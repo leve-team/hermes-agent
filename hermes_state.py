@@ -430,6 +430,7 @@ class SessionDB(
 
     def __init__(
         self, db_path: Path = None, read_only: bool = False, *, postgres_dsn: Optional[str] = None,
+        dual_write: Optional[bool] = None,
     ):
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
@@ -483,7 +484,9 @@ class SessionDB(
         # them to the dedicated PostgreSQL shadow.
         from hermes_state_dual import dual_write_enabled
 
-        self._dual_requested = dual_write_enabled()
+        self._dual_requested = (
+            dual_write_enabled() if dual_write is None else bool(dual_write)
+        )
         self._dual_mode = bool(self._dual_requested and not read_only)
         self._dual_replicator = None
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.

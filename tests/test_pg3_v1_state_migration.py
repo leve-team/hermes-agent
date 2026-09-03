@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state_dual
+import hermes_state_postgres
 from hermes_state import SessionDB
 from migrate_state_to_postgres import (
     BackfillBudgetExceeded,
@@ -13,6 +14,7 @@ from migrate_state_to_postgres import (
     online_backfill,
 )
 from state_diff import RepairWriter, canonical_row_json, state_diff_connections
+from state_reverse import InjectedReverseFault, reverse_backfill
 from state_transfer import sqlite_table_specs
 
 
@@ -54,6 +56,71 @@ def _ledger_rows(path: Path) -> tuple[list[tuple], list[tuple]]:
             "SELECT id, session_id, role, content, timestamp FROM messages ORDER BY id"
         ).fetchall()
     return sessions, messages
+
+
+def _full_hash_diff(source_path: Path, target_path: Path, *, repair: bool = False):
+    source = sqlite3.connect(source_path, isolation_level=None)
+    source.row_factory = sqlite3.Row
+    target = sqlite3.connect(target_path, isolation_level=None)
+    target.row_factory = sqlite3.Row
+    writer_conn = None
+    try:
+        specs = sqlite_table_specs(source)
+        if repair:
+            writer_conn = sqlite3.connect(target_path, isolation_level=None)
+            writer_conn.row_factory = sqlite3.Row
+        return state_diff_connections(
+            source,
+            target,
+            specs=specs,
+            target_dialect="sqlite",
+            repair_writer=(
+                RepairWriter(writer_conn, "sqlite", batch_rows=1000)
+                if writer_conn is not None
+                else None
+            ),
+            batch_rows=2,
+        )
+    finally:
+        if writer_conn is not None:
+            writer_conn.close()
+        target.close()
+        source.close()
+
+
+class _ProcessKilled(BaseException):
+    """Simulate an uncatchable process death at a fault-matrix boundary."""
+
+
+def test_dual_write_explicit_message_id_refreshes_postgres_fts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, _sql, _params):
+            return self
+
+        def fetchone(self):
+            return (37,)
+
+    calls = []
+    monkeypatch.setattr(
+        hermes_state_postgres,
+        "_update_fts_content",
+        lambda conn, message_id, content, tool_name, tool_calls: calls.append(
+            (conn, message_id, content, tool_name, tool_calls)
+        ),
+    )
+    connection = object()
+    cursor = hermes_state_postgres._PostgresCursor(Cursor(), conn=connection)
+    cursor.execute(
+        "INSERT OR IGNORE INTO messages "
+        "(session_id, role, content, tool_name, tool_calls, timestamp, id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("s1", "user", "body", "tool", "[]", 1.0, 37),
+    )
+    assert calls == [(connection, 37, "body", "tool", "[]")]
 
 
 def test_dual_write_replays_same_generated_id_and_timestamp(
@@ -111,6 +178,66 @@ def test_dual_write_failure_is_journaled_and_replay_is_idempotent(
     assert first == {"applied": 1, "failed": 0, "pending": 0}
     assert second == {"applied": 0, "failed": 0, "pending": 0}
     assert _ledger_rows(source_path) == _ledger_rows(target_path)
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        "after_source_commit",
+        "before_pg_apply",
+        "after_pg_commit_before_ack",
+        "during_replay",
+    ],
+)
+def test_dual_write_fault_matrix_recovers_to_full_hash_diff_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_point: str,
+) -> None:
+    source_path = tmp_path / f"source-{fault_point}.db"
+    target_path = tmp_path / f"target-{fault_point}.db"
+    db = _open_dual(monkeypatch, source_path, target_path)
+    try:
+        db.create_session("s1", "cli")
+
+        if fault_point == "during_replay":
+
+            def fail_initial_apply(point: str) -> None:
+                if point == "before_pg_apply":
+                    raise ConnectionError("replica unavailable")
+
+            db._dual_replicator.fault_inject = fail_initial_apply
+            db.append_message("s1", "user", "recover me", timestamp=42.0)
+
+            def kill_replay(point: str) -> None:
+                if point == "during_replay":
+                    raise _ProcessKilled(point)
+
+            db._dual_replicator.fault_inject = kill_replay
+            with pytest.raises(_ProcessKilled):
+                db._dual_replicator.replay_failures()
+            db._dual_replicator.fault_inject = None
+            assert db._dual_replicator.replay_failures()["pending"] == 0
+        else:
+
+            def kill_at_boundary(point: str) -> None:
+                if point == fault_point:
+                    raise _ProcessKilled(point)
+
+            db._dual_replicator.fault_inject = kill_at_boundary
+            with pytest.raises(_ProcessKilled):
+                db.append_message("s1", "user", "recover me", timestamp=42.0)
+            db._dual_replicator.fault_inject = None
+    finally:
+        db.close()
+
+    first_diff = _full_hash_diff(source_path, target_path)
+    if not first_diff["clean"]:
+        repaired = _full_hash_diff(source_path, target_path, repair=True)
+        assert repaired["mismatch_count"] > 0
+    final_diff = _full_hash_diff(source_path, target_path)
+    assert final_diff["clean"] is True
+    assert final_diff["mismatch_count"] == 0
 
 
 def test_dual_write_rejects_database_local_clock_before_source_commit() -> None:
@@ -309,3 +436,99 @@ def test_state_diff_hash_normalization_fixes_numeric_bytes_and_null_rules() -> N
         '"nothing":{"type":"null","value":null},'
         '"z":{"type":"float","value":"1.25"}}'
     )
+
+
+def test_state_diff_hash_repair_handles_self_referencing_session_order(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source-tree.db"
+    target_path = tmp_path / "target-tree.db"
+    source = SessionDB(db_path=source_path)
+    target = SessionDB(db_path=target_path)
+    try:
+        source.create_session("z-source-parent", "cli")
+        source.create_session(
+            "a-source-child", "cli", parent_session_id="z-source-parent"
+        )
+        target.create_session("a-extra-parent", "cli")
+        target.create_session(
+            "z-extra-child", "cli", parent_session_id="a-extra-parent"
+        )
+    finally:
+        source.close()
+        target.close()
+
+    mismatch = _full_hash_diff(source_path, target_path, repair=True)
+    assert mismatch["mismatch_count"] == 4
+    clean = _full_hash_diff(source_path, target_path)
+    assert clean["clean"] is True
+    with sqlite3.connect(target_path) as repaired:
+        assert (
+            repaired.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = 'a-source-child'"
+            ).fetchone()[0]
+            == "z-source-parent"
+        )
+
+
+def test_state_reverse_backfill_resume_after_fault_finishes_with_hash_diff_zero(
+    tmp_path: Path,
+) -> None:
+    pg_fixture_path = tmp_path / "pg-fixture.db"
+    sqlite_target_path = tmp_path / "rollback-state.db"
+    checkpoint = tmp_path / "reverse.json"
+    source_db = SessionDB(db_path=pg_fixture_path)
+    try:
+        # Text-PK order deliberately loads the child before its parent, proving
+        # reverse backfill defers the self-referencing edge.
+        source_db.create_session("z-parent", "cli")
+        source_db.create_session("a-child", "cli", parent_session_id="z-parent")
+        source_db.append_message("a-child", "user", "rollback payload", timestamp=7.0)
+    finally:
+        source_db.close()
+
+    def source_factory(_dsn: str):
+        conn = sqlite3.connect(pg_fixture_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    with pytest.raises(InjectedReverseFault):
+        reverse_backfill(
+            "test-only",
+            sqlite_target_path,
+            checkpoint_path=checkpoint,
+            batch_rows=1,
+            fault_inject_at="50%",
+            _source_factory=source_factory,
+        )
+
+    summary = reverse_backfill(
+        "test-only",
+        sqlite_target_path,
+        checkpoint_path=checkpoint,
+        resume=True,
+        batch_rows=1,
+        _source_factory=source_factory,
+    )
+    assert summary["complete"] is True
+    assert summary["diff"]["clean"] is True
+    assert summary["diff"]["mismatch_count"] == 0
+    with sqlite3.connect(sqlite_target_path) as target:
+        assert (
+            target.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = 'a-child'"
+            ).fetchone()[0]
+            == "z-parent"
+        )
+
+    # A completed checkpoint remains an idempotent, hash-verified resume.
+    repeated = reverse_backfill(
+        "test-only",
+        sqlite_target_path,
+        checkpoint_path=checkpoint,
+        resume=True,
+        batch_rows=1,
+        _source_factory=source_factory,
+    )
+    assert repeated["complete"] is True
+    assert repeated["diff"]["mismatch_count"] == 0

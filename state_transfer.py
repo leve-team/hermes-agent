@@ -97,18 +97,22 @@ def primary_key_from_row(spec: TableSpec, row: Any) -> list[Any]:
     return [row[column] for column in spec.primary_key]
 
 
-def checkpoint_template(source_path: Path, direction: str) -> dict[str, Any]:
+def _checkpoint_source_identity(source: Path | str) -> str:
+    return str(source.resolve()) if isinstance(source, Path) else str(source)
+
+
+def checkpoint_template(source_path: Path | str, direction: str) -> dict[str, Any]:
     return {
         "version": 1,
         "direction": direction,
-        "source": str(source_path.resolve()),
+        "source": _checkpoint_source_identity(source_path),
         "tables": {},
         "completed": False,
     }
 
 
 def load_checkpoint(
-    path: Path, *, source_path: Path, direction: str, resume: bool
+    path: Path, *, source_path: Path | str, direction: str, resume: bool
 ) -> dict[str, Any]:
     if not path.exists():
         return checkpoint_template(source_path, direction)
@@ -121,7 +125,7 @@ def load_checkpoint(
         raise RuntimeError(f"unsupported checkpoint version at {path}")
     if payload.get("direction") != direction:
         raise RuntimeError(f"checkpoint direction does not match {direction}")
-    if payload.get("source") != str(source_path.resolve()):
+    if payload.get("source") != _checkpoint_source_identity(source_path):
         raise RuntimeError("checkpoint belongs to a different source database")
     if not isinstance(payload.get("tables"), dict):
         raise RuntimeError("checkpoint table watermarks are malformed")
