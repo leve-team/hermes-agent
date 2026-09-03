@@ -69,13 +69,141 @@ def _get_starts_log_path() -> Path:
     return get_hermes_home() / "gateway-starts.log"
 
 
+def _parse_downward_map(path: Path) -> dict[str, str]:
+    """Parse Kubernetes Downward API labels/annotations file syntax."""
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        key, separator, raw = line.partition("=")
+        if not separator or not key:
+            continue
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, str):
+            values[key] = value
+    return values
+
+
+def _read_downward_pod_metadata(config: Any) -> dict[str, Optional[str]]:
+    """Read the configured Downward API projection, returning bounded fields."""
+    if not isinstance(config, dict):
+        return {}
+    raw_dir = config.get("pod_metadata_dir")
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        return {}
+    root = Path(raw_dir).expanduser()
+
+    def _read_scalar(name: str) -> Optional[str]:
+        try:
+            value = (root / name).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value[:512] or None
+
+    labels = _parse_downward_map(root / "labels")
+    annotations = _parse_downward_map(root / "annotations")
+    return {
+        "uid": _read_scalar("uid"),
+        "name": _read_scalar("name"),
+        "namespace": _read_scalar("namespace"),
+        "template_hash": labels.get("pod-template-hash"),
+        "deployment_revision": annotations.get("deployment.kubernetes.io/revision"),
+    }
+
+
+def _parse_start_record(line: str) -> Optional[dict[str, Any]]:
+    """Parse current JSONL and legacy one-float-per-line start records."""
+    raw = line.strip()
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        decoded = None
+    if isinstance(decoded, dict):
+        try:
+            started_at = float(decoded["started_at_epoch"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if started_at != started_at:
+            return None
+        return {**decoded, "started_at_epoch": started_at}
+    try:
+        started_at = float(raw)
+    except ValueError:
+        return None
+    return {
+        "started_at_epoch": started_at,
+        "restart_reason": "unknown",
+        "classification_source": "legacy_epoch",
+    }
+
+
+def _classify_gateway_restart(
+    previous_start: Optional[dict[str, Any]],
+    current_pod: dict[str, Optional[str]],
+    lifecycle: Optional[dict[str, Any]],
+    unclean_evidence: Optional[dict[str, Any]],
+) -> tuple[str, str]:
+    """Classify the previous gateway death from durable local evidence."""
+    lifecycle = lifecycle or {}
+    previous_exit_code = lifecycle.get("exit_code")
+    previous_reason = str(lifecycle.get("exit_reason") or "").lower()
+    if previous_exit_code == 137 or "oom" in previous_reason or (
+        unclean_evidence or {}
+    ).get("suspected_oom"):
+        return "oom", "lifecycle_exit_or_memory"
+
+    previous_pod = (
+        previous_start.get("pod")
+        if isinstance(previous_start, dict)
+        and isinstance(previous_start.get("pod"), dict)
+        else {}
+    )
+    old_uid = previous_pod.get("uid")
+    new_uid = current_pod.get("uid")
+    if old_uid and new_uid and old_uid != new_uid:
+        old_hash = previous_pod.get("template_hash")
+        new_hash = current_pod.get("template_hash")
+        old_revision = previous_pod.get("deployment_revision")
+        new_revision = current_pod.get("deployment_revision")
+        if (old_hash and new_hash and old_hash != new_hash) or (
+            old_revision and new_revision and old_revision != new_revision
+        ):
+            return "deployment", "downward_api_template_change"
+        if old_hash and new_hash and old_hash == new_hash:
+            return "eviction", "downward_api_pod_replacement_same_template"
+        return "unknown", "downward_api_pod_replacement_unresolved"
+
+    if old_uid and new_uid and old_uid == new_uid:
+        if lifecycle.get("phase") == "running" or (
+            isinstance(previous_exit_code, int) and previous_exit_code != 0
+        ):
+            return "crash", "same_pod_unclean_or_nonzero_exit"
+    if lifecycle.get("phase") == "running":
+        return "crash", "lifecycle_unclean_exit"
+    if isinstance(previous_exit_code, int) and previous_exit_code != 0:
+        return "crash", "lifecycle_nonzero_exit"
+    return "unknown", "insufficient_evidence"
+
+
 def record_start_and_check_storm(
-    max_starts: int = 5, window_s: float = 120.0, *, backoff_cap_s: float = 300.0
+    max_starts: int = 5,
+    window_s: float = 120.0,
+    *,
+    backoff_cap_s: float = 300.0,
+    restart_classification: Optional[dict[str, Any]] = None,
 ) -> Optional[StormInfo]:
     """Record this gateway start and report whether a respawn storm is underway.
 
-    Appends the current UTC timestamp to the starts-log, prunes entries older
-    than ``window_s``, and ring-buffers the file so it can't grow unbounded.
+    Appends a JSON record with the current UTC timestamp and restart reason,
+    prunes entries older than ``window_s``, and ring-buffers the file so it
+    can't grow unbounded. Legacy float-only lines remain readable.
     Returns a :class:`StormInfo` when more than ``max_starts`` starts landed in
     the window (with an exponential backoff capped at ``backoff_cap_s``), else
     ``None``.
@@ -89,21 +217,55 @@ def record_start_and_check_storm(
 
         now = datetime.now(timezone.utc).timestamp()
 
-        existing: list[float] = []
+        existing: list[dict[str, Any]] = []
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    existing.append(float(line))
-                except ValueError:
-                    continue
+                record = _parse_start_record(line)
+                if record is not None:
+                    existing.append(record)
 
-        existing.append(now)
+        current_pod = _read_downward_pod_metadata(restart_classification)
+        lifecycle = None
+        unclean_evidence = None
+        try:
+            from gateway.lifecycle_ledger import (
+                detect_unclean_exit,
+                read_lifecycle_record,
+            )
+
+            lifecycle = read_lifecycle_record()
+            unclean_evidence = detect_unclean_exit()
+        except Exception:
+            logger.debug("restart classification lifecycle read failed", exc_info=True)
+        previous = existing[-1] if existing else None
+        restart_reason, classification_source = _classify_gateway_restart(
+            previous,
+            current_pod,
+            lifecycle,
+            unclean_evidence,
+        )
+        current_record: dict[str, Any] = {
+            "started_at_epoch": now,
+            "started_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "restart_reason": restart_reason,
+            "classification_source": classification_source,
+            "previous_exit_code": (
+                lifecycle.get("exit_code") if isinstance(lifecycle, dict) else None
+            ),
+            "previous_exit_reason": (
+                lifecycle.get("exit_reason") if isinstance(lifecycle, dict) else None
+            ),
+            "previous_unclean_exit": bool(unclean_evidence),
+            "pod": current_pod,
+        }
+        existing.append(current_record)
 
         # Keep only starts within the sliding window for the storm decision.
-        recent = [ts for ts in existing if now - ts <= window_s]
+        recent = [
+            record
+            for record in existing
+            if now - float(record["started_at_epoch"]) <= window_s
+        ]
 
         # Ring-buffer what we persist so the file stays bounded even if the
         # window is wide or starts are frequent.
@@ -112,7 +274,12 @@ def record_start_and_check_storm(
 
         tmp = path.with_suffix(".tmp")
         tmp.write_text(
-            "\n".join(repr(ts) for ts in to_write) + "\n", encoding="utf-8"
+            "\n".join(
+                json.dumps(record, sort_keys=True, separators=(",", ":"))
+                for record in to_write
+            )
+            + "\n",
+            encoding="utf-8",
         )
         os.replace(tmp, path)
 

@@ -1137,6 +1137,125 @@ class TestRespawnStormBreaker:
             )
             assert result is None
 
+    @staticmethod
+    def _write_pod_info(root, *, uid, template_hash, revision="1"):
+        root.mkdir()
+        (root / "uid").write_text(uid, encoding="utf-8")
+        (root / "name").write_text(f"pod-{uid}", encoding="utf-8")
+        (root / "namespace").write_text("test", encoding="utf-8")
+        (root / "labels").write_text(
+            f'pod-template-hash="{template_hash}"\n', encoding="utf-8"
+        )
+        (root / "annotations").write_text(
+            f'deployment.kubernetes.io/revision="{revision}"\n',
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_previous_start(home, *, uid, template_hash, revision="1"):
+        record = {
+            "started_at_epoch": time.time() - 10,
+            "restart_reason": "unknown",
+            "pod": {
+                "uid": uid,
+                "template_hash": template_hash,
+                "deployment_revision": revision,
+            },
+        }
+        (home / "gateway-starts.log").write_text(
+            json.dumps(record) + "\n", encoding="utf-8"
+        )
+
+    @staticmethod
+    def _write_lifecycle(home, *, phase="exited", exit_code=0):
+        state = home / "state"
+        state.mkdir(exist_ok=True)
+        (state / "gateway.lifecycle.json").write_text(
+            json.dumps(
+                {
+                    "phase": phase,
+                    "pid": 999_999_999,
+                    "exit_code": exit_code,
+                    "exit_reason": "test",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _last_record(home):
+        return json.loads(
+            (home / "gateway-starts.log").read_text(encoding="utf-8").splitlines()[-1]
+        )
+
+    def test_classifies_deployment_from_changed_template(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pod_info = tmp_path / "podinfo"
+        self._write_pod_info(pod_info, uid="new", template_hash="hash-b", revision="2")
+        self._write_previous_start(tmp_path, uid="old", template_hash="hash-a")
+        self._write_lifecycle(tmp_path)
+
+        status.record_start_and_check_storm(
+            restart_classification={"pod_metadata_dir": str(pod_info)}
+        )
+
+        record = self._last_record(tmp_path)
+        assert record["restart_reason"] == "deployment"
+        assert record["classification_source"] == "downward_api_template_change"
+        assert record["previous_exit_code"] == 0
+
+    def test_classifies_eviction_from_same_template_new_pod(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pod_info = tmp_path / "podinfo"
+        self._write_pod_info(pod_info, uid="new", template_hash="same")
+        self._write_previous_start(tmp_path, uid="old", template_hash="same")
+        self._write_lifecycle(tmp_path, phase="running", exit_code=None)
+
+        status.record_start_and_check_storm(
+            restart_classification={"pod_metadata_dir": str(pod_info)}
+        )
+
+        assert self._last_record(tmp_path)["restart_reason"] == "eviction"
+
+    @pytest.mark.parametrize(
+        ("exit_code", "reason"),
+        [(137, "oom"), (1, "crash")],
+    )
+    def test_classifies_same_pod_exit_code(
+        self, tmp_path, monkeypatch, exit_code, reason
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pod_info = tmp_path / "podinfo"
+        self._write_pod_info(pod_info, uid="same", template_hash="hash-a")
+        self._write_previous_start(tmp_path, uid="same", template_hash="hash-a")
+        self._write_lifecycle(tmp_path, exit_code=exit_code)
+
+        status.record_start_and_check_storm(
+            restart_classification={"pod_metadata_dir": str(pod_info)}
+        )
+
+        assert self._last_record(tmp_path)["restart_reason"] == reason
+
+    def test_legacy_epoch_lines_still_count_toward_storm(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        now = time.time()
+        (tmp_path / "gateway-starts.log").write_text(
+            "\n".join(str(now - offset) for offset in (3, 2, 1)) + "\n",
+            encoding="utf-8",
+        )
+
+        result = status.record_start_and_check_storm(max_starts=3, window_s=10)
+
+        assert result is not None
+        assert result.count == 4
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "gateway-starts.log")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        assert records[0]["classification_source"] == "legacy_epoch"
+
 
 class TestLaunchdPlistRespawnGovernance:
     def test_plist_has_throttle_interval(self, tmp_path, monkeypatch):
@@ -1386,4 +1505,3 @@ class TestResolveGatewayLiveness:
         # expected_home is what stops a recycled PID belonging to another
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
-

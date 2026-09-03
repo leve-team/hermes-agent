@@ -5883,6 +5883,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         # Defaults mirror config.yaml DEFAULT_CONFIG ``gateway.respawn_storm``.
         _max_starts = 5
         _win = 120.0
+        _restart_classification = None
         try:
             from hermes_cli.config import load_config
 
@@ -5894,6 +5895,12 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
                     _max_starts = _rs["max_starts"]
                 if isinstance(_rs.get("window_seconds"), (int, float)):
                     _win = float(_rs["window_seconds"])
+            _restart_classification = (
+                _gw.get("restart_classification")
+                if isinstance(_gw, dict)
+                and isinstance(_gw.get("restart_classification"), dict)
+                else None
+            )
         except Exception:
             pass
         # Env vars override config for escape-hatch use.
@@ -5910,7 +5917,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except ValueError:
             pass
         _storm = (
-            record_start_and_check_storm(max_starts=_max_starts, window_s=_win)
+            record_start_and_check_storm(
+                max_starts=_max_starts,
+                window_s=_win,
+                restart_classification=_restart_classification,
+            )
             if _max_starts > 0
             else None
         )

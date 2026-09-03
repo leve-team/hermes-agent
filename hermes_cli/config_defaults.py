@@ -2974,6 +2974,14 @@ DEFAULT_CONFIG = {
             "max_starts": 5,
             "window_seconds": 120,
         },
+        # Optional Kubernetes Downward API directory. When configured, the
+        # directory contains uid/name/namespace scalar files plus labels and
+        # annotations map files. gateway-starts.log combines that pod identity
+        # with the existing lifecycle sentinel to classify deployment, crash,
+        # OOM, and eviction starts. Blank keeps classification local-only.
+        "restart_classification": {
+            "pod_metadata_dir": "",
+        },
 
         # Inject a human-readable timestamp prefix (e.g.
         # "[Tue 2026-04-28 13:40:53 CEST]") onto user messages IN THE MODEL'S

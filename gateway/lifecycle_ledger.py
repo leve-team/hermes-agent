@@ -118,6 +118,11 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def read_lifecycle_record(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Return the current lifecycle sentinel without mutating it."""
+    return _read_json(get_lifecycle_sentinel_path(home))
+
+
 def _write_sentinel(payload: Dict[str, Any], home: Optional[Path]) -> None:
     path = get_lifecycle_sentinel_path(home)
     try:
@@ -182,7 +187,7 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
     """Inspect the previous life's sentinel; return an evidence dict when it
     died uncleanly, else ``None``.  Read-only — does not rewrite the sentinel.
     """
-    sentinel = _read_json(get_lifecycle_sentinel_path(home))
+    sentinel = read_lifecycle_record(home)
     if not sentinel or sentinel.get("phase") != "running":
         return None
     if _pid_alive_with_start_time(sentinel.get("pid"), sentinel.get("start_time")):
@@ -293,7 +298,7 @@ def mark_exited(
     ours with a ``clean exit`` claim.
     """
     try:
-        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        sentinel = read_lifecycle_record(home)
         if sentinel is not None and sentinel.get("pid") != os.getpid():
             return
         _write_sentinel(
@@ -317,7 +322,7 @@ def read_prior_exit_label(profile_home: Path) -> str:
     ``hermes_cli.container_boot`` to annotate ``container-boot.log``.
     """
     try:
-        sentinel = _read_json(get_lifecycle_sentinel_path(profile_home))
+        sentinel = read_lifecycle_record(profile_home)
         if not sentinel:
             return "unknown"
         phase = sentinel.get("phase")
