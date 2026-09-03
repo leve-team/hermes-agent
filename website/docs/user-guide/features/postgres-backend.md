@@ -177,11 +177,13 @@ environment-variable form.
 
 ## Migrating existing sessions
 
-The `hermes migrate state-to-postgres` subcommand performs a one-shot copy of
-an existing SQLite state database into PostgreSQL:
+The `hermes migrate state-to-postgres` subcommand performs an online,
+resumable backfill of an existing SQLite state database into PostgreSQL:
 
 ```bash
-hermes migrate state-to-postgres [--dsn 'postgresql://...'] [--sqlite-path PATH]
+hermes migrate state-to-postgres --dsn 'postgresql://...' --yes \
+  [--sqlite-path PATH] [--checkpoint PATH] [--resume] \
+  [--batch-rows 5000] [--budget-bytes 44023414784]
 ```
 
 Running without `--dsn` resolves the target from the
@@ -196,39 +198,87 @@ Use `-y` / `--yes` to skip the confirmation prompt in scripts or CI:
 hermes migrate state-to-postgres --dsn 'postgresql://...' --yes
 ```
 
-The equivalent direct invocation (documented for scripting or for users who
-prefer to run the module without the CLI) is:
+The equivalent direct invocation is:
 
 ```bash
-python -m migrate_state_to_postgres --dsn 'postgresql://...' [--sqlite-path PATH]
+python -m migrate_state_to_postgres --dsn 'postgresql://...' \
+  [--sqlite-path PATH] [--checkpoint PATH] [--resume]
 ```
 
 Its properties, by design:
 
-- **Source-safe.** The SQLite database is opened read-only and is never mutated
-  or deleted. It stays the fallback-of-record until you have verified the copy
-  and flipped `sessions.state_backend`.
-- **Idempotent.** Rows are inserted with `ON CONFLICT DO NOTHING`, so re-running
-  after a partial run fills the gaps without duplicating. Note that it does not
-  *refresh* rows already present — it targets a fresh database. If a source row
-  changed after a prior partial import, drop the target and re-run.
-- **Full fidelity.** Rewound (soft-deleted) messages are included, message ids
-  and timestamps are preserved, and content is re-encoded through the live
-  encoding path.
+- **Source-safe snapshot.** SQLite is opened with `mode=ro`, and one read
+  transaction pins the source snapshot. No local database copy is made.
+- **Bounded, resumable COPY.** Each table is streamed in primary-key order
+  through psycopg `COPY`. An atomically replaced JSON checkpoint records each
+  committed `(table, last_pk)` watermark. `--resume` continues that checkpoint,
+  and `ON CONFLICT DO NOTHING` makes a repeated batch idempotent.
+- **Disk guard.** PostgreSQL size is checked before loading and after every
+  batch. The default budget is 41 GiB; exceeding `--budget-bytes` preserves the
+  checkpoint and exits with status 4.
+- **Bulk-load indexes.** Secondary and GIN indexes are built after COPY. The
+  command also fills every `messages.fts_content IS NULL` row and resets the
+  message identity sequence after importing explicit SQLite ids.
 
-The script verifies session and message counts after import and reports them.
+The checkpoint identifies the source file and cannot be reused for another
+source. It is not a change-data-capture log: enable dual-write before starting
+an online backfill, and use a final quiesced full diff before cutover.
+
+### SQLite-primary dual-write validation
+
+`HERMES_STATE_DUAL_WRITE=1` is a transition mode. It keeps SQLite as the read
+and write authority, then replays each committed mutation synchronously to the
+PostgreSQL DSN in `HERMES_CORE_PG_DSN`. A replica failure is fail-open for the
+primary operation and is recorded in SQLite's `_hermes_dual_failures` table for
+idempotent replay. It does not select the PostgreSQL read backend and does not
+change the default `sessions.state_backend: sqlite`.
+
+Use the dedicated migration DSN; the dual-write and validation tools never
+borrow an unrelated application's PostgreSQL DSN.
+
+```bash
+export HERMES_STATE_DUAL_WRITE=1
+export HERMES_CORE_PG_DSN='postgresql://...'
+
+# Replay journaled transactions, then compare Python-normalized row hashes.
+python -m state_diff --sqlite-path ~/.hermes/state.db --replay-failures --full
+
+# Repair missing/different/extra target rows from the SQLite authority.
+python -m state_diff --sqlite-path ~/.hermes/state.db --full --repair
+
+# Report dual-write mutation entrypoints not exercised in the validation window.
+python -m state_diff --sqlite-path ~/.hermes/state.db --full --coverage \
+  [--coverage-waive reviewed-waivers.json]
+```
+
+`state_diff` exits 0 for parity, 1 for a mismatch, and 2 when either store is
+unavailable. `--since` accepts an epoch timestamp or ISO-8601 value and checks
+only tables with `updated_at`; it excludes the newest five minutes so in-flight
+dual writes do not create false alarms. A full repair compares cross-database
+snapshots, so stop or otherwise quiesce source writers before using its result
+as a cutover or rollback decision. Never reuse an earlier full-diff result.
+
+To rehearse rollback into a new SQLite file, use the resumable reverse tool. Its
+checkpoint stores only a SHA-256 identity for the credential-bearing DSN, and a
+successful run finishes with a full PG-to-SQLite hash comparison:
+
+```bash
+python -m state_reverse --dsn "$HERMES_CORE_PG_DSN" \
+  --sqlite-path /safe/path/rollback-state.db [--checkpoint PATH] [--resume]
+```
 
 Recommended sequence:
 
-1. Run the migration while Hermes is stopped.
-2. The command reports how many sessions and messages it migrated out of the
-   source total (for example `Sessions: 42/42`). Confirm both numbers match.
-   These counts are scoped to the rows this run actually copied, not to the
-   target's table totals — a target that already holds rows would satisfy any
-   "total >= source" comparison no matter how much was dropped.
-3. Set `sessions.state_backend: postgres`.
-4. Start Hermes and confirm `/resume` and `session_search` behave.
-5. Keep the SQLite file until you are satisfied.
+1. Provision an empty target and enable SQLite-primary dual-write.
+2. Run or resume the online backfill while Hermes continues serving SQLite
+   reads. If the disk guard exits 4, increase capacity or choose a reviewed
+   budget before resuming; do not simply disable the guard.
+3. Replay failures and run incremental hash checks throughout the validation
+   window. Exercise every write entrypoint or record a reviewed waiver.
+4. Quiesce writes and run a new full diff/repair/full-diff sequence. Rehearse
+   reverse backfill and verify its final hash result.
+5. Only then set `sessions.state_backend: postgres` in a separately controlled
+   cutover. Keep the SQLite authority until the rollback window closes.
 
 ## Behavioral notes
 
@@ -245,29 +295,20 @@ every message as it is written. Queries use `fts_content @@ tsquery` with the
 mixing code identifiers, proper nouns, and multiple languages), which gives
 tokenized multi-word AND search.
 
-:::note If you migrated from SQLite, read this first
-
-Migrated rows are written before the full-text column is populated, so a
-database carrying pre-existing history starts with `fts_content IS NULL` on
-every imported row. Until you run the one-time backfill below, **every search
-uses the `ILIKE` fallback, not full-text search.** Nothing is broken and no
-result is missing — but multi-word queries behave as substring matches until
-the backfill completes.
-
-:::
-
 Rows written *before* the full-text column existed have `fts_content IS NULL`.
 Until every such row is backfilled, search deliberately stays on a
 trigram-indexed `ILIKE` scan, because an FTS-only query would silently miss
 every un-backfilled row — `ILIKE` covers all rows, so it is the correct choice
 during that window. The `pg_trgm` GIN indexes keep it usable.
 
-To finish the transition on a database with pre-existing history, run the
-one-time backfill (safe to run in batches, and safe to re-run):
+The resumable migration command fills this column automatically before it
+builds the deferred indexes. For a database imported by an older tool, the
+following repair remains safe to re-run:
 
 ```sql
 UPDATE messages
-   SET fts_content = to_tsvector('simple', coalesce(content, ''))
+   SET fts_content = to_tsvector(
+       'simple', concat_ws(' ', content, tool_name, tool_calls))
  WHERE fts_content IS NULL;
 ```
 

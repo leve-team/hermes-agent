@@ -4170,7 +4170,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
-                        dual = self._dual_replicator
+                        # Some adapter-level tests and third-party subclasses
+                        # construct SessionDB without running __init__. Dual
+                        # mode is optional, so an absent transition attribute
+                        # must retain the pre-dual write path.
+                        dual = getattr(self, "_dual_replicator", None)
                         if dual is not None:
                             mutation_id, recording_conn = dual.new_batch()
                             result = fn(recording_conn)
