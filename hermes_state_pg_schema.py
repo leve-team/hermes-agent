@@ -745,8 +745,16 @@ def _schema_statements(sql: str):
             yield statement.strip()
 
 
-def init_postgres_schema(conn: Any, schema_version: int) -> None:
+def init_postgres_schema(
+    conn: Any, schema_version: int, *, defer_indexes: bool = False
+) -> None:
     """Provision tables, require column parity, then build indexes and record success.
+
+    ``defer_indexes=True`` (online COPY backfill) provisions tables and records
+    the version only; secondary indexes and Postgres-only migrations are built
+    afterwards by :func:`finalize_postgres_schema`. Primary-key/unique indexes
+    remain part of CREATE TABLE because they are required for
+    conflict-idempotent batches.
 
     CREATE TABLE IF NOT EXISTS leaves existing tables untouched. Indexes must
     wait for reconciliation, or an index on a newly added column prevents the
@@ -757,15 +765,26 @@ def init_postgres_schema(conn: Any, schema_version: int) -> None:
     for statement in _schema_statements(_POSTGRES_TABLE_SQL):
         raw.execute(statement)
     reconcile_postgres_columns(conn, SCHEMA_SQL)
-    apply_postgres_migrations(conn)
-    for statement in _schema_statements(_POSTGRES_INDEX_SQL):
-        raw.execute(statement)
+    if not defer_indexes:
+        apply_postgres_migrations(conn)
+        for statement in _schema_statements(_POSTGRES_INDEX_SQL):
+            raw.execute(statement)
     # Keep the shared version separate from the PostgreSQL migration ledger,
     # and never claim completion before the required schema work succeeds.
     if postgres_schema_version(conn) < schema_version:
         raw.execute(
             "INSERT INTO schema_version (version) VALUES (%s) ON CONFLICT DO NOTHING", (schema_version,)
         )
+    conn.commit()
+
+
+def finalize_postgres_schema(conn: Any) -> None:
+    """Build deferred base/GIN indexes after a bulk COPY has completed."""
+    raw = conn.raw if hasattr(conn, "raw") else conn
+    reconcile_postgres_columns(conn, SCHEMA_SQL)
+    apply_postgres_migrations(conn)
+    for statement in _schema_statements(_POSTGRES_INDEX_SQL):
+        raw.execute(statement)
     conn.commit()
 
 

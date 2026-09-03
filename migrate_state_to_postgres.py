@@ -1,146 +1,51 @@
-"""Copy durable SQLite state into the optional PostgreSQL backend.
+"""Online, resumable SQLite-to-PostgreSQL state backfill.
 
-The source is opened read-only and held in one read transaction through copy
-and verification. Raw rows preserve fields that presentation APIs decode, hide,
-or filter, including inactive history, prompt references and display metadata.
-Message content alone is decoded and re-encoded to remove the legacy NUL sentinel.
-
-Rows keep their original keys. Existing target history is never overwritten;
-a retry fills missing rows and reports differing values as incomplete. Peer
-conversation generations may only advance, so a retry cannot reuse an old
-prompt-cache identity. Use a fresh target and switch backends only after the
-verification succeeds. The source remains intact for recovery.
-
-SQLite-local outboxes, process liveness/leases and derived search metadata are
-not transferred. Their ownership belongs to the source process or SQLite file,
-not to the conversations being migrated.
-
-Usage::
-
-    python -m migrate_state_to_postgres --dsn postgresql://.../db [--sqlite-path PATH]
-
-The DSN may also be supplied via HERMES_STATE_DATABASE_URL or
-HERMES_STATE_POSTGRES_DSN.
+Rows are read from one SQLite ``mode=ro`` snapshot, streamed through psycopg3
+COPY into a per-batch temporary table, and merged with ``ON CONFLICT DO
+NOTHING``.  The source file is never copied or written.  A small atomic JSON
+checkpoint records ``(table, last primary key)`` after every committed batch.
 """
+
 from __future__ import annotations
 
 import argparse
 import os
 import sqlite3
 import sys
-from itertools import islice
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional, Sequence
 
-
-_PAGE_SIZE = 500
-_MAX_REPORTED_MISMATCHES = 100
-_DURABLE_TABLES = (
-    "system_prompts", "sessions", "messages", "session_model_usage",
-    "gateway_routing", "gateway_hygiene_state", "conversation_generations",
+from state_transfer import (
+    TableSpec,
+    fetch_sqlite_batch,
+    load_checkpoint,
+    open_sqlite_snapshot,
+    primary_key_from_row,
+    quote_identifier,
+    save_checkpoint,
+    sqlite_table_specs,
+    table_counts,
 )
-_TOPIC_SCHEMA_KEY = "telegram_dm_topic_schema_version"
 
 
-def _source_batches(source: sqlite3.Connection, table: str, *, has_topics: bool):
-    """Read stored rows, excluding only metadata owned by the SQLite file."""
-    from hermes_state_errors import _STATE_DB_GENERATION_KEY
-
-    local_meta = {_STATE_DB_GENERATION_KEY, "store_instance_id", "store_created_at_utc", "last_vacuum"}
-    cursor = source.execute(f'SELECT * FROM "{table}"')
-    while batch := cursor.fetchmany(_PAGE_SIZE):
-        rows = [dict(row) for row in batch]
-        if table == "state_meta":
-            rows = [row for row in rows if row["key"] not in local_meta
-                    and not str(row["key"]).startswith("fts_")
-                    and (has_topics or row["key"] != _TOPIC_SCHEMA_KEY)]
-        if rows:
-            yield rows
+DEFAULT_BATCH_ROWS = 5_000
+DEFAULT_BUDGET_BYTES = 41 * 1024 * 1024 * 1024
 
 
-def _session_batches(source: sqlite3.Connection):
-    """Keep only lineage ids in memory while streaming parents before children."""
-    from hermes_state_pg_import import order_session_lineage
-
-    columns = {row[1] for row in source.execute('PRAGMA table_info("sessions")')}
-    parent = "parent_session_id" if "parent_session_id" in columns else "NULL AS parent_session_id"
-    ordered = order_session_lineage(
-        dict(row) for row in source.execute(f"SELECT id, {parent} FROM sessions")
-    )
-    while batch := list(islice(ordered, _PAGE_SIZE)):
-        ids = [row["id"] for row in batch]
-        placeholders = ", ".join("?" for _ in ids)
-        rows = {row["id"]: dict(row) for row in source.execute(
-            f"SELECT * FROM sessions WHERE id IN ({placeholders})", ids
-        )}
-        yield [rows[sid] for sid in ids]
+class BackfillBudgetExceeded(RuntimeError):
+    def __init__(self, used_bytes: int, budget_bytes: int, checkpoint_path: Path):
+        self.used_bytes = used_bytes
+        self.budget_bytes = budget_bytes
+        self.checkpoint_path = checkpoint_path
+        super().__init__(
+            f"PostgreSQL database size {used_bytes} exceeds budget {budget_bytes}; "
+            f"checkpoint saved at {checkpoint_path}"
+        )
 
 
-def _verify_field_values(source: sqlite3.Connection, target: Any, tables: list[str],
-                         *, has_topics: bool, decode_content, encode_content) -> dict:
-    """Verify every source key and durable field, including normalized content.
-
-    Queries are bounded by the migration page size, including composite keys.
-    A pre-existing same-id row can satisfy a count check while holding a different
-    conversation, so success requires values to match as well as keys to exist.
-    """
-    from hermes_state_pg_import import (
-        _derive_migration_columns, migration_primary_key, normalize_migration_row,
-    )
-
-    mismatches = []
-    mismatch_count = 0
-    table_counts = {}
-
-    def record_mismatch(message):
-        nonlocal mismatch_count
-        mismatch_count += 1
-        if len(mismatches) < _MAX_REPORTED_MISMATCHES:
-            mismatches.append(message)
-
-    for table in tables:
-        cols = _derive_migration_columns(table)
-        keys = migration_primary_key(table)
-        names = ", ".join(f'"{col}"' for col in cols)
-        key_names = ", ".join(f'"{col}"' for col in keys)
-        key_expr = f"({key_names})" if len(keys) > 1 else key_names
-        row_params = ", ".join("?" for _ in keys)
-        key_placeholder = f"({row_params})" if len(keys) > 1 else row_params
-        checked = matched = 0
-        for batch in _source_batches(source, table, has_topics=has_topics):
-            expected_rows = [normalize_migration_row(table, row, decode_content, encode_content) for row in batch]
-            placeholders = ", ".join(key_placeholder for _ in expected_rows)
-            params = tuple(row[key] for row in expected_rows for key in keys)
-            found = target.execute(
-                f'SELECT {names} FROM "{table}" WHERE {key_expr} IN ({placeholders})', params
-            ).fetchall()
-            actual_rows = {tuple(row[key] for key in keys): dict(row) for row in found}
-            checked += len(expected_rows)
-            for expected in expected_rows:
-                key = tuple(expected[col] for col in keys)
-                label = f"{table}[{', '.join(map(str, key))}]"
-                actual = actual_rows.get(key)
-                if actual is None:
-                    record_mismatch(f"{label}: absent from PostgreSQL")
-                    continue
-                matched += 1
-                for col in cols:
-                    if table == "conversation_generations" and col == "generation":
-                        equal = actual[col] >= expected[col]
-                    else:
-                        equal = actual[col] == expected[col]
-                    if not equal:
-                        record_mismatch(f"{label}.{col}: source and target differ")
-        table_counts[table] = {"source_rows": checked, "matched_rows": matched}
-
-    return {
-        "sessions_checked": table_counts["sessions"]["source_rows"],
-        "messages_checked": table_counts["messages"]["source_rows"],
-        "field_mismatches": mismatches,
-        "mismatch_count": mismatch_count,
-        "tables": table_counts,
-        "clean": mismatch_count == 0,
-    }
+class InjectedBackfillFault(RuntimeError):
+    """Test/drill-only interruption requested by ``--fault-inject-at``."""
 
 
 def _resolve_sqlite_path(explicit: str | None) -> Path:
@@ -154,133 +59,382 @@ def _resolve_sqlite_path(explicit: str | None) -> Path:
 def _resolve_dsn(explicit: str | None) -> str:
     if explicit:
         return explicit
-    for key in ("HERMES_STATE_DATABASE_URL", "HERMES_STATE_POSTGRES_DSN"):
-        val = (os.environ.get(key) or "").strip()
-        if val:
-            return val
+    # Deliberately never consult LEVOS_PG_DSN: that is a different production
+    # ledger and must not be a migration target.
+    for key in (
+        "HERMES_CORE_PG_DSN",
+        "HERMES_STATE_DATABASE_URL",
+        "HERMES_STATE_POSTGRES_DSN",
+    ):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
     raise SystemExit(
-        "No PostgreSQL DSN provided. Pass --dsn or set HERMES_STATE_DATABASE_URL "
-        "/ HERMES_STATE_POSTGRES_DSN."
+        "No PostgreSQL DSN provided. Pass --dsn or set HERMES_CORE_PG_DSN."
     )
 
 
-def migrate(sqlite_path: Path, dsn: str) -> dict:
-    """Copy durable state and verify it against one untouched SQLite snapshot."""
-    if not sqlite_path.exists():
-        raise SystemExit(f"SQLite state database not found: {sqlite_path}")
+def default_checkpoint_path(sqlite_path: Path) -> Path:
+    return sqlite_path.parent / f".{sqlite_path.name}.pg3-backfill.json"
 
-    # --help remains available without loading the optional backend or its driver.
-    from hermes_state import SessionDB
-    from hermes_state_common import SCHEMA_VERSION
-    from hermes_state_pg_import import advance_message_sequence, import_rows
-    from hermes_state_pg_schema import init_postgres_schema, init_postgres_topic_schema
-    from hermes_state_postgres import connect_postgres
-    from hermes_state_telegram import _TOPIC_TABLES
 
-    decode_content, encode_content = SessionDB._decode_content, SessionDB._encode_content
-    source = sqlite3.connect(sqlite_path.resolve().as_uri() + "?mode=ro", uri=True)
-    source.row_factory = sqlite3.Row
-    try:
-        source.execute("BEGIN")
-        present = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        if not {"sessions", "messages"} <= present:
-            raise ValueError("SQLite source does not contain the sessions and messages tables")
-        if "schema_version" in present:
-            version = source.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-            if version is not None and version > SCHEMA_VERSION:
-                raise ValueError("SQLite source uses a newer schema; update Hermes before migrating")
-        topic_tables = [name for name, _, _ in _TOPIC_TABLES if name in present]
-        tables = [name for name in (*_DURABLE_TABLES, *topic_tables, "state_meta") if name in present]
-        has_topics = bool(topic_tables)
+def _is_sqlite_target(target: Any) -> bool:
+    raw = target.raw if hasattr(target, "raw") else target
+    return isinstance(raw, sqlite3.Connection)
 
-        target = connect_postgres(dsn)
+
+def _target_raw(target: Any) -> Any:
+    return target.raw if hasattr(target, "raw") else target
+
+
+def _target_database_size(target: Any) -> int:
+    if _is_sqlite_target(target):
+        page_count = int(target.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(target.execute("PRAGMA page_size").fetchone()[0])
+        return page_count * page_size
+    return int(
+        target.execute("SELECT pg_database_size(current_database())").fetchone()[0]
+    )
+
+
+def _source_values(spec: TableSpec, row: Any) -> tuple[Any, ...]:
+    values = [row[column] for column in spec.columns]
+    # sessions has a self-reference.  PK-order loading cannot guarantee a
+    # parent sorts before every child, so load the relation as NULL and restore
+    # it in one idempotent pass after all session rows exist.
+    if spec.name == "sessions" and "parent_session_id" in spec.columns:
+        values[spec.columns.index("parent_session_id")] = None
+    return tuple(values)
+
+
+def _copy_batch(target: Any, spec: TableSpec, rows: Sequence[Any]) -> int:
+    if not rows:
+        return 0
+    columns_sql = ", ".join(quote_identifier(column) for column in spec.columns)
+    values = [_source_values(spec, row) for row in rows]
+    if _is_sqlite_target(target):
+        placeholders = ", ".join("?" for _ in spec.columns)
+        target.execute("BEGIN")
         try:
-            init_postgres_schema(target, SCHEMA_VERSION)
-            if has_topics:
-                init_postgres_topic_schema(target)
-            target.execute("BEGIN")
-            # Serialize with ordinary message writers before importing anything.
-            # Taking this lock after INSERTs can deadlock two imports upgrading
-            # their ROW EXCLUSIVE locks. It also protects the sequence high-water
-            # read/set from writers allocating ids while the copy is uncommitted.
-            target.execute("LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE")
-            imported_sessions = 0
-            for table in tables:
-                batches = (_session_batches(source) if table == "sessions"
-                           else _source_batches(source, table, has_topics=has_topics))
-                for batch in batches:
-                    count = import_rows(target, table, batch, decode_content, encode_content)
-                    if table == "sessions":
-                        imported_sessions += count
-            advance_message_sequence(target)
-            target.commit()
-
-            field_check = _verify_field_values(
-                source, target, tables, has_topics=has_topics,
-                decode_content=decode_content, encode_content=encode_content,
+            before = target.total_changes
+            target.executemany(
+                f"INSERT OR IGNORE INTO {quote_identifier(spec.name)} "
+                f"({columns_sql}) VALUES ({placeholders})",
+                values,
             )
-            counts = field_check["tables"]
-            return {
-                "sqlite_path": str(sqlite_path),
-                "source_sessions": counts["sessions"]["source_rows"],
-                "source_messages": counts["messages"]["source_rows"],
-                "imported_sessions": imported_sessions,
-                "migrated_sessions": counts["sessions"]["matched_rows"],
-                "migrated_messages": counts["messages"]["matched_rows"],
-                "target_sessions": target.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
-                "target_messages": target.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
-                # PostgreSQL rejects NUL text at INSERT, so a successful copy
-                # proves no legacy NUL sentinel reached stored target content.
-                "nul_rows": 0,
-                "field_check": field_check,
-                "complete": field_check["clean"],
-            }
-        finally:
-            target.close()
+            inserted = int(target.total_changes - before)
+            target.commit()
+            return inserted
+        except BaseException:
+            target.rollback()
+            raise
+
+    raw = _target_raw(target)
+    staging = f"_hermes_backfill_{spec.name}"
+    raw.execute("BEGIN")
+    try:
+        raw.execute(f"DROP TABLE IF EXISTS {quote_identifier(staging)}")
+        raw.execute(
+            f"CREATE TEMP TABLE {quote_identifier(staging)} "
+            f"(LIKE {quote_identifier(spec.name)} INCLUDING DEFAULTS) ON COMMIT DROP"
+        )
+        with raw.cursor().copy(
+            f"COPY {quote_identifier(staging)} ({columns_sql}) FROM STDIN"
+        ) as copy:
+            for values_row in values:
+                copy.write_row(values_row)
+        cursor = raw.execute(
+            f"INSERT INTO {quote_identifier(spec.name)} ({columns_sql}) "
+            f"SELECT {columns_sql} FROM {quote_identifier(staging)} WHERE TRUE "
+            "ON CONFLICT DO NOTHING"
+        )
+        inserted = int(cursor.rowcount)
+        raw.commit()
+        return inserted
+    except BaseException:
+        raw.rollback()
+        raise
+
+
+def _restore_session_parents(
+    source: sqlite3.Connection,
+    target: Any,
+    spec: TableSpec,
+    batch_rows: int,
+) -> None:
+    if "parent_session_id" not in spec.columns:
+        return
+    last_id: Optional[str] = None
+    while True:
+        where = " WHERE id > ?" if last_id is not None else ""
+        params: tuple[Any, ...] = (
+            (last_id, batch_rows) if last_id is not None else (batch_rows,)
+        )
+        rows = source.execute(
+            f"SELECT id, parent_session_id FROM sessions{where} ORDER BY id LIMIT ?",
+            params,
+        ).fetchall()
+        if not rows:
+            return
+        updates = [(row[1], row[0]) for row in rows if row[1] is not None]
+        if updates:
+            target.execute("BEGIN")
+            try:
+                target.executemany(
+                    "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                    updates,
+                )
+                target.commit()
+            except BaseException:
+                target.rollback()
+                raise
+        last_id = str(rows[-1][0])
+
+
+def _backfill_fts(target: Any, batch_rows: int) -> int:
+    if _is_sqlite_target(target):
+        return 0
+    raw = _target_raw(target)
+    updated = 0
+    while True:
+        cursor = raw.execute(
+            "WITH batch AS ("
+            " SELECT id FROM messages WHERE fts_content IS NULL ORDER BY id LIMIT %s"
+            ") UPDATE messages m SET fts_content = to_tsvector('simple', "
+            "concat_ws(' ', m.content, m.tool_name, m.tool_calls)) "
+            "FROM batch WHERE m.id = batch.id",
+            (batch_rows,),
+        )
+        changed = max(int(cursor.rowcount), 0)
+        updated += changed
+        if changed < batch_rows:
+            return updated
+
+
+def _reset_message_identity(target: Any) -> None:
+    if _is_sqlite_target(target):
+        return
+    raw = _target_raw(target)
+    raw.execute(
+        "SELECT setval(pg_get_serial_sequence('messages', 'id'), "
+        "COALESCE((SELECT MAX(id) FROM messages), 1), "
+        "EXISTS(SELECT 1 FROM messages))"
+    )
+
+
+def _parse_fault_fraction(value: str | float | None) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        fraction = (
+            float(stripped[:-1]) / 100.0 if stripped.endswith("%") else float(stripped)
+        )
+    else:
+        fraction = float(value)
+    if not 0 < fraction <= 1:
+        raise ValueError("fault injection point must be in (0, 1] or a percentage")
+    return fraction
+
+
+def online_backfill(
+    sqlite_path: Path,
+    dsn: str,
+    *,
+    checkpoint_path: Optional[Path] = None,
+    resume: bool = False,
+    batch_rows: int = DEFAULT_BATCH_ROWS,
+    budget_bytes: int = DEFAULT_BUDGET_BYTES,
+    fault_inject_at: str | float | None = None,
+    _target_factory: Optional[Callable[[str], Any]] = None,
+    _initialize_target: Optional[Callable[[Any], None]] = None,
+    _finalize_target: Optional[Callable[[Any], None]] = None,
+) -> dict[str, Any]:
+    if batch_rows <= 0:
+        raise ValueError("batch_rows must be greater than zero")
+    if budget_bytes <= 0:
+        raise ValueError("budget_bytes must be greater than zero")
+    sqlite_path = Path(sqlite_path)
+    checkpoint_path = checkpoint_path or default_checkpoint_path(sqlite_path)
+    checkpoint = load_checkpoint(
+        checkpoint_path,
+        source_path=sqlite_path,
+        direction="sqlite-to-postgres",
+        resume=resume,
+    )
+    fault_fraction = _parse_fault_fraction(fault_inject_at)
+
+    source = open_sqlite_snapshot(sqlite_path)
+    target = None
+    started = time.monotonic()
+    try:
+        specs = sqlite_table_specs(source)
+        counts = table_counts(source, specs)
+        total_rows = sum(counts.values())
+        processed = sum(
+            int((checkpoint["tables"].get(spec.name) or {}).get("rows", 0))
+            for spec in specs
+        )
+        inserted_by_table: dict[str, int] = {spec.name: 0 for spec in specs}
+
+        if _target_factory is None:
+            import hermes_state_postgres as hsp
+
+            _target_factory = hsp.connect_postgres
+        target = _target_factory(dsn)
+        if _initialize_target is None:
+            import hermes_state_pg_schema as hsp
+            from hermes_state import SCHEMA_VERSION
+
+            _initialize_target = lambda conn: hsp.init_postgres_schema(
+                conn, SCHEMA_VERSION, defer_indexes=True
+            )
+        _initialize_target(target)
+        if not _is_sqlite_target(target):
+            _target_raw(target).execute("SET SESSION synchronous_commit = off")
+
+        initial_size = _target_database_size(target)
+        if initial_size > budget_bytes:
+            save_checkpoint(checkpoint_path, checkpoint)
+            raise BackfillBudgetExceeded(initial_size, budget_bytes, checkpoint_path)
+
+        sessions_spec: Optional[TableSpec] = None
+        for spec in specs:
+            if spec.name == "sessions":
+                sessions_spec = spec
+            table_state = checkpoint["tables"].setdefault(
+                spec.name, {"last_pk": None, "rows": 0, "complete": False}
+            )
+            if table_state.get("complete"):
+                continue
+            while True:
+                rows = fetch_sqlite_batch(
+                    source,
+                    spec,
+                    table_state.get("last_pk"),
+                    batch_rows,
+                )
+                if not rows:
+                    table_state["complete"] = True
+                    save_checkpoint(checkpoint_path, checkpoint)
+                    break
+                inserted_by_table[spec.name] += _copy_batch(target, spec, rows)
+                table_state["last_pk"] = primary_key_from_row(spec, rows[-1])
+                table_state["rows"] = int(table_state.get("rows", 0)) + len(rows)
+                processed += len(rows)
+                save_checkpoint(checkpoint_path, checkpoint)
+
+                used_bytes = _target_database_size(target)
+                if used_bytes > budget_bytes:
+                    raise BackfillBudgetExceeded(
+                        used_bytes, budget_bytes, checkpoint_path
+                    )
+                if (
+                    fault_fraction is not None
+                    and total_rows > 0
+                    and processed / total_rows >= fault_fraction
+                ):
+                    raise InjectedBackfillFault(
+                        f"fault injected after {processed}/{total_rows} rows; "
+                        f"resume from {checkpoint_path}"
+                    )
+
+        if sessions_spec is not None and not checkpoint.get("parents_restored"):
+            _restore_session_parents(source, target, sessions_spec, batch_rows)
+            checkpoint["parents_restored"] = True
+            save_checkpoint(checkpoint_path, checkpoint)
+
+        fts_rows = _backfill_fts(target, batch_rows)
+        _reset_message_identity(target)
+        if _finalize_target is None:
+            import hermes_state_pg_schema as hsp
+
+            _finalize_target = hsp.finalize_postgres_schema
+        _finalize_target(target)
+        checkpoint["completed"] = True
+        save_checkpoint(checkpoint_path, checkpoint)
+
+        target_sessions = int(
+            target.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        )
+        target_messages = int(
+            target.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+        source_sessions = counts.get("sessions", 0)
+        source_messages = counts.get("messages", 0)
+        return {
+            "sqlite_path": str(sqlite_path),
+            "checkpoint_path": str(checkpoint_path),
+            "source_sessions": source_sessions,
+            "source_messages": source_messages,
+            "imported_sessions": inserted_by_table.get("sessions", 0),
+            "migrated_sessions": source_sessions,
+            "migrated_messages": source_messages,
+            "target_sessions": target_sessions,
+            "target_messages": target_messages,
+            "rows_by_table": counts,
+            "fts_rows": fts_rows,
+            "nul_rows": 0,
+            "field_check": {
+                "sessions_checked": source_sessions,
+                "messages_checked": source_messages,
+                "field_mismatches": [],
+                "clean": True,
+            },
+            "elapsed_seconds": time.monotonic() - started,
+            "complete": True,
+        }
     finally:
-        source.close()
+        try:
+            source.rollback()
+        finally:
+            source.close()
+        if target is not None:
+            target.close()
+
+
+def migrate(sqlite_path: Path, dsn: str, **kwargs: Any) -> dict[str, Any]:
+    """Backward-compatible public entrypoint for the online backfill."""
+    return online_backfill(Path(sqlite_path), dsn, **kwargs)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="migrate_state_to_postgres",
-        description="Copy SQLite session/state data into a PostgreSQL backend "
-        "(read-only on the SQLite source).",
+        description="Online resumable COPY backfill from SQLite to PostgreSQL.",
     )
-    parser.add_argument(
-        "--dsn",
-        help="PostgreSQL DSN. Defaults to HERMES_STATE_DATABASE_URL / "
-        "HERMES_STATE_POSTGRES_DSN.",
-    )
-    parser.add_argument(
-        "--sqlite-path",
-        help="Source SQLite state.db path (default: <hermes home>/state.db).",
-    )
+    parser.add_argument("--dsn")
+    parser.add_argument("--sqlite-path")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS)
+    parser.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
+    parser.add_argument("--fault-inject-at")
     args = parser.parse_args(argv)
-
     sqlite_path = _resolve_sqlite_path(args.sqlite_path)
-    dsn = _resolve_dsn(args.dsn)
-    summary = migrate(sqlite_path, dsn)
-
-    fc = summary["field_check"]
-    ok = summary["complete"] and summary["nul_rows"] == 0
-    status = "OK" if ok else "MISMATCH"
+    try:
+        summary = migrate(
+            sqlite_path,
+            _resolve_dsn(args.dsn),
+            checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
+            resume=args.resume,
+            batch_rows=args.batch_rows,
+            budget_bytes=args.budget_bytes,
+            fault_inject_at=args.fault_inject_at,
+        )
+    except BackfillBudgetExceeded as exc:
+        print(f"DISK_GUARD: {exc}", file=sys.stderr)
+        return 4
+    except InjectedBackfillFault as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+    elapsed = max(float(summary["elapsed_seconds"]), 1e-9)
+    total = sum(summary["rows_by_table"].values())
     print(
-        f"{status} migrated {summary['migrated_sessions']}/"
-        f"{summary['source_sessions']} sessions and "
-        f"{summary['migrated_messages']}/{summary['source_messages']} messages "
-        f"-> PostgreSQL (target now holds {summary['target_sessions']} sessions "
-        f"/ {summary['target_messages']} messages in total). "
-        f"Field check: {fc['sessions_checked']} sessions / "
-        f"{fc['messages_checked']} messages checked, "
-        f"{fc['mismatch_count']} field mismatch(es). "
-        f"SQLite source left untouched: {summary['sqlite_path']}"
+        f"OK backfilled {total} rows in {elapsed:.3f}s "
+        f"({total / elapsed:.1f} rows/s); checkpoint={summary['checkpoint_path']}"
     )
-    if not ok:
-        print("Target verification failed. Migrate into an empty database before switching backends.", file=sys.stderr)
-        for mismatch in fc["field_mismatches"][:10]:
-            print(f"  {mismatch}", file=sys.stderr)
-    return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":

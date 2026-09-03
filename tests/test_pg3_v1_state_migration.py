@@ -7,6 +7,11 @@ import pytest
 
 import hermes_state_dual
 from hermes_state import SessionDB
+from migrate_state_to_postgres import (
+    BackfillBudgetExceeded,
+    InjectedBackfillFault,
+    online_backfill,
+)
 
 
 def _init_sqlite_replica(path: Path) -> None:
@@ -118,3 +123,87 @@ def test_dual_write_rejects_database_local_clock_before_source_commit() -> None:
         )
     source.rollback()
     assert source.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def _seed_sessions(path: Path, count: int) -> None:
+    db = SessionDB(db_path=path)
+    try:
+        for index in range(count):
+            session_id = f"s-{index:04d}"
+            db.create_session(session_id, "cli")
+            db.append_message(
+                session_id,
+                "user",
+                f"payload {index}",
+                timestamp=float(index + 1),
+            )
+    finally:
+        db.close()
+
+
+def test_backfill_resume_after_fifty_percent_fault_uses_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    checkpoint = tmp_path / "backfill.json"
+    _seed_sessions(source_path, 20)
+    _init_sqlite_replica(target_path)
+
+    def target_factory(_dsn: str):
+        conn = sqlite3.connect(target_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    common = {
+        "checkpoint_path": checkpoint,
+        "batch_rows": 3,
+        "budget_bytes": 1024 * 1024 * 1024,
+        "_target_factory": target_factory,
+        "_initialize_target": lambda _conn: None,
+        "_finalize_target": lambda _conn: None,
+    }
+    with pytest.raises(InjectedBackfillFault):
+        online_backfill(
+            source_path,
+            "test-only",
+            fault_inject_at="50%",
+            **common,
+        )
+
+    summary = online_backfill(
+        source_path,
+        "test-only",
+        resume=True,
+        **common,
+    )
+    assert summary["complete"] is True
+    assert summary["source_sessions"] == 20
+    assert summary["source_messages"] == 20
+    assert _ledger_rows(source_path) == _ledger_rows(target_path)
+
+
+def test_backfill_resume_disk_guard_saves_checkpoint_and_uses_rc4_error(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    checkpoint = tmp_path / "backfill.json"
+    _seed_sessions(source_path, 1)
+    _init_sqlite_replica(target_path)
+
+    def target_factory(_dsn: str):
+        return sqlite3.connect(target_path, isolation_level=None)
+
+    with pytest.raises(BackfillBudgetExceeded) as raised:
+        online_backfill(
+            source_path,
+            "test-only",
+            checkpoint_path=checkpoint,
+            budget_bytes=1,
+            _target_factory=target_factory,
+            _initialize_target=lambda _conn: None,
+            _finalize_target=lambda _conn: None,
+        )
+    assert raised.value.checkpoint_path == checkpoint
+    assert checkpoint.is_file()

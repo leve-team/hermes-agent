@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
 from hermes_cli.colors import Colors, color
@@ -110,7 +111,27 @@ def cmd_migrate_state_to_postgres(args: Any) -> int:
 
     # --- Run the migration ---
     try:
-        summary = _m2pg.migrate(sqlite_path, dsn)
+        summary = _m2pg.migrate(
+            sqlite_path,
+            dsn,
+            checkpoint_path=(
+                Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
+            ),
+            resume=bool(getattr(args, "resume", False)),
+            batch_rows=int(
+                getattr(args, "batch_rows", _m2pg.DEFAULT_BATCH_ROWS)
+            ),
+            budget_bytes=int(
+                getattr(args, "budget_bytes", _m2pg.DEFAULT_BUDGET_BYTES)
+            ),
+            fault_inject_at=getattr(args, "fault_inject_at", None),
+        )
+    except _m2pg.BackfillBudgetExceeded as exc:
+        print(f"  {color('✗', Colors.RED)} DISK_GUARD: {exc}", file=sys.stderr)
+        return 4
+    except _m2pg.InjectedBackfillFault as exc:
+        print(f"  {color('✗', Colors.RED)} {exc}", file=sys.stderr)
+        return 3
     except SystemExit as exc:
         # migrate() raises SystemExit for user-facing errors (missing file,
         # missing postgres extra, etc.).
