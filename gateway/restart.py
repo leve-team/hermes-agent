@@ -42,6 +42,13 @@ SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
+# Kubernetes and other process supervisors need time after the in-flight turn
+# wait to interrupt a wedged worker, flush state, close adapters, and release
+# storage handles.  ``agent.termination_grace_seconds`` describes the outer
+# supervisor deadline; SIGTERM reserves this tail instead of spending the
+# entire grace period waiting for turns.
+SIGNAL_DRAIN_CLEANUP_RESERVE_S = 30.0
+
 
 def is_global_startup_conflict(error_code: str | None) -> bool:
     """True when an adapter's fatal error is a single-writer ownership conflict.
@@ -96,6 +103,38 @@ def _parse_timeout_keeping_zero(raw: object, default: float, *, finite: bool = F
 def parse_restart_drain_timeout(raw: object) -> float:
     """Parse a configured drain timeout; falsy (incl. ``0``) falls back to the shared default."""
     return _parse_timeout_keeping_zero(raw or None, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+
+
+def parse_termination_grace_seconds(raw: object) -> float | None:
+    """Parse the optional outer supervisor termination deadline.
+
+    ``None`` and blank strings leave the existing ``restart_drain_timeout``
+    behavior untouched.  A configured value is clamped at zero so malformed
+    negative grace periods cannot lengthen shutdown accidentally.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_signal_drain_timeout(
+    configured_drain_timeout: float,
+    termination_grace_seconds: float | None,
+    *,
+    cleanup_reserve_s: float = SIGNAL_DRAIN_CLEANUP_RESERVE_S,
+) -> float:
+    """Return the in-flight-turn budget for a supervisor SIGTERM.
+
+    When the outer grace is known, it is authoritative and the final
+    ``cleanup_reserve_s`` seconds stay available for forced interruption and
+    teardown.  Without it, preserve the pre-existing configured drain budget.
+    """
+    if termination_grace_seconds is None:
+        return max(0.0, float(configured_drain_timeout))
+    return max(0.0, float(termination_grace_seconds) - max(0.0, cleanup_reserve_s))
 
 
 def parse_restart_after_turn_timeout(raw: object) -> float:

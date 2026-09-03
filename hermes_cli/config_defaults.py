@@ -83,6 +83,13 @@ DEFAULT_CONFIG = {
         # TimeoutStopSec or risk SIGKILL mid-cleanup; for /restart prefer restart_after_turn_timeout
         # so turns finish BEFORE stop().
         "restart_drain_timeout": 0,
+        # Optional outer supervisor termination deadline (seconds). On
+        # SIGTERM, Hermes stops intake immediately and waits for in-flight
+        # turns for at most this value minus a fixed 30s teardown reserve.
+        # None preserves restart_drain_timeout behavior. Set this from
+        # config.yaml to the pod/systemd grace; it is deliberately not an env
+        # setting because non-secret behavior belongs in config.
+        "termination_grace_seconds": None,
         # Cron-only floor under the stop()/drain wait (seconds). Interrupted chat turns resume on
         # the next message, but an interrupted cron run is recorded as a permanent failure, so it
         # must not inherit restart_drain_timeout's 0. Clamped to the shutdown-watchdog leash minus

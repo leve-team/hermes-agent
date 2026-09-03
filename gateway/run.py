@@ -3337,6 +3337,8 @@ class GatewayRunner(
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    _termination_grace_seconds: Optional[float] = None
+    _shutdown_signal_received: Optional[int] = None
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     _signal_interrupt_grace_timeout: float = DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
@@ -3463,6 +3465,7 @@ class GatewayRunner(
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._termination_grace_seconds = self._load_termination_grace_seconds()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
@@ -5046,6 +5049,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
 
             _best_effort(_log_context, "format_context_for_log failed: %s")
             _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
+        runner._begin_signal_drain(received_signal)
         asyncio.create_task(runner.stop())
     return shutdown_signal_handler
 

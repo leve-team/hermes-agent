@@ -21,7 +21,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
     parse_restart_after_turn_timeout, parse_restart_drain_timeout,
-    parse_signal_interrupt_grace_timeout,
+    parse_signal_interrupt_grace_timeout, parse_termination_grace_seconds,
 )
 from gateway.session import SessionSource
 from gateway.session_state import SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET
@@ -323,6 +323,18 @@ class GatewayConfigLoadersMixin:
         value = parse_restart_drain_timeout(raw)
         if raw and value == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT:
             cls._warn_unparsable_timeout("restart_drain_timeout", raw, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
+        return value
+
+    @staticmethod
+    def _load_termination_grace_seconds() -> Optional[float]:
+        """Load the outer supervisor grace from config.yaml only (levos)."""
+        from gateway.run import _load_gateway_runtime_config
+        raw = cfg_get(_load_gateway_runtime_config(), "agent", "termination_grace_seconds", default=None)
+        value = parse_termination_grace_seconds(raw)
+        if raw is not None and str(raw).strip() and value is None:
+            logger.warning(
+                "Invalid termination_grace_seconds %r; preserving restart_drain_timeout behavior", raw
+            )
         return value
 
     @classmethod

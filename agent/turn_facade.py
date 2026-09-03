@@ -199,6 +199,34 @@ class TurnFacadeMixin:
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
 
+    def release_active_session_turn_lease(self, *, reason: str, clear: bool = False) -> bool:
+        """Release this agent's durable turn lease with its fencing token (levos).
+
+        Shutdown uses ``clear=False`` deliberately: a worker that outlives the
+        drain must keep presenting its old holder and epoch so any late write
+        fails closed. The normal turn finalizer clears the attributes after it
+        has unwound.
+        """
+        holder = getattr(self, "_active_session_turn_lease_holder", None)
+        if not holder:
+            return False
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        epoch = getattr(self, "_active_session_turn_lease_epoch", None)
+        if not session_id or session_db is None:
+            return False
+        session_db.release_session_turn_lease(
+            session_id, holder, **({"lease_epoch": epoch} if epoch is not None else {}),
+        )
+        logger.warning(
+            "Released active session turn lease: session=%s epoch=%s reason=%s", session_id, epoch, reason,
+        )
+        if clear and self._active_session_turn_lease_holder == holder:
+            self._active_session_turn_lease_holder = None
+            self._active_session_turn_lease_ttl_seconds = None
+            self._active_session_turn_lease_epoch = None
+        return True
+
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""
         return self.run_conversation(message, stream_callback=stream_callback)["final_response"]
