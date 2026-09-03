@@ -635,3 +635,33 @@ def test_flush_messages_to_session_db_fences_stale_holder_on_live_db(tmp_path):
     second.release_session_turn_lease("shared", next_holder)
     first.close()
     second.close()
+
+
+def test_shutdown_release_uses_epoch_and_retains_stale_fence(tmp_path, caplog):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    holder = "pid=1:turn=shutdown"
+    assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=5)
+    epoch = db.session_turn_lease_epoch("shared", holder)
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "shared"
+    agent._session_db = db
+    agent._active_session_turn_lease_holder = holder
+    agent._active_session_turn_lease_ttl_seconds = 5.0
+    agent._active_session_turn_lease_epoch = epoch
+
+    assert agent.release_active_session_turn_lease(
+        reason="shutdown drain timeout", clear=False
+    )
+    row = db._conn.execute(
+        "SELECT holder, lease_epoch FROM session_turn_leases "
+        "WHERE conversation_id = ?",
+        ("shared",),
+    ).fetchone()
+
+    assert dict(row) == {"holder": "", "lease_epoch": epoch + 1}
+    assert agent._active_session_turn_lease_holder == holder
+    assert agent._active_session_turn_lease_epoch == epoch
+    assert "Released active session turn lease" in caplog.text
+    db.close()

@@ -8958,7 +8958,13 @@ class AIAgent:
                     if durable_turn_lease is not None:
                         try:
                             _turn_db.release_session_turn_lease(
-                                session_id, durable_turn_lease
+                                session_id,
+                                durable_turn_lease,
+                                **(
+                                    {"lease_epoch": durable_turn_lease_epoch}
+                                    if durable_turn_lease_epoch is not None
+                                    else {}
+                                ),
                             )
                         except Exception:
                             logger.error(
@@ -8985,6 +8991,44 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+
+    def release_active_session_turn_lease(
+        self,
+        *,
+        reason: str,
+        clear: bool = False,
+    ) -> bool:
+        """Release this agent's durable turn lease with its fencing token.
+
+        Shutdown uses ``clear=False`` deliberately: a worker that outlives the
+        drain must keep presenting its old holder and epoch so any late write
+        fails closed. The normal turn finalizer clears the attributes after it
+        has unwound.
+        """
+        holder = getattr(self, "_active_session_turn_lease_holder", None)
+        if not holder:
+            return False
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        epoch = getattr(self, "_active_session_turn_lease_epoch", None)
+        if not session_id or session_db is None:
+            return False
+        session_db.release_session_turn_lease(
+            session_id,
+            holder,
+            **({"lease_epoch": epoch} if epoch is not None else {}),
+        )
+        logger.warning(
+            "Released active session turn lease: session=%s epoch=%s reason=%s",
+            session_id,
+            epoch,
+            reason,
+        )
+        if clear and self._active_session_turn_lease_holder == holder:
+            self._active_session_turn_lease_holder = None
+            self._active_session_turn_lease_ttl_seconds = None
+            self._active_session_turn_lease_epoch = None
+        return True
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

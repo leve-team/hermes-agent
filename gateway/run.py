@@ -2703,7 +2703,9 @@ from gateway.restart import (
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
+    parse_termination_grace_seconds,
     resolve_cron_drain_budget,
+    resolve_signal_drain_timeout,
 )
 
 
@@ -6735,6 +6737,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    _termination_grace_seconds: Optional[float] = None
+    _shutdown_signal_received: Optional[int] = None
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
@@ -6883,6 +6887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        self._termination_grace_seconds = self._load_termination_grace_seconds()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._provider_routing = self._load_provider_routing()
@@ -9723,6 +9728,101 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
                 )
         return value
+
+    @staticmethod
+    def _load_termination_grace_seconds() -> Optional[float]:
+        """Load the outer supervisor grace from config.yaml only."""
+        cfg = _load_gateway_runtime_config()
+        raw = cfg_get(cfg, "agent", "termination_grace_seconds", default=None)
+        value = parse_termination_grace_seconds(raw)
+        if raw is not None and str(raw).strip() and value is None:
+            logger.warning(
+                "Invalid termination_grace_seconds %r; preserving "
+                "restart_drain_timeout behavior",
+                raw,
+            )
+        return value
+
+    def _begin_signal_drain(self, received_signal: Optional[int]) -> None:
+        """Synchronously stop intake and publish not-ready before teardown.
+
+        The asyncio signal callback invokes this before scheduling ``stop()``.
+        That closes the small admission window where Kubernetes had delivered
+        SIGTERM but readiness and message intake still advertised ``running``.
+        """
+        if self._shutdown_signal_received is None:
+            self._shutdown_signal_received = received_signal
+        self._running = False
+        self._draining = True
+        self._update_runtime_status("draining")
+
+        if received_signal == signal.SIGTERM:
+            prior_timeout = self._restart_drain_timeout
+            self._restart_drain_timeout = resolve_signal_drain_timeout(
+                prior_timeout,
+                getattr(self, "_termination_grace_seconds", None),
+            )
+            logger.info(
+                "SIGTERM drain engaged: readiness=false, active_work=%d, "
+                "turn_budget=%.1fs, termination_grace=%s",
+                self._active_work_count(),
+                self._restart_drain_timeout,
+                (
+                    f"{self._termination_grace_seconds:.1f}s"
+                    if self._termination_grace_seconds is not None
+                    else "unconfigured"
+                ),
+            )
+
+    def _release_shutdown_turn_leases(self, active_agents: Dict[str, Any]) -> int:
+        """Fence timed-out workers by releasing their durable turn leases.
+
+        The agent retains its holder and epoch attributes after this call. If
+        its worker thread wakes after shutdown moved on, any late transcript
+        flush still presents the stale token and is rejected instead of
+        silently writing without a fence.
+        """
+        agents: Dict[int, Any] = {
+            id(agent): agent for agent in active_agents.values() if agent is not None
+        }
+        for agent in list(getattr(self, "_running_agents", {}).values()):
+            if agent is not None:
+                agents[id(agent)] = agent
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            snapshot = getattr(adapter, "shutdown_active_agents_snapshot", None)
+            if callable(snapshot):
+                for agent in snapshot():
+                    if agent is not None:
+                        agents[id(agent)] = agent
+        except Exception as exc:
+            logger.debug("Failed snapshotting API agents for lease release: %s", exc)
+
+        released = 0
+        for agent in agents.values():
+            release = getattr(agent, "release_active_session_turn_lease", None)
+            if not callable(release):
+                continue
+            try:
+                if release(reason="shutdown drain timeout", clear=False):
+                    released += 1
+            except Exception as exc:
+                logger.error(
+                    "Failed to release session turn lease during shutdown: %s",
+                    exc,
+                    exc_info=True,
+                )
+        logger.warning(
+            "%s drain deadline exceeded; force path released %d durable "
+            "session turn lease(s)",
+            (
+                signal.Signals(self._shutdown_signal_received).name
+                if self._shutdown_signal_received is not None
+                else "Gateway"
+            ),
+            released,
+        )
+        return released
 
     @staticmethod
     def _load_restart_after_turn_timeout() -> float:
@@ -14856,6 +14956,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Re-signaled interrupt for work still live at settle-window exit"
                     )
+
+                # Anything still unwinding after the cooperative interrupt
+                # must lose write authority before a replacement pod starts.
+                # Epoch-qualified release makes a late old-worker release a
+                # no-op if a successor has already acquired the same holder.
+                self._release_shutdown_turn_leases(active_agents)
 
                 # Kill lingering tool subprocesses NOW, before we spend more
                 # budget on adapter disconnect / session DB close.  Under
@@ -30603,6 +30709,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
+        runner._begin_signal_drain(received_signal)
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():

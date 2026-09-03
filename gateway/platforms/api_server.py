@@ -1518,6 +1518,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 dict.fromkeys(self._shutdown_resume_session_keys.values())
             )
 
+    def shutdown_active_agents_snapshot(self) -> tuple[Any, ...]:
+        """Snapshot all constructed API agents for shutdown lease fencing."""
+        agents: Dict[int, Any] = {}
+        for agent in list(self._active_run_agents.values()):
+            if agent is not None:
+                agents[id(agent)] = agent
+        for agent in list(self._shutdown_interruptible_agents.values()):
+            if agent is not None:
+                agents[id(agent)] = agent
+        return tuple(agents.values())
+
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
 
@@ -1544,19 +1555,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         Returns the number of agents that accepted an interrupt.
         """
-        agents: Dict[int, Any] = {}
-        for agent in list(self._active_run_agents.values()):
-            if agent is not None:
-                agents[id(agent)] = agent
-        for agent in list(self._shutdown_interruptible_agents.values()):
-            if agent is not None:
-                # Dedupe by object identity — the two registries are disjoint
-                # today (/v1/runs runs its own lifecycle, not _run_agent), but
-                # an agent published to both must still be interrupted once.
-                agents[id(agent)] = agent
-
         interrupted = 0
-        for agent in agents.values():
+        for agent in self.shutdown_active_agents_snapshot():
             try:
                 if request_hard_interrupt(agent, reason):
                     interrupted += 1

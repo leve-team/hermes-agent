@@ -1,4 +1,5 @@
 import asyncio
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -102,6 +103,70 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     assert runner._pending_messages == {}
     assert runner._pending_approvals == {}
     assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_sigterm_marks_not_ready_then_waits_for_inflight_turn_to_finish():
+    runner, adapter = make_restart_runner()
+    runner._termination_grace_seconds = 31.0
+    adapter.disconnect = AsyncMock()
+    agent = MagicMock()
+    runner._running_agents = {"session": agent}
+
+    async def finish_turn():
+        await asyncio.sleep(0.01)
+        runner._running_agents.clear()
+
+    finish_task = asyncio.create_task(finish_turn())
+    runner._begin_signal_drain(signal.SIGTERM)
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+    await finish_task
+
+    assert _persisted_states(runner)[0] == "draining"
+    assert runner._restart_drain_timeout == 1.0
+    agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_deadline_forces_exit_and_epoch_lease_release(caplog):
+    runner, adapter = make_restart_runner()
+    runner._termination_grace_seconds = 30.01
+    adapter.disconnect = AsyncMock()
+    agent = MagicMock()
+    agent.release_active_session_turn_lease.return_value = True
+    runner._running_agents = {"session": agent}
+    agent.interrupt.side_effect = lambda *a, **k: runner._running_agents.clear()
+
+    runner._begin_signal_drain(signal.SIGTERM)
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    agent.interrupt.assert_called_once_with("Gateway shutting down")
+    agent.release_active_session_turn_lease.assert_called_once_with(
+        reason="shutdown drain timeout", clear=False
+    )
+    assert "SIGTERM drain deadline exceeded" in caplog.text
+    assert "released 1 durable session turn lease" in caplog.text
+
+
+def test_force_release_includes_agent_materialized_after_drain_snapshot():
+    runner, _adapter = make_restart_runner()
+    late_agent = MagicMock()
+    late_agent.release_active_session_turn_lease.return_value = True
+    runner._running_agents = {"late-session": late_agent}
+
+    released = runner._release_shutdown_turn_leases({})
+
+    assert released == 1
+    late_agent.release_active_session_turn_lease.assert_called_once_with(
+        reason="shutdown drain timeout", clear=False
+    )
 
 
 @pytest.mark.asyncio
@@ -322,5 +387,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
-

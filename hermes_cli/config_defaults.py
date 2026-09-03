@@ -97,6 +97,13 @@ DEFAULT_CONFIG = {
         # (/restart, SIGUSR1), prefer restart_after_turn_timeout below so
         # active turns finish *before* stop() begins (#77184).
         "restart_drain_timeout": 0,
+        # Optional outer supervisor termination deadline (seconds). On
+        # SIGTERM, Hermes stops intake immediately and waits for in-flight
+        # turns for at most this value minus a fixed 30s teardown reserve.
+        # None preserves restart_drain_timeout behavior. Set this from
+        # config.yaml to the pod/systemd grace; it is deliberately not an env
+        # setting because non-secret behavior belongs in config.
+        "termination_grace_seconds": None,
         # Cron-only floor under the stop()/drain wait (seconds). A chat turn
         # interrupted by a restart is announced to the user and resumed on
         # their next message; an interrupted cron run is written to jobs.json
