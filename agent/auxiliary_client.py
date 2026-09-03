@@ -633,6 +633,12 @@ def _compression_threshold_for_model(
     Arcee Trinity Large Thinking → 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
     → 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark → 0.70, ungated.
     """
+    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if (
+        (provider or "").strip().lower() == "openai-codex"
+        and bare_model.startswith("gpt-5.6-sol")
+    ):
+        return 0.3
     if _is_arcee_trinity_thinking(model):
         return 0.75
     if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
@@ -4627,6 +4633,28 @@ def _resolve_openai_codex_branch(req: _ResolveRequest) -> _ResolveResult:
                        "or auxiliary.<task>.model for per-task aux routing).")
         return None, None
     no_token_msg = "resolve_provider_client: openai-codex requested but no Codex OAuth token found (run: hermes model)"
+    # levos hotfix: the active main session may use provider=openai-codex through an
+    # operator-supplied Responses proxy.  That endpoint is already the
+    # authenticated/trusted runtime path; replacing it with chatgpt.com here makes
+    # compression perform an unrelated device-code lookup.  Only the canonical
+    # ChatGPT Codex URL belongs to the OAuth pool.
+    runtime_base_url = str(req.explicit_base_url or "").strip().rstrip("/")
+    canonical_base_url = _CODEX_AUX_BASE_URL.rstrip("/")
+    if runtime_base_url and runtime_base_url.lower() != canonical_base_url.lower():
+        runtime_api_key = (req.explicit_api_key or "").strip() or "no-key-required"
+        final_model = _normalize_resolved_model(model, req.provider)
+        clean_base_url, default_query = _extract_url_query_params(_to_openai_base_url(runtime_base_url))
+        client_kwargs = {}
+        if default_query:
+            client_kwargs["default_query"] = default_query
+        default_headers = _apply_user_default_headers(None)
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+        real_client = _create_openai_client(api_key=runtime_api_key, base_url=clean_base_url, **client_kwargs)
+        logger.info("resolve_provider_client: using explicit main-runtime Codex Responses endpoint %s", clean_base_url)
+        if req.raw_codex:
+            return real_client, final_model
+        return _route_client(req, CodexAuxiliaryClient(real_client, final_model), final_model)
     if req.raw_codex:
         # Raw OpenAI client for callers needing responses.stream() (main agent loop).
         codex_token = _read_codex_access_token()

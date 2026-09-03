@@ -114,6 +114,10 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_message_items TEXT,
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
+    -- Mirrors the levos display_only column in SCHEMA_SQL: transcript-only
+    -- rows that context reconstruction must skip. Declared here AND in the
+    -- v25 migration so fresh and converged databases have the same shape.
+    display_only INTEGER DEFAULT 0,
     _compressed_summary INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
@@ -542,7 +546,12 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             "CREATE TABLE IF NOT EXISTS gateway_hygiene_state (\n"
             "    session_key TEXT PRIMARY KEY,\n"
             "    failure_streak INTEGER NOT NULL DEFAULT 0\n"
-            ")"
+            ");\n"
+            # messages.display_only rides the same version (levos session-plane
+            # hotfix): the shared read path filters on it, so a Postgres database
+            # converged before the fork carried the column would otherwise fail
+            # the schema-parity guard. ADD COLUMN IF NOT EXISTS is idempotent.
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_only INTEGER DEFAULT 0"
         ),
     ),
     # Required state used by current conversation boundaries, liveness and

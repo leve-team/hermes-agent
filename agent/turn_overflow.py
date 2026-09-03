@@ -147,7 +147,9 @@ class _Recovery(OverflowVerdict):
         committed summary) ends the turn via the typed contract, since re-sending would
         hit the same overflow."""
         from agent.conversation_compression import conversation_history_after_compression
-        from agent.conversation_loop import _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _compression_deferred_result
+        from agent.conversation_loop import (
+            _COMPRESSION_TIMEOUT_FINAL_RESPONSE, _compression_aborted_result, _compression_deferred_result,
+        )
 
         agent = self.agent
         before = self.messages
@@ -167,6 +169,13 @@ class _Recovery(OverflowVerdict):
                 self.compression_attempts -= 1
                 agent._persist_session(self.messages, self.conversation_history)
                 return self.done("return", deferred)
+            # levos hotfix: an explicitly aborted summary (aux auth/network failure) keeps the
+            # transcript intact; retrying would be mislabelled compression_exhausted.
+            aborted = _compression_aborted_result(
+                agent, self.messages, self.conversation_history, self.api_call_count,
+            )
+            if aborted is not None:
+                return self.done("return", aborted)
         if fail_on_timeout and context_compression_timed_out(agent):
             return self.fail_turn(
                 _COMPRESSION_TIMEOUT_FINAL_RESPONSE, turn_exit_reason="context_compression_timeout"

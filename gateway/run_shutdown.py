@@ -780,17 +780,42 @@ class GatewayShutdownMixin:
         from gateway.run import _INTERRUPT_REASON_GATEWAY_RESTART, _INTERRUPT_REASON_GATEWAY_SHUTDOWN
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
+    def _api_server_resume_pending_session_keys(self) -> tuple[str, ...]:
+        """Session keys for API turns still in progress (levos RESUME_PENDING_API_SESSIONS_OK).
+
+        The adapter keeps its established id(agent) interrupt registry; this duck-typed sibling
+        accessor adds routing identity without widening ``interrupt_active_runs``.  Missing hooks
+        remain safe for older adapters and minimal shutdown test doubles.
+        """
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            helper = getattr(adapter, "resume_pending_session_keys", None)
+            raw_keys = helper() if callable(helper) else ()
+            keys = (str(key).strip() for key in (raw_keys or ()))
+            return tuple(dict.fromkeys(key for key in keys if key))
+        except Exception as exc:
+            logger.debug("Failed snapshotting api_server resume-pending keys: %s", exc)
+            return ()
+
+    def _resume_pending_agent_session_keys(self) -> tuple[str, ...]:
+        """Snapshot live, started native + API turns eligible for restart recovery."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        keys = [
+            session_key for session_key, agent in list(self._running_agents.items())
+            if agent is not _AGENT_PENDING_SENTINEL
+        ]
+        keys.extend(self._api_server_resume_pending_session_keys())
+        return tuple(dict.fromkeys(keys))
+
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
         # manager during the drain, the durable marker is already written so the next gateway boot can
-        # recover in-flight sessions (#27856).
-        for _sk, _agent in list(self._running_agents.items()):
-            if _agent is _AGENT_PENDING_SENTINEL:
-                continue
+        # recover in-flight sessions (#27856).  Snapshot the native + API registries (levos): completed
+        # API turns drop their key in _run_agent's finally, pending native sentinels are excluded.
+        for _sk in self._resume_pending_agent_session_keys():
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 await self.async_session_store.mark_resume_pending(_sk, reason)
                 marked.append(_sk)
@@ -1621,8 +1646,9 @@ class GatewayShutdownMixin:
             return
         # Graceful drain: clear the pre-drain resume_pending markers so sessions that finished
         # during the drain window don't carry a stale flag.
+        _active_resume_keys = set(GatewayRunner._resume_pending_agent_session_keys(self))
         for _sk in _pre_drain_keys:
-            if _sk not in self._running_agents:
+            if _sk not in _active_resume_keys:
                 try:
                     await self.async_session_store.clear_resume_pending(_sk)
                 except Exception as _e:

@@ -91,7 +91,8 @@ def _live_session_messages(session: dict) -> Optional[list]:
         if db is not None and session.get("session_key"):
             with contextlib.suppress(Exception):
                 return db.get_messages_as_conversation(
-                    session["session_key"], include_ancestors=True, include_row_ids=True)
+                    session["session_key"], include_ancestors=True, include_row_ids=True,
+                    include_display_only=True)
     return None
 
 

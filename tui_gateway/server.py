@@ -817,11 +817,70 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         reset_transport(token)
 
 
+def _agent_build_snapshot(session: dict):
+    lock = session.setdefault("agent_build_lock", threading.Lock())
+    with lock:
+        return (
+            session.get("agent_ready"),
+            int(session.get("agent_build_generation") or 0),
+        )
+
+
+def _agent_build_error_for_generation(session: dict, generation: int) -> str | None:
+    error = session.get("agent_error")
+    if isinstance(error, tuple) and len(error) == 3:
+        return str(error[1]) if error[0] == generation else None
+    return str(error) if error else None
+
+
+def _agent_build_error_is_retryable(error, generation: int) -> bool:
+    return bool(
+        isinstance(error, tuple)
+        and len(error) == 3
+        and error[0] == generation
+        and error[2]
+    )
+
+
+def _retryable_agent_build_exception(exc: Exception) -> bool:
+    # AuthError is the authoritative typed path.  Runtime provider resolution
+    # also collapses an exhausted pool to RuntimeError, so retain the narrow
+    # user-facing credential/rate-limit vocabulary used by those paths.
+    if any(cls.__name__ == "AuthError" for cls in type(exc).__mro__):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "401",
+            "429",
+            "api key",
+            "authentication",
+            "credential",
+            "no llm provider configured",
+            "quota",
+            "rate limit",
+            "rate-limit",
+        )
+    )
+
+
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.wait(timeout=timeout):
-        return _err(rid, 5032, "agent initialization timed out")
-    return _err(rid, 5032, err) if (err := session.get("agent_error")) else None
+    deadline = time.monotonic() + timeout
+    while True:
+        ready, generation = _agent_build_snapshot(session)
+        remaining = max(0.0, deadline - time.monotonic())
+        if ready is not None and not ready.wait(timeout=remaining):
+            return _err(rid, 5032, "agent initialization timed out")
+        lock = session.setdefault("agent_build_lock", threading.Lock())
+        with lock:
+            if (
+                session.get("agent_ready") is not ready
+                or int(session.get("agent_build_generation") or 0) != generation
+            ):
+                continue
+            error = _agent_build_error_for_generation(session, generation)
+        return _err(rid, 5032, error) if error else None
 
 
 # The deferred prompt path waits in short slices so a cancel is honored promptly and a slow
@@ -855,7 +914,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     and returned without ever calling ``_run_prompt_submit`` — the first message was permanently discarded
     while the build finished successfully in the background, leaving the blank first session.
     """
-    ready = session.get("agent_ready")
+    ready, generation = _agent_build_snapshot(session)
     if ready is None:
         return None
     start, cap, notified_slow = time.monotonic(), _agent_build_wait_cap(), False
@@ -871,7 +930,8 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
         build_thread = session.get("_agent_build_thread")
         if build_thread is not None and not build_thread.is_alive() and not ready.is_set():
             # _build's finally guarantees ready.set(); dead thread + unset ready = died hard.
-            return _err(rid, 5032, session.get("agent_error") or "agent initialization failed before completing")
+            return _err(rid, 5032, _agent_build_error_for_generation(session, generation)
+                        or "agent initialization failed before completing")
         if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
             notified_slow = True  # one keyed, replace-in-place notice (toast / status bar)
             _emit("notification.show", sid, {
@@ -880,7 +940,19 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
                 "key": _AGENT_BUILD_SLOW_NOTICE_KEY, "id": _AGENT_BUILD_SLOW_NOTICE_KEY})
     if notified_slow:
         _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
-    return _err(rid, 5032, err) if (err := session.get("agent_error")) else None
+    lock = session.setdefault("agent_build_lock", threading.Lock())
+    with lock:
+        changed = (
+            session.get("agent_ready") is not ready
+            or int(session.get("agent_build_generation") or 0) != generation
+        )
+        error = _agent_build_error_for_generation(session, generation)
+    if changed:
+        # A retry won the race after this prompt passed the old Event.  Rejoin
+        # the current generation within the original bounded wait budget.
+        remaining = max(0.0, cap - (time.monotonic() - start))
+        return _wait_agent(session, rid, timeout=remaining)
+    return _err(rid, 5032, error) if error else None
 
 
 def _bind_build_profile_scopes(profile_home: str) -> "_TurnScopes":
@@ -1026,8 +1098,25 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # flowing (it bails once agent is set); incidental RPCs via _sess() would upgrade it mid-stream.
     if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
         return
-    with session.setdefault("agent_build_lock", threading.Lock()):
-        if ready.is_set() or session.get("agent_build_started"):
+    lock = session.setdefault("agent_build_lock", threading.Lock())
+    with lock:
+        # Re-read under the lock: another caller may already have replaced the
+        # completed Event with the next generation while we were entering.
+        ready = session.get("agent_ready")
+        if ready is None:
+            return
+        generation = int(session.get("agent_build_generation") or 0)
+        if ready.is_set():
+            if not _agent_build_error_is_retryable(
+                session.get("agent_error"), generation
+            ):
+                return
+            generation += 1
+            ready = threading.Event()
+            session["agent_build_generation"] = generation
+            session["agent_ready"] = ready
+            session["agent_build_started"] = False
+        if session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
         session.pop("lazy", None)  # now genuinely mid-construction: restore the "still starting" eviction exemption
@@ -1066,7 +1155,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
             notify_registered = _wire_session_agent(sid, key, agent)
             _announce_built_agent(sid, key, current, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
+            error = (generation, str(e), _retryable_agent_build_exception(e))
+            with lock:
+                # A replaced session/Event owns a different lifecycle.  Never
+                # let this completed generation poison its successor.
+                if (
+                    current.get("agent_ready") is ready
+                    and int(current.get("agent_build_generation") or 0)
+                    == generation
+                ):
+                    current["agent_error"] = error
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             _finish_agent_build(
@@ -2707,8 +2805,10 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
         try:
             # include_compacted: a compacted session's archived turns are still the user's
             # conversation; without them a warm switch repainted the chat as summary + tail only.
+            # include_display_only (levos): mid-turn steer ledger rows are part of the transcript.
             display = db.get_messages_as_conversation(
-                key, include_ancestors=True, include_row_ids=True, include_compacted=True)
+                key, include_ancestors=True, include_row_ids=True, include_compacted=True,
+                include_display_only=True)
             # See #92080.
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:

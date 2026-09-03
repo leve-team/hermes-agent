@@ -1931,6 +1931,15 @@ def get_model_context_length(
     probe, Ollama); 4 Anthropic /v1/models (API keys only); 5 provider-aware (Copilot,
     Nous, Codex OAuth, GMI, Ollama, OpenRouter live, models.dev); 6 OpenRouter for
     unknown providers; 7 local server; 8 hardcoded defaults; 9 256K fallback."""
+    # levos hotfix: gpt-5.6-sol on the Codex route is pinned to its advertised 272K
+    # window (the proxied Responses endpoint rejects the 900K bump).
+    sol_route_model = _strip_provider_prefix(model).strip().lower().rsplit("/", 1)[-1]
+    if (
+        (provider or "").strip().lower() == "openai-codex"
+        and sol_route_model.startswith("gpt-5.6-sol")
+    ):
+        return 272000
+
     # 0. Explicit config override — user knows best
     if isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length

@@ -1170,6 +1170,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Every agent inside _run_agent() for shutdown interrupt, keyed by id() (the strong ref
         # keeps the id() from recycling); distinct from the run_id-keyed _active_run_agents.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
+        # RESUME_PENDING_API_SESSIONS_OK (levos t_5d92fc8c): preserve the id(agent) -> agent interrupt
+        # registry above exactly as-is.  A parallel map exposes only the routing identity needed by the
+        # owning GatewayRunner's durable shutdown marker.  One lock covers snapshot, registration, and
+        # cleanup because _run_agent mutates the map from an executor thread while shutdown reads it
+        # from the event-loop thread.
+        self._shutdown_resume_session_keys: Dict[int, str] = {}
+        self._shutdown_resume_session_keys_lock = threading.Lock()
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
@@ -1188,6 +1195,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
             return 0
+
+    def resume_pending_session_keys(self) -> tuple[str, ...]:
+        """Snapshot only API turns still owned by the shutdown registry."""
+        with self._shutdown_resume_session_keys_lock:
+            return tuple(
+                dict.fromkeys(self._shutdown_resume_session_keys.values())
+            )
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
@@ -2932,11 +2946,31 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}/messages."""
+        """GET /api/sessions/{session_id}/messages.
+
+        Upstream owns the ``limit``/``offset``/``order`` contract; the levos
+        delta is only that an ambiguous *repeated* pagination parameter is
+        refused with 400 instead of resolving to whichever value arrived first.
+        """
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        query_keys = list(request.query.keys())
+        repeated = sorted(
+            name for name in ("limit", "offset", "order")
+            if query_keys.count(name) > 1
+        )
+        if repeated:
+            # The names come from the static tuple above, not from the client,
+            # so echoing them back reflects nothing caller-controlled.
+            return web.json_response(
+                _openai_error(
+                    "Query parameters must not be repeated: " + ", ".join(repeated),
+                    code="repeated_query_parameter",
+                ),
+                status=400,
+            )
         db = await self._ensure_session_db_async()
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
         raw_limit, raw_offset = request.query.get("limit"), request.query.get("offset", "0")
@@ -3725,6 +3759,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # two callers pass ``agent_ref``, and only /v1/runs has a run_id, so neither is a usable
                     # hook for the rest. See #63529.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    # levos: same identity precedence as _bind_api_server_session above.
+                    # gateway_session_key is the durable gateway lane used by wake/injection
+                    # callers; session_id keeps native API session turns eligible when they
+                    # also have a SessionStore routing entry.
+                    _resume_session_key = str(gateway_session_key or session_id or "").strip()
+                    if _resume_session_key:
+                        with self._shutdown_resume_session_keys_lock:
+                            self._shutdown_resume_session_keys[id(agent)] = _resume_session_key
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
@@ -3755,6 +3797,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
+                        # levos: completion owns cleanup — remove resume eligibility before
+                        # interrupt ownership so a shutdown snapshot in this finally block
+                        # never replays a turn whose run_conversation() already returned.
+                        with self._shutdown_resume_session_keys_lock:
+                            self._shutdown_resume_session_keys.pop(id(agent), None)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                         # Bind the declared key to the row the turn actually ended on
                         # (agent.session_id carries a mid-turn rotation). Opt-in per route.
