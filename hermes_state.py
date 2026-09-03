@@ -10802,9 +10802,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         active_clause = "" if include_inactive else " AND active = 1"
         # Default-exclude display-only rows so every context caller is
         # duplication-safe without opting in; display callers opt back in.
-        # IFNULL guards a row written before the column existed.
+        # COALESCE guards a row written before the column existed; IFNULL is
+        # SQLite-only and would abort the statement on PostgreSQL.
         display_clause = (
-            "" if include_display_only else " AND IFNULL(display_only, 0) = 0"
+            "" if include_display_only else " AND COALESCE(display_only, 0) = 0"
         )
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)

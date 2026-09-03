@@ -1017,6 +1017,7 @@ _STRICT_FORBIDDEN = (
     "fts5",
     "match ",
     "x'",        # SQLite hex literals (X'0A' etc.) — translated to chr() above
+    "ifnull(",   # SQLite spelling of COALESCE; slipped in via a hotfix once
 )
 
 # SQLite JSON functions SessionDB emits that PostgreSQL does not define.

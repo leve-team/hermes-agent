@@ -193,6 +193,42 @@ def test_strict_mode_forbids_every_known_sqlite_json_function(fn):
     )
 
 
+def test_no_ifnull_in_sql_emitting_modules():
+    """``IFNULL`` is SQLite-only; the portable spelling is ``COALESCE``.
+
+    The levos session-plane hotfix introduced ``IFNULL(display_only, 0) = 0``
+    into ``get_messages_as_conversation`` (the ``/history`` and ``/context``
+    read path), which PostgreSQL rejects at parse time. The translator does
+    not rewrite it, so the call sites themselves must not emit it. Scanned
+    modules: every SQL-emitting SessionDB module plus tui_gateway/server.py,
+    which the hotfix also touched.
+    """
+    offenders = []
+    for module in (*SQL_EMITTING_MODULES, "tui_gateway/server.py"):
+        path = REPO / module
+        if not path.exists():  # pragma: no cover - tree layout guard
+            continue
+        source = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\bIFNULL\s*\(", source, flags=re.IGNORECASE):
+            line = source[: m.start()].count("\n") + 1
+            offenders.append(f"{module}:{line}")
+    assert not offenders, (
+        "SQLite-only IFNULL( in SQL-emitting code — use COALESCE(: "
+        + ", ".join(offenders)
+    )
+
+
+def test_strict_mode_forbids_ifnull(monkeypatch):
+    """Strict mode names ``ifnull(`` so a regression fails in the parity suite."""
+    assert "ifnull(" in _STRICT_FORBIDDEN
+    monkeypatch.setenv("HERMES_PG_ADAPTER_STRICT", "1")
+    with pytest.raises(RuntimeError, match="ifnull"):
+        _translate_sql("SELECT 1 FROM messages WHERE IFNULL(display_only, 0) = 0")
+    # The portable spelling passes through untouched.
+    out = _translate_sql("SELECT 1 FROM messages WHERE COALESCE(display_only, 0) = 0")
+    assert "COALESCE(display_only, 0) = 0" in out
+
+
 def test_known_call_sites_translate_to_postgres_spelling():
     """The four known-divergent shapes, pinned by their translations."""
     cases = {
