@@ -235,7 +235,8 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at DOUBLE PRECISION NOT NULL,
-    expires_at DOUBLE PRECISION NOT NULL
+    expires_at DOUBLE PRECISION NOT NULL,
+    lease_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
@@ -581,6 +582,13 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
     # a Postgres database converged before the fork carried the column would
     # otherwise fail the schema-parity guard. ADD COLUMN IF NOT EXISTS keeps
     # the statement idempotent on fresh installs where the DDL already has it.
+    #
+    # session_turn_leases.lease_epoch (levos S1 fencing token) rides here too:
+    # the shared SCHEMA_VERSION is 26 and the pg-only range must stay below
+    # it, so a new v26 entry is not available. A database that already
+    # recorded v25 before this column existed is healed on its next writable
+    # connect by reconcile_postgres_columns(), which ADDs any column declared
+    # in SCHEMA_SQL that the live table lacks.
     PostgresMigration(
         version=25,
         optional=True,
@@ -589,7 +597,9 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             "    session_key TEXT PRIMARY KEY,\n"
             "    failure_streak INTEGER NOT NULL DEFAULT 0\n"
             ");\n"
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_only INTEGER DEFAULT 0"
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_only INTEGER DEFAULT 0;\n"
+            "ALTER TABLE session_turn_leases ADD COLUMN IF NOT EXISTS\n"
+            "    lease_epoch INTEGER NOT NULL DEFAULT 0"
         ),
     ),
 ]

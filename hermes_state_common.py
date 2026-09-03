@@ -219,6 +219,31 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 SCHEMA_VERSION = 26
 
 
+class SessionTurnLeaseLostError(RuntimeError):
+    """A transcript write presented a turn-lease holder that no longer owns it.
+
+    Fail-fast fencing: do not retry inside ``_execute_write``. The caller
+    either still thinks it owns the conversation after expiry/reclaim, or
+    the lease row is gone. A later writer may already be persisting a
+    newer turn; landing this write would interleave a stale reply.
+    """
+
+
+class StaleLeaseError(SessionTurnLeaseLostError):
+    """A transcript write presented a ``lease_epoch`` the row has moved past.
+
+    The holder string still matches but the lease was reclaimed and
+    re-issued in between (expiry, dead-PID reclaim, or an explicit release
+    followed by a new acquire), so the writer holds a token from an older
+    incarnation of the lease. The holder check alone cannot see this when
+    the same holder string is reused; the monotonic epoch can.
+
+    Subclasses :class:`SessionTurnLeaseLostError` so every existing
+    ``except SessionTurnLeaseLostError`` handler and
+    ``classify_persistence_error`` bucket keeps treating it as a lost lease.
+    """
+
+
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
 # freely on open (so future migrations always land); the FTS *layout* only
@@ -397,7 +422,8 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    lease_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (

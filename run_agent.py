@@ -2391,6 +2391,9 @@ class AIAgent:
                         self, "_active_session_turn_lease_ttl_seconds", 300.0
                     )
                     or 300.0,
+                    turn_lease_epoch=getattr(
+                        self, "_active_session_turn_lease_epoch", None
+                    ),
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
@@ -8536,6 +8539,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        durable_turn_lease_epoch = None
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8719,6 +8723,23 @@ class AIAgent:
                 durable_turn_lease = _durable_holder
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
+                # Fencing token for this incarnation of the lease. Stores
+                # without the epoch API (older builds, test doubles) leave it
+                # None and the flush falls back to holder-only fencing.
+                _epoch_reader = getattr(_turn_db, "session_turn_lease_epoch", None)
+                durable_turn_lease_epoch = None
+                if callable(_epoch_reader):
+                    try:
+                        durable_turn_lease_epoch = _epoch_reader(
+                            session_id, _durable_holder
+                        )
+                    except Exception:
+                        logger.debug(
+                            "session turn lease epoch read failed: %s",
+                            session_id,
+                            exc_info=True,
+                        )
+                self._active_session_turn_lease_epoch = durable_turn_lease_epoch
                 if _lease_waited:
                     self._emit_status(
                         "Session is free; loading the latest transcript..."
@@ -8771,6 +8792,11 @@ class AIAgent:
                                 getattr(self, "session_id", None) or session_id,
                                 durable_turn_lease,
                                 ttl_seconds=_lease_ttl,
+                                **(
+                                    {"lease_epoch": durable_turn_lease_epoch}
+                                    if durable_turn_lease_epoch is not None
+                                    else {}
+                                ),
                             ):
                                 # finally sets the stop event then releases.
                                 # A late holder-fenced miss after that join
@@ -8946,6 +8972,7 @@ class AIAgent:
                         ):
                             self._active_session_turn_lease_holder = None
                             self._active_session_turn_lease_ttl_seconds = None
+                            self._active_session_turn_lease_epoch = None
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:

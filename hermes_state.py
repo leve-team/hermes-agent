@@ -74,6 +74,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    SessionTurnLeaseLostError,
+    StaleLeaseError,
     _PREVIEW_CONTENT_SQL,
     _PREVIEW_HEAD_CHARS,
     _PREVIEW_MAX_CHARS,
@@ -2691,14 +2693,9 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
-class SessionTurnLeaseLostError(RuntimeError):
-    """A transcript write presented a turn-lease holder that no longer owns it.
-
-    Fail-fast fencing: do not retry inside ``_execute_write``. The caller
-    either still thinks it owns the conversation after expiry/reclaim, or
-    the lease row is gone. A later writer may already be persisting a
-    newer turn; landing this write would interleave a stale reply.
-    """
+# ``SessionTurnLeaseLostError`` / ``StaleLeaseError`` live in
+# hermes_state_common (imported above) so backend modules can raise them
+# without importing this module; both stay importable from here.
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -6752,6 +6749,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         INSERT share one write transaction. Expired leases and leases whose
         structured local holder PID is known dead are reclaimed in that same
         transaction.
+
+        Every successful acquire advances the row's ``lease_epoch`` (fencing
+        token). A reclaim UPDATEs the existing row in place rather than
+        DELETE + INSERT so the epoch never restarts for a conversation;
+        :meth:`release_session_turn_lease` leaves a tombstone for the same
+        reason. Read the token back with :meth:`session_turn_lease_epoch`.
         """
         if not session_id or not holder:
             return False
@@ -6760,6 +6763,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
             row = conn.execute(
                 "SELECT holder, expires_at FROM session_turn_leases "
                 "WHERE conversation_id = ?",
@@ -6772,14 +6776,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     or _compression_lock_holder_process_is_dead(current_holder)
                 ):
                     conn.execute(
-                        "DELETE FROM session_turn_leases "
+                        "UPDATE session_turn_leases SET holder = ?, "
+                        "acquired_at = ?, expires_at = ?, "
+                        "lease_epoch = lease_epoch + 1 "
                         "WHERE conversation_id = ? AND holder = ?",
-                        (conversation_id, current_holder),
+                        (holder, now, expires_at, conversation_id, current_holder),
                     )
             conn.execute(
                 "INSERT OR IGNORE INTO session_turn_leases "
-                "(conversation_id, holder, acquired_at, expires_at) "
-                "VALUES (?, ?, ?, ?)",
+                "(conversation_id, holder, acquired_at, expires_at, lease_epoch) "
+                "VALUES (?, ?, ?, ?, 1)",
                 (conversation_id, holder, now, expires_at),
             )
             owner = conn.execute(
@@ -6789,6 +6795,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return owner is not None and owner["holder"] == holder
 
         return bool(self._execute_write(_do, patience_s=patience_s))
+
+    def _serialize_session_turn_lease_on_conn(self, conn, conversation_id: str) -> None:
+        """Serialize lease mutation and lease-fenced writes per conversation.
+
+        SQLite needs nothing: ``_execute_write`` opens ``BEGIN IMMEDIATE``, so
+        the whole database is already single-writer. PostgreSQL translates
+        that to a plain ``BEGIN`` with no exclusion, so a transaction-scoped
+        advisory lock keyed on the conversation makes acquire / refresh /
+        release and the transcript-write guard mutually exclusive until
+        commit. That is what turns the guard's "epoch still matches" check
+        into a commit-time fence rather than a read-then-race.
+        """
+        if self._is_postgres:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(?))", (conversation_id,)
+            )
+
+    def session_turn_lease_epoch(self, session_id: str, holder: str) -> Optional[int]:
+        """Return the ``lease_epoch`` of the lease *holder* currently owns.
+
+        ``None`` when *holder* does not own the conversation's lease (no row,
+        tombstone, or another holder). Expiry is deliberately not consulted:
+        an owner whose refresher starved can still recover its epoch and let
+        the write guard revive the row, exactly as the holder check allows.
+        Pass the value as ``turn_lease_epoch`` to the transcript writers so a
+        reclaimed-and-reissued lease with the same holder string is fenced.
+        """
+        if not session_id or not holder:
+            return None
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT lease_epoch FROM session_turn_leases "
+                "WHERE conversation_id = ? AND holder = ?",
+                (conversation_id, holder),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["lease_epoch"])
 
     def acquire_session_turn_lease(
         self,
@@ -6869,35 +6914,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         holder: str,
         *,
         ttl_seconds: float = 300.0,
+        lease_epoch: Optional[int] = None,
     ) -> bool:
-        """Extend a turn lease only while ``holder`` still owns it."""
+        """Extend a turn lease only while ``holder`` still owns it.
+
+        Refresh never changes ``lease_epoch``. When *lease_epoch* is given
+        the extension is additionally fenced on it, so a refresher that
+        outlived a reclaim-and-reissue to the same holder string cannot keep
+        the newer incarnation alive on the old holder's behalf.
+        """
         if not session_id or not holder:
             return False
         expires_at = time.time() + max(0.1, float(ttl_seconds))
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            cursor = conn.execute(
-                "UPDATE session_turn_leases SET expires_at = ? "
-                "WHERE conversation_id = ? AND holder = ?",
-                (expires_at, conversation_id, holder),
-            )
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
+            if lease_epoch is None:
+                cursor = conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (expires_at, conversation_id, holder),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ? AND lease_epoch = ?",
+                    (expires_at, conversation_id, holder, int(lease_epoch)),
+                )
             return cursor.rowcount > 0
 
         return bool(self._execute_write(_do))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
+    def release_session_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        lease_epoch: Optional[int] = None,
+    ) -> None:
+        """Release a turn lease iff ``holder`` still owns it; idempotent.
+
+        The row is not deleted: it becomes a tombstone (empty holder, already
+        expired, epoch advanced) that the next acquire reclaims in place.
+        Deleting it would restart ``lease_epoch`` at 1 and let a writer that
+        kept an old token match a fresh lease. The tombstone can never be
+        mistaken for ownership — no real holder is the empty string, and the
+        write guard rejects a holder mismatch before it looks at the epoch.
+        """
         if not session_id or not holder:
             return
 
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            conn.execute(
-                "DELETE FROM session_turn_leases "
-                "WHERE conversation_id = ? AND holder = ?",
-                (conversation_id, holder),
-            )
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
+            if lease_epoch is None:
+                conn.execute(
+                    "UPDATE session_turn_leases SET holder = '', expires_at = 0, "
+                    "lease_epoch = lease_epoch + 1 "
+                    "WHERE conversation_id = ? AND holder = ?",
+                    (conversation_id, holder),
+                )
+            else:
+                conn.execute(
+                    "UPDATE session_turn_leases SET holder = '', expires_at = 0, "
+                    "lease_epoch = lease_epoch + 1 "
+                    "WHERE conversation_id = ? AND holder = ? AND lease_epoch = ?",
+                    (conversation_id, holder, int(lease_epoch)),
+                )
 
         self._execute_write(_do)
 
@@ -9357,6 +9441,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str],
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        turn_lease_epoch: Optional[int] = None,
     ) -> None:
         """Transcript-append admission checks, run INSIDE the write txn.
 
@@ -9364,6 +9449,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the two writers can never diverge on these correctness invariants
         (this guard has already needed targeted fixes — see the #74478
         patience note below).
+
+        ``turn_lease_epoch`` is the fencing token the writer got from
+        :meth:`session_turn_lease_epoch` after acquiring. When present, the
+        row's current epoch must equal it or the write is refused with
+        :class:`StaleLeaseError`. The check runs inside the transaction and,
+        on PostgreSQL, under the per-conversation advisory lock, so no
+        acquire can advance the epoch between this check and our commit.
         """
         # NOTE (#75316 redesign): appends do NOT check compression_locks.
         # The lock's job is to stop two COMPRESSIONS colliding, not to fence
@@ -9377,8 +9469,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # stale locks from dead PIDs blocking writes for the full TTL.
         if turn_lease_holder:
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
             lease = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases "
+                "SELECT holder, expires_at, lease_epoch FROM session_turn_leases "
                 "WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
@@ -9386,6 +9479,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise SessionTurnLeaseLostError(
                     f"Session turn lease lost; refusing transcript write "
                     f"for {session_id!r}"
+                )
+            if (
+                turn_lease_epoch is not None
+                and int(lease["lease_epoch"]) != int(turn_lease_epoch)
+            ):
+                raise StaleLeaseError(
+                    f"Session turn lease lost; refusing transcript write "
+                    f"for {session_id!r}: lease_epoch {int(turn_lease_epoch)} "
+                    f"is stale (current {int(lease['lease_epoch'])})"
                 )
             now = time.time()
             if float(lease["expires_at"]) <= now:
@@ -9484,6 +9586,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        turn_lease_epoch: Optional[int] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -9547,6 +9650,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 compression_lock_holder,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                turn_lease_epoch=turn_lease_epoch,
             )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -9613,6 +9717,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         turn_lease_ttl_seconds: float = 300.0,
+        turn_lease_epoch: Optional[int] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -9653,6 +9758,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     compression_lock_holder=compression_lock_holder,
                     turn_lease_holder=turn_lease_holder,
                     turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                    turn_lease_epoch=turn_lease_epoch,
                 )
             return inserted_total
 
@@ -9663,6 +9769,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 compression_lock_holder,
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                turn_lease_epoch=turn_lease_epoch,
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
