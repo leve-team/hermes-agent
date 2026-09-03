@@ -1475,6 +1475,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # the dict holds a strong reference for the life of the turn, so an
         # id() can never be recycled while it is still registered.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
+        # RESUME_PENDING_API_SESSIONS_OK (levos t_5d92fc8c): preserve the
+        # id(agent) -> agent interrupt registry above exactly as-is.  A
+        # parallel map exposes only the routing identity needed by the owning
+        # GatewayRunner's durable shutdown marker.  One lock covers snapshot,
+        # registration, and cleanup because _run_agent mutates the map from an
+        # executor thread while shutdown reads it from the event-loop thread.
+        self._shutdown_resume_session_keys: Dict[int, str] = {}
+        self._shutdown_resume_session_keys_lock = threading.Lock()
         # Back-reference to the owning GatewayRunner (set by gateway/run.py)
         # so /api/platforms/{platform}/events can resolve sibling adapters.
         # BasePlatformAdapter declares the class-level default of None.
@@ -1500,6 +1508,13 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    def resume_pending_session_keys(self) -> tuple[str, ...]:
+        """Snapshot only API turns still owned by the shutdown registry."""
+        with self._shutdown_resume_session_keys_lock:
+            return tuple(
+                dict.fromkeys(self._shutdown_resume_session_keys.values())
+            )
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
@@ -3624,7 +3639,12 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}/messages."""
+        """GET /api/sessions/{session_id}/messages.
+
+        Upstream owns the ``limit``/``offset``/``order`` contract; the levos
+        delta is only that an ambiguous *repeated* pagination parameter is
+        refused with 400 instead of resolving to whichever value arrived first.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -3632,6 +3652,21 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        query_keys = list(request.query.keys())
+        repeated = sorted(
+            name for name in ("limit", "offset", "order")
+            if query_keys.count(name) > 1
+        )
+        if repeated:
+            # The names come from the static tuple above, not from the client,
+            # so echoing them back reflects nothing caller-controlled.
+            return web.json_response(
+                _openai_error(
+                    "Query parameters must not be repeated: " + ", ".join(repeated),
+                    code="repeated_query_parameter",
+                ),
+                status=400,
+            )
         db = await self._ensure_session_db_async()
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
         raw_limit = request.query.get("limit")
@@ -6418,6 +6453,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    # Use the same identity precedence as
+                    # _bind_api_server_session above.  gateway_session_key is
+                    # the durable gateway lane used by wake/injection callers;
+                    # session_id keeps native API session turns eligible when
+                    # they also have a SessionStore routing entry.
+                    _resume_session_key = str(
+                        gateway_session_key or session_id or ""
+                    ).strip()
+                    if _resume_session_key:
+                        with self._shutdown_resume_session_keys_lock:
+                            self._shutdown_resume_session_keys[id(agent)] = (
+                                _resume_session_key
+                            )
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
@@ -6553,6 +6601,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         # over, so it must not be interrupted by a later
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
+                        # Completion owns cleanup: remove resume eligibility
+                        # before interrupt ownership.  A shutdown snapshot in
+                        # this finally block must not replay a turn whose
+                        # run_conversation() call already returned.
+                        with self._shutdown_resume_session_keys_lock:
+                            self._shutdown_resume_session_keys.pop(id(agent), None)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                     clear_session_vars(tokens)
 

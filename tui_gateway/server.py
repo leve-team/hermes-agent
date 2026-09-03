@@ -2201,12 +2201,70 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         reset_transport(token)
 
 
+def _agent_build_snapshot(session: dict):
+    lock = session.setdefault("agent_build_lock", threading.Lock())
+    with lock:
+        return (
+            session.get("agent_ready"),
+            int(session.get("agent_build_generation") or 0),
+        )
+
+
+def _agent_build_error_for_generation(session: dict, generation: int) -> str | None:
+    error = session.get("agent_error")
+    if isinstance(error, tuple) and len(error) == 3:
+        return str(error[1]) if error[0] == generation else None
+    return str(error) if error else None
+
+
+def _agent_build_error_is_retryable(error, generation: int) -> bool:
+    return bool(
+        isinstance(error, tuple)
+        and len(error) == 3
+        and error[0] == generation
+        and error[2]
+    )
+
+
+def _retryable_agent_build_exception(exc: Exception) -> bool:
+    # AuthError is the authoritative typed path.  Runtime provider resolution
+    # also collapses an exhausted pool to RuntimeError, so retain the narrow
+    # user-facing credential/rate-limit vocabulary used by those paths.
+    if any(cls.__name__ == "AuthError" for cls in type(exc).__mro__):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "401",
+            "429",
+            "api key",
+            "authentication",
+            "credential",
+            "no llm provider configured",
+            "quota",
+            "rate limit",
+            "rate-limit",
+        )
+    )
+
+
 def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
-    ready = session.get("agent_ready")
-    if ready is not None and not ready.wait(timeout=timeout):
-        return _err(rid, 5032, "agent initialization timed out")
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+    deadline = time.monotonic() + timeout
+    while True:
+        ready, generation = _agent_build_snapshot(session)
+        remaining = max(0.0, deadline - time.monotonic())
+        if ready is not None and not ready.wait(timeout=remaining):
+            return _err(rid, 5032, "agent initialization timed out")
+        lock = session.setdefault("agent_build_lock", threading.Lock())
+        with lock:
+            if (
+                session.get("agent_ready") is not ready
+                or int(session.get("agent_build_generation") or 0) != generation
+            ):
+                continue
+            error = _agent_build_error_for_generation(session, generation)
+        return _err(rid, 5032, error) if error else None
 
 
 # The deferred prompt path waits in short slices so a cancel is honored
@@ -2262,7 +2320,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     Returns ``None`` on success OR when the turn was cancelled mid-wait (the
     caller's cancel branch owns that messaging), an ``_err`` dict otherwise.
     """
-    ready = session.get("agent_ready")
+    ready, generation = _agent_build_snapshot(session)
     if ready is None:
         return None
     start = time.monotonic()
@@ -2297,7 +2355,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
             return _err(
                 rid,
                 5032,
-                session.get("agent_error")
+                _agent_build_error_for_generation(session, generation)
                 or "agent initialization failed before completing",
             )
         if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
@@ -2323,8 +2381,19 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
             )
     if notified_slow:
         _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
-    err = session.get("agent_error")
-    return _err(rid, 5032, err) if err else None
+    lock = session.setdefault("agent_build_lock", threading.Lock())
+    with lock:
+        changed = (
+            session.get("agent_ready") is not ready
+            or int(session.get("agent_build_generation") or 0) != generation
+        )
+        error = _agent_build_error_for_generation(session, generation)
+    if changed:
+        # A retry won the race after this prompt passed the old Event.  Rejoin
+        # the current generation within the original bounded wait budget.
+        remaining = max(0.0, cap - (time.monotonic() - start))
+        return _wait_agent(session, rid, timeout=remaining)
+    return _err(rid, 5032, error) if error else None
 
 
 def _start_agent_build(sid: str, session: dict) -> None:
@@ -2350,7 +2419,23 @@ def _start_agent_build(sid: str, session: dict) -> None:
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
-        if ready.is_set() or session.get("agent_build_started"):
+        # Re-read under the lock: another caller may already have replaced the
+        # completed Event with the next generation while we were entering.
+        ready = session.get("agent_ready")
+        if ready is None:
+            return
+        generation = int(session.get("agent_build_generation") or 0)
+        if ready.is_set():
+            if not _agent_build_error_is_retryable(
+                session.get("agent_error"), generation
+            ):
+                return
+            generation += 1
+            ready = threading.Event()
+            session["agent_build_generation"] = generation
+            session["agent_ready"] = ready
+            session["agent_build_started"] = False
+        if session.get("agent_build_started"):
             return
         session["agent_build_started"] = True
         # An upgrading lazy session is now genuinely mid-construction — restore
@@ -2522,7 +2607,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            current["agent_error"] = str(e)
+            error = (generation, str(e), _retryable_agent_build_exception(e))
+            with lock:
+                # A replaced session/Event owns a different lifecycle.  Never
+                # let this completed generation poison its successor.
+                if (
+                    current.get("agent_ready") is ready
+                    and int(current.get("agent_build_generation") or 0)
+                    == generation
+                ):
+                    current["agent_error"] = error
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
@@ -8280,6 +8374,49 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def _append_midturn_display_row(session: dict | None, text: Any) -> None:
+    """Record an accepted mid-turn user message as a display-only ledger row.
+
+    See the 0.18.0 twin for the full rationale.  In short: a steer is appended
+    to the tail of the in-flight turn's last tool result and never gets a row
+    of its own, so the transcript cannot draw the user's own words.  The row is
+    flagged ``display_only`` so context reconstruction skips it, classification
+    is by call site rather than by matching the marker text, and the write can
+    never raise — an accepted steer must stay accepted.
+    """
+    if not session:
+        return
+    session_key = str(session.get("session_key") or "").strip()
+    if not session_key:
+        return
+    content = text.strip() if isinstance(text, str) else ""
+    if not content:
+        return
+    try:
+        agent = session.get("agent")
+        db = getattr(agent, "_session_db", None) if agent is not None else None
+        if db is not None:
+            db.append_message(
+                session_id=session_key,
+                role="user",
+                content=content,
+                display_only=True,
+            )
+            return
+
+        _ensure_session_db_row(session)
+        with _session_db(session) as scoped_db:
+            if scoped_db is not None:
+                scoped_db.append_message(
+                    session_id=session_key,
+                    role="user",
+                    content=content,
+                    display_only=True,
+                )
+    except Exception:
+        logger.debug("failed to persist mid-turn display row", exc_info=True)
+
+
 def _handle_busy_submit(
     rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
 ) -> dict | None:
@@ -8326,6 +8463,12 @@ def _handle_busy_submit(
                     _record_inflight_correction(session, plain_text)
                     _drop_queued_duplicates_of_inflight_user(session)
                     session["last_active"] = time.time()
+                # Deliberately outside history_lock: this module's own rule is
+                # never to hold that lock across a call the live turn can
+                # contend on.  Only the accepted-steer branch records a row —
+                # the queue fallback's text is persisted as an ordinary user
+                # message when it runs, so a row here would be a real duplicate.
+                _append_midturn_display_row(session, plain_text)
                 return _ok(rid, {"status": "steered"})
         except Exception:
             pass  # fall through to queue
@@ -8953,7 +9096,12 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
-            display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
+            display = db.get_messages_as_conversation(
+                key,
+                include_ancestors=True,
+                include_row_ids=True,
+                include_display_only=True,
+            )
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)
@@ -13946,7 +14094,8 @@ def _format_live_history_output(session: dict) -> str:
         if db is not None and session.get("session_key"):
             try:
                 history = db.get_messages_as_conversation(
-                    session["session_key"], include_ancestors=True, include_row_ids=True
+                    session["session_key"], include_ancestors=True, include_row_ids=True,
+                    include_display_only=True,
                 )
             except Exception:
                 pass
@@ -13989,7 +14138,8 @@ def _format_live_context_output(session: dict) -> str:
             try:
                 messages = _history_to_messages(
                     db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True, include_row_ids=True
+                        session["session_key"], include_ancestors=True, include_row_ids=True,
+                        include_display_only=True,
                     )
                 )
             except Exception:

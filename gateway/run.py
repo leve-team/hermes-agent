@@ -8582,6 +8582,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 0
 
+    def _api_server_resume_pending_session_keys(self) -> tuple[str, ...]:
+        """Return session keys for API turns that are still in progress.
+
+        The adapter keeps its established id(agent) interrupt registry; this
+        duck-typed sibling accessor adds routing identity without widening or
+        reinterpreting ``interrupt_active_runs``.  Missing hooks remain safe
+        for older adapters and minimal shutdown test doubles.
+        """
+        try:
+            adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+            helper = getattr(adapter, "resume_pending_session_keys", None)
+            raw_keys = helper() if callable(helper) else ()
+            keys = (str(key).strip() for key in (raw_keys or ()))
+            return tuple(dict.fromkeys(key for key in keys if key))
+        except Exception as exc:
+            logger.debug(
+                "Failed snapshotting api_server resume-pending keys: %s", exc
+            )
+            return ()
+
+    def _resume_pending_agent_session_keys(self) -> tuple[str, ...]:
+        """Snapshot live, started turns eligible for restart recovery."""
+        keys = [
+            session_key
+            for session_key, agent in list(self._running_agents.items())
+            if agent is not _AGENT_PENDING_SENTINEL
+        ]
+        keys.extend(self._api_server_resume_pending_session_keys())
+        return tuple(dict.fromkeys(keys))
+
     def _interrupt_api_server_runs(self, reason: str) -> int:
         """Interrupt API-server agents that are not in ``_running_agents``.
 
@@ -14680,9 +14710,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
             _pre_drain_keys: list[str] = []
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
-                    continue
+            for _sk in self._resume_pending_agent_session_keys():
                 try:
                     await self.async_session_store.mark_resume_pending(
                         _sk,
@@ -14744,8 +14772,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Drain completed gracefully — all running sessions finished.
                 # Clear the pre-drain resume_pending markers so sessions that
                 # completed during the drain window don't carry a stale flag.
+                _active_resume_keys = set(
+                    self._resume_pending_agent_session_keys()
+                )
                 for _sk in _pre_drain_keys:
-                    if _sk not in self._running_agents:
+                    if _sk not in _active_resume_keys:
                         try:
                             await self.async_session_store.clear_resume_pending(_sk)
                         except Exception as _e:
@@ -14775,22 +14806,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (incremented below, threshold 3), which sets
                 # ``suspended=True`` and overrides resume_pending.
                 #
-                # Iterate self._running_agents (current) rather than the
-                # drain-start ``active_agents`` snapshot — the snapshot
-                # may include sessions that finished gracefully during
-                # the drain window, and marking those falsely would give
-                # them a stray restart-interruption system note on their
-                # next turn even though their previous turn completed
-                # cleanly.  Skip pending sentinels for the same reason
-                # _interrupt_running_agents() does: their agent hasn't
-                # started yet, there's nothing to interrupt, and the
-                # session shouldn't carry a misleading resume flag.
+                # Snapshot the current native + API registries rather than
+                # the drain-start ``active_agents`` count.  Completed API
+                # turns remove their parallel key in _run_agent's finally,
+                # while pending native sentinels are excluded by the helper;
+                # neither can acquire a misleading replay marker.
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
-                for _sk, _agent in list(self._running_agents.items()):
-                    if _agent is _AGENT_PENDING_SENTINEL:
-                        continue
+                for _sk in self._resume_pending_agent_session_keys():
                     try:
                         await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:

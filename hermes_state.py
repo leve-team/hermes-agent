@@ -9475,6 +9475,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         codex_message_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
+        display_only: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
         api_content: Optional[str] = None,
@@ -9551,8 +9552,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata,
+                   display_only)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -9575,6 +9577,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    1 if display_only else 0,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -10665,6 +10668,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
+        include_display_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -10689,6 +10693,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
+        # Default-exclude display-only rows so every context caller is
+        # duplication-safe without opting in; display callers opt back in.
+        # IFNULL guards a row written before the column existed.
+        display_clause = (
+            "" if include_display_only else " AND IFNULL(display_only, 0) = 0"
+        )
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -10702,7 +10712,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
+                f"{active_clause}{display_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -10886,7 +10896,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"SELECT session_id, display_only, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
@@ -10896,8 +10906,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
-        # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        # their relative id order.  Display-only rows are dropped from THIS
+        # projection only — display_history below is built from the full row
+        # set and keeps them, which is the point of serving both views from
+        # one SELECT.
+        tip_rows = [
+            r
+            for r in rows
+            if r["session_id"] == session_id and not r["display_only"]
+        ]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,

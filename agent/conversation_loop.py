@@ -1448,6 +1448,51 @@ def _compression_deferred_result(
     }
 
 
+def _compression_aborted_result(
+    agent,
+    messages: List[Dict],
+    conversation_history,
+    api_call_count: int,
+) -> Optional[Dict[str, Any]]:
+    """Stop an overflow retry when summary generation explicitly aborted.
+
+    ``_compress_context`` already preserves the original transcript on an
+    auxiliary auth/network failure.  The provider has also proved that the
+    unchanged request does not fit, so retrying would mislabel the no-op as
+    ``compression_exhausted`` and invite the gateway to reset the session.
+    """
+    compressor = agent.context_compressor
+    if not getattr(compressor, "_last_compress_aborted", False):
+        return None
+    summary_error = str(
+        getattr(compressor, "_last_summary_error", None)
+        or "unknown summary error"
+    )
+    if getattr(compressor, "_last_summary_auth_failure", False):
+        failure = (
+            "Context compression authentication failed; original messages "
+            f"were preserved: {summary_error}"
+        )
+    else:
+        failure = (
+            "Context compression aborted; original messages were preserved: "
+            f"{summary_error}"
+        )
+    agent._flush_status_buffer()
+    agent._vprint(f"{agent.log_prefix}❌ {failure}", force=True)
+    logger.error("%s%s", agent.log_prefix, failure)
+    agent._persist_session(messages, conversation_history)
+    return {
+        "final_response": failure,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": failure,
+        "partial": True,
+        "failed": True,
+    }
+
+
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
     """Rewrite a cache-decorated system message in place, keeping its blocks.
 
@@ -5576,6 +5621,11 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
+                    compression_aborted = _compression_aborted_result(
+                        agent, messages, conversation_history, api_call_count
+                    )
+                    if compression_aborted is not None:
+                        return compression_aborted
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -5882,6 +5932,11 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
+                    compression_aborted = _compression_aborted_result(
+                        agent, messages, conversation_history, api_call_count
+                    )
+                    if compression_aborted is not None:
+                        return compression_aborted
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )

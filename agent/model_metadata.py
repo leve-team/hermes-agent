@@ -2740,6 +2740,13 @@ def get_model_context_length(
     7. Local server query (before hardcoded defaults for local endpoints)
     8. Hardcoded defaults (broad family patterns, longest-key-first)
     9. Default fallback (256K)"""
+    sol_route_model = _strip_provider_prefix(model).strip().lower().rsplit("/", 1)[-1]
+    if (
+        (provider or "").strip().lower() == "openai-codex"
+        and sol_route_model.startswith("gpt-5.6-sol")
+    ):
+        return 272000
+
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
