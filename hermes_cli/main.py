@@ -12703,13 +12703,12 @@ def main():
 
     migrate_s2pg = migrate_subparsers.add_parser(
         "state-to-postgres",
-        help="Copy the SQLite state database into a PostgreSQL backend",
+        help="Online resumable COPY backfill from SQLite to PostgreSQL",
         description=(
-            "One-shot migration of session/state data from the SQLite state "
-            "database into a PostgreSQL backend. The SQLite source is opened "
-            "read-only and is never modified. The migration is idempotent: "
-            "re-running after a partial run fills in any missing rows without "
-            "duplicating existing ones."
+            "Online, resumable migration of session/state data from one "
+            "read-only SQLite snapshot into PostgreSQL COPY batches. The "
+            "source is never copied or modified; committed batch watermarks "
+            "make --resume idempotent."
         ),
     )
     migrate_s2pg.add_argument(
@@ -12732,6 +12731,33 @@ def main():
         "-y",
         action="store_true",
         help="Skip the confirmation prompt (required for non-interactive use).",
+    )
+    migrate_s2pg.add_argument(
+        "--checkpoint",
+        metavar="PATH",
+        help="Atomic watermark file (default: beside state.db).",
+    )
+    migrate_s2pg.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing checkpoint.",
+    )
+    migrate_s2pg.add_argument(
+        "--batch-rows",
+        type=int,
+        default=5000,
+        help="Rows per COPY transaction (default: 5000).",
+    )
+    migrate_s2pg.add_argument(
+        "--budget-bytes",
+        type=int,
+        default=41 * 1024 * 1024 * 1024,
+        help="Stop with rc=4 after this PostgreSQL size (default: 41 GiB).",
+    )
+    migrate_s2pg.add_argument(
+        "--fault-inject-at",
+        metavar="PERCENT",
+        help="Drill-only interruption point, for example 50%%.",
     )
     migrate_s2pg.set_defaults(func=cmd_migrate_state_to_postgres)
 

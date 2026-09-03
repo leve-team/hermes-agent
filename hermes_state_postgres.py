@@ -744,7 +744,29 @@ def apply_postgres_migrations(conn: Any) -> None:
             logger.info("pg-only migration v%d applied", migration.version)
 
 
-def init_postgres_schema(conn: Any, schema_version: int) -> None:
+def _postgres_schema_statements(*, indexes: bool) -> List[str]:
+    """Select base-schema statements by whether they create an index.
+
+    The online backfill provisions tables first and deliberately defers all
+    secondary indexes until after COPY.  Primary-key/unique indexes remain part
+    of CREATE TABLE because they are required for conflict-idempotent batches.
+    """
+    selected: List[str] = []
+    for statement in SCHEMA_SQL_POSTGRES.split(";"):
+        if not statement.strip():
+            continue
+        uncommented = re.sub(r"--[^\n]*", "", statement).strip().upper()
+        is_index = uncommented.startswith("CREATE INDEX") or uncommented.startswith(
+            "CREATE UNIQUE INDEX"
+        )
+        if is_index == indexes:
+            selected.append(statement.strip())
+    return selected
+
+
+def init_postgres_schema(
+    conn: Any, schema_version: int, *, defer_indexes: bool = False
+) -> None:
     """Create the PostgreSQL schema if absent, record the base schema version,
     reconcile drifted columns, and apply any pending Postgres-only migrations.
 
@@ -766,11 +788,16 @@ def init_postgres_schema(conn: Any, schema_version: int) -> None:
     is degraded-but-running rather than dead.
     """
     cur = conn.cursor()
-    cur.executescript(SCHEMA_SQL_POSTGRES)
+    schema_sql = SCHEMA_SQL_POSTGRES
+    if defer_indexes:
+        schema_sql = ";\n".join(_postgres_schema_statements(indexes=False))
+    cur.executescript(schema_sql)
     existing = cur.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
     if existing is None:
         cur.execute("INSERT INTO schema_version (version) VALUES (?)", (schema_version,))
     conn.commit()
+    if defer_indexes:
+        return
     # Apply Postgres-only migrations (e.g. pg_trgm GIN indexes). They are
     # tracked in pg_migration_version, a ledger separate from the shared
     # schema_version, so the two counters cannot collide as the shared
@@ -778,6 +805,20 @@ def init_postgres_schema(conn: Any, schema_version: int) -> None:
     apply_postgres_migrations(conn)
     # Declarative backstop — see the docstring and the module note above
     # reconcile_postgres_columns.
+    try:
+        from hermes_state import SCHEMA_SQL
+
+        reconcile_postgres_columns(conn, SCHEMA_SQL)
+    except Exception as exc:
+        logger.warning("pg column reconciliation skipped: %s", exc)
+
+
+def finalize_postgres_schema(conn: Any) -> None:
+    """Build deferred base/GIN indexes after a bulk COPY has completed."""
+    raw = conn.raw if hasattr(conn, "raw") else conn
+    for statement in _postgres_schema_statements(indexes=True):
+        raw.execute(statement)
+    apply_postgres_migrations(conn)
     try:
         from hermes_state import SCHEMA_SQL
 
