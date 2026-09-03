@@ -5,6 +5,13 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
+from hermes_state_postgres import (
+    _PG_ONLY_MIGRATIONS,
+    _build_tsquery,
+    _replace_prefix_terms,
+    _search_messages_fts,
+    search_messages_postgres,
+)
 
 
 @pytest.fixture
@@ -103,3 +110,135 @@ def test_sqlite_limit_and_temporal_sort_are_bounds(
     assert [row["id"] for row in db.search_messages("blue", limit=1, sort="oldest")] == [
         ids["phrase"]
     ]
+
+
+class _Rows:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _TsqueryConnection:
+    def __init__(self, websearch_result: str):
+        self._conn = self
+        self._fts_col_available = True
+        self.websearch_result = websearch_result
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params=()):
+        bound = tuple(params)
+        self.calls.append((sql, bound))
+        if "websearch_to_tsquery" in sql:
+            return _Rows([(self.websearch_result,)])
+        if "plainto_tsquery" in sql:
+            return _Rows()
+        if "to_tsquery" in sql:
+            term = bound[0].removesuffix(":*")
+            return _Rows([(f"'{term}':*",)])
+        return _Rows()
+
+
+@pytest.mark.parametrize(
+    ("query", "websearch_result", "expected"),
+    [
+        ("deploy", "'deploy'", "'deploy'"),
+        ("deploy*", "'zzhermesprefix0zz'", "('deploy':*)"),
+        ('"blue green"', "'blue' <-> 'green'", "'blue' <-> 'green'"),
+        ("blue OR green", "'blue' | 'green'", "'blue' | 'green'"),
+        ("blue -green", "'blue' & !'green'", "'blue' & !'green'"),
+    ],
+    ids=["word", "prefix", "phrase", "or", "negative"],
+)
+def test_postgres_query_contract(
+    query: str, websearch_result: str, expected: str
+) -> None:
+    conn = _TsqueryConnection(websearch_result)
+    assert _build_tsquery(conn, query) == expected
+    if query == "deploy*":
+        assert any(
+            "to_tsquery" in sql and params == ("deploy:*",)
+            for sql, params in conn.calls
+        )
+
+
+def test_postgres_prefix_placeholder_preserves_websearch_boolean_tree() -> None:
+    conn = _TsqueryConnection(
+        "'release' | ('zzhermesprefix0zz' & !'legacy')"
+    )
+    assert _build_tsquery(conn, "release OR deploy* -legacy") == (
+        "'release' | (('deploy':*) & !'legacy')"
+    )
+
+
+def test_postgres_prefix_placeholders_cannot_collide_with_query_text() -> None:
+    query = "zzhermesprefix0zz zzhermesprefix1zz first* second*"
+    rewritten, mappings = _replace_prefix_terms(query)
+    placeholders = [placeholder for placeholder, _term in mappings]
+
+    assert len(placeholders) == len(set(placeholders)) == 2
+    assert all(placeholder not in query for placeholder in placeholders)
+    assert all(placeholder in rewritten for placeholder in placeholders)
+
+
+class _SearchConnection(_TsqueryConnection):
+    def __init__(self, websearch_result: str = "'needle'"):
+        super().__init__(websearch_result)
+        self.search_calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params=()):
+        if "_to_tsquery" in sql or "to_tsquery" in sql:
+            return super().execute(sql, params)
+        bound = tuple(params)
+        self.search_calls.append((sql, bound))
+        return _Rows()
+
+
+def test_postgres_null_rows_are_auxiliary_not_a_global_ilike_downgrade() -> None:
+    conn = _SearchConnection()
+    _search_messages_fts(
+        conn,
+        lambda value: value,
+        "blue -green",
+        "'blue' & !'green'",
+        source_filter=["cli"],
+        exclude_sources=None,
+        role_filter=["user"],
+        limit=7,
+        offset=2,
+        sort_norm="newest",
+        include_inactive=False,
+    )
+
+    sql, params = conn.search_calls[-1]
+    assert "m.fts_content IS NOT NULL AND m.fts_content @@" in sql
+    assert "m.fts_content IS NULL AND" in sql
+    assert "ILIKE" in sql
+    assert "s.source IN" in sql and "m.role IN" in sql
+    assert params[0] == "'blue' & !'green'"
+    assert "%blue%" in params and "%green%" in params
+    assert params[-2:] == (7, 2)
+
+
+def test_postgres_cjk_uses_ilike_when_pg_trgm_is_unavailable() -> None:
+    conn = _SearchConnection("'数据库连接'")
+    assert search_messages_postgres(
+        conn, lambda value: value, "数据库连接", limit=20
+    ) == []
+
+    sql, params = conn.search_calls[-1]
+    assert "ILIKE" in sql
+    assert "fts_content @@" not in sql
+    assert "%数据库连接%" in params
+    trigram_migrations = [
+        migration
+        for migration in _PG_ONLY_MIGRATIONS
+        if "pg_trgm" in migration.sql or "gin_trgm_ops" in migration.sql
+    ]
+    assert trigram_migrations and all(
+        migration.optional for migration in trigram_migrations
+    )

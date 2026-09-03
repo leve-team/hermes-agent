@@ -1752,8 +1752,8 @@ class SessionSearchMixin:
 
         if self._is_postgres:
             # PostgreSQL has no FTS5; dispatch to the Postgres search helper,
-            # which uses native tsvector full-text search once the backfill is
-            # complete and falls back to ILIKE while rows remain unindexed.
+            # which keeps native tsvector search for indexed rows and uses an
+            # ILIKE auxiliary predicate only for rows still unindexed.
             # Placed before every FTS gate below, which would otherwise
             # short-circuit to [] on the PostgreSQL backend.
             # NOTE: the PG helper predates the ``fields`` projection and always

@@ -32,6 +32,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_state_common import MAX_FTS5_QUERY_CHARS
+
 logger = logging.getLogger(__name__)
 
 
@@ -1317,33 +1319,31 @@ def _fts_column_available(conn: Any) -> bool:
     return result
 
 
-def _fts_backfill_complete(conn: Any) -> bool:
-    """Return True if every messages row has a non-NULL fts_content.
+_PREFIX_TERM_RE = re.compile(r"(?<![\w*])([\w]+)\*+(?=\s|$)", re.UNICODE)
 
-    While legacy rows remain un-backfilled (fts_content IS NULL), an FTS-only
-    query would silently miss them, so search_messages_postgres stays on the
-    ILIKE path (which covers all rows) until backfill finishes.
 
-    Caching is monotonic-safe: once we observe completeness we cache True
-    permanently (the per-INSERT hook keeps new rows non-NULL, so the table can
-    never regress to having NULLs). While incomplete we re-probe each call —
-    cheap because EXISTS short-circuits on the first NULL row via the partial
-    index / seq scan and the answer flips at most once per process.
-    """
-    if getattr(conn, "_fts_backfill_done", False):
-        return True
-    if not _fts_column_available(conn):
-        return False
-    try:
-        row = conn._conn.execute(
-            "SELECT 1 FROM messages WHERE fts_content IS NULL LIMIT 1"
-        ).fetchone()
-        complete = row is None
-    except Exception:
-        complete = False
-    if complete:
-        conn._fts_backfill_done = True
-    return complete
+def _replace_prefix_terms(query: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Replace unquoted FTS5 prefix terms with websearch-safe placeholders."""
+    mappings: List[Tuple[str, str]] = []
+    occupied = query.casefold()
+    used: set[str] = set()
+
+    def replace(match: re.Match[str]) -> str:
+        index = len(mappings)
+        placeholder = f"zzhermesprefix{index}zz"
+        while placeholder in occupied or placeholder in used:
+            index += 1
+            placeholder = f"zzhermesprefix{index}zz"
+        used.add(placeholder)
+        mappings.append((placeholder, match.group(1)))
+        return placeholder
+
+    # A suffix star inside a phrase is literal. The portable prefix form is an
+    # unquoted word token such as ``deploy*``.
+    parts = re.split(r'("[^"]*")', query)
+    for index in range(0, len(parts), 2):
+        parts[index] = _PREFIX_TERM_RE.sub(replace, parts[index])
+    return "".join(parts), mappings
 
 
 def _build_tsquery(conn: Any, query: str) -> Optional[str]:
@@ -1363,12 +1363,9 @@ def _build_tsquery(conn: Any, query: str) -> Optional[str]:
     if not _fts_column_available(conn):
         return None
 
-    # Strip FTS5-specific prefix wildcard (*) — websearch_to_tsquery handles
-    # quoted phrases and OR/- natively but not the FTS5 "term*" prefix form.
-    # Only strip a * that terminates a word token (followed by whitespace or
-    # end-of-string), i.e. the FTS5 prefix marker "deploy*". Asterisks embedded
-    # mid-token (e.g. "a*b") are left intact so non-FTS queries keep meaning.
-    cleaned = re.sub(r"(\w)\*+(?=\s|$)", r"\1", query).strip()
+    cleaned, prefixes = _replace_prefix_terms(
+        query[:MAX_FTS5_QUERY_CHARS].strip()
+    )
     if not cleaned:
         return None
 
@@ -1391,7 +1388,94 @@ def _build_tsquery(conn: Any, query: str) -> Optional[str]:
         except Exception:
             return None
 
-    return tsq or None  # empty string → None
+    if not tsq:
+        return None
+
+    # websearch_to_tsquery has no prefix spelling. Asking PostgreSQL itself to
+    # build each ``term:*`` fragment keeps lexeme escaping in the database; the
+    # placeholders preserve websearch's phrase/OR/negative parse tree.
+    for placeholder, term in prefixes:
+        try:
+            row = conn._conn.execute(
+                "SELECT to_tsquery('simple', %s)::text",
+                (f"{term}:*",),
+            ).fetchone()
+            prefix_tsq = row[0] if row else None
+        except Exception:
+            return None
+        marker = f"'{placeholder}'"
+        if not prefix_tsq or marker not in tsq:
+            return None
+        tsq = tsq.replace(marker, f"({prefix_tsq})")
+
+    return tsq
+
+
+def _contains_cjk(text: str) -> bool:
+    return any(
+        0x3400 <= ord(char) <= 0x9FFF
+        or 0x20000 <= ord(char) <= 0x2A6DF
+        or 0x3040 <= ord(char) <= 0x30FF
+        or 0xAC00 <= ord(char) <= 0xD7AF
+        for char in text
+    )
+
+
+def _compile_ilike_query(query: str, *, prefix: str = "m") -> Tuple[str, List[str]]:
+    """Compile the portable boolean subset into parameter-bound ILIKE SQL.
+
+    Used for the PostgreSQL equivalent of ``messages_fts_trigram`` and only the
+    rows whose derived ``fts_content`` is still NULL. The optional pg_trgm
+    extension supplies indexes, not query semantics.
+    """
+    groups: List[List[Tuple[str, bool]]] = [[]]
+    negate_next = False
+    for raw in re.findall(r'"[^"]+"|\S+', query[:MAX_FTS5_QUERY_CHARS]):
+        operator = raw.upper()
+        if operator == "OR":
+            if groups[-1]:
+                groups.append([])
+            negate_next = False
+            continue
+        if operator == "AND":
+            continue
+        if operator == "NOT":
+            negate_next = True
+            continue
+
+        negated = negate_next or (raw.startswith("-") and len(raw) > 1)
+        if raw.startswith("-") and len(raw) > 1:
+            raw = raw[1:]
+        negate_next = False
+        quoted = len(raw) >= 2 and raw.startswith('"') and raw.endswith('"')
+        term = raw[1:-1] if quoted else raw.rstrip("*")
+        term = term.strip()
+        if term:
+            groups[-1].append((term, negated))
+
+    compiled_groups: List[str] = []
+    params: List[str] = []
+    for group in groups:
+        # The portable contract requires a positive arm. Negative-only queries
+        # have backend-specific broadening/index behavior and return no matches.
+        if not group or not any(not negated for _, negated in group):
+            continue
+        clauses = []
+        for term, negated in group:
+            escaped = (
+                term.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clause = (
+                f"(COALESCE({prefix}.content, '') ILIKE ? ESCAPE '\\' OR "
+                f"COALESCE({prefix}.tool_name, '') ILIKE ? ESCAPE '\\' OR "
+                f"COALESCE({prefix}.tool_calls, '') ILIKE ? ESCAPE '\\')"
+            )
+            clauses.append(f"NOT {clause}" if negated else clause)
+            params.extend([f"%{escaped}%"] * 3)
+        compiled_groups.append(f"({' AND '.join(clauses)})")
+    return " OR ".join(compiled_groups), params
 
 
 def _update_fts_content(conn: Any, msg_id: int,
@@ -2509,6 +2593,10 @@ def search_messages_postgres(
     - the v19 column is absent (migration pending), or
     - the query produces an empty tsquery (pure punctuation / no tokens).
 
+    CJK queries use ILIKE deliberately for parity with SQLite's substring
+    trigram route. During backfill, indexed rows still use tsvector and only
+    rows whose fts_content is NULL use an ILIKE auxiliary predicate.
+
     The result-row contract is identical to the SQLite ``search_messages``
     path: id/session_id/role/snippet/timestamp/tool_name/source/model/
     session_started + a bounded before/anchor/after ``context`` window.
@@ -2518,17 +2606,14 @@ def search_messages_postgres(
 
     sort_norm = sort.strip().lower() if isinstance(sort, str) else None
 
-    # ── FTS path (v19 column present AND backfill complete) ───────────────────
-    # While the column exists but legacy rows are still fts_content IS NULL,
-    # an FTS-only query would silently miss every un-backfilled row. To honor
-    # the "old rows fall through to ILIKE until backfill" contract, we only take
-    # the FTS path once no NULL rows remain. ILIKE covers all rows regardless,
-    # so it is the correct choice during the backfill window.
+    # CJK substring search is the PostgreSQL equivalent of SQLite's trigram
+    # route. ILIKE keeps working without pg_trgm; the optional extension only
+    # turns these predicates into GIN-indexable operations.
     tsq = _build_tsquery(conn, query)
-    if tsq is not None and _fts_backfill_complete(conn):
+    if tsq is not None and not _contains_cjk(query):
         try:
             matches = _search_messages_fts(
-                conn, decode_content, tsq,
+                conn, decode_content, query, tsq,
                 source_filter=source_filter,
                 exclude_sources=exclude_sources,
                 role_filter=role_filter,
@@ -2544,7 +2629,7 @@ def search_messages_postgres(
                 "FTS search failed, falling back to ILIKE", exc_info=True
             )
 
-    # ── ILIKE fallback (column absent, backfill incomplete, empty tsquery) ────
+    # ILIKE fallback: column absent, empty tsquery, or trigram/substring query.
     return _search_messages_ilike(
         conn, decode_content, query,
         source_filter=source_filter,
@@ -2585,13 +2670,23 @@ def _build_where(
 def _search_messages_fts(
     conn: Any,
     decode_content,
+    query: str,
     tsq: str,
     source_filter, exclude_sources, role_filter,
     limit, offset, sort_norm, include_inactive,
 ) -> List[Dict[str, Any]]:
-    """Execute the tsvector FTS search path. Returns matches without context."""
-    params: list = [tsq]  # for fts_content @@ %s::tsquery
-    where = ["m.fts_content @@ %s::tsquery"]
+    """Search indexed rows with tsvector and only NULL rows with ILIKE."""
+    null_predicate, null_params = _compile_ilike_query(query)
+    if null_predicate:
+        text_predicate = (
+            "((m.fts_content IS NOT NULL AND m.fts_content @@ %s::tsquery) OR "
+            f"(m.fts_content IS NULL AND ({null_predicate})))"
+        )
+        params: list = [tsq, *null_params]
+    else:
+        text_predicate = "m.fts_content @@ %s::tsquery"
+        params = [tsq]
+    where = [text_predicate]
     where += _build_where(
         source_filter, exclude_sources, role_filter, include_inactive, params
     )
@@ -2642,15 +2737,11 @@ def _search_messages_ilike(
     source_filter, exclude_sources, role_filter,
     limit, offset, sort_norm, include_inactive,
 ) -> List[Dict[str, Any]]:
-    """Execute the ILIKE fallback search path. Returns matches with context."""
-    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like = f"%{escaped}%"
-
-    params: list = [like, like, like]
-    where = [
-        "(m.content ILIKE ? ESCAPE '\\' OR m.tool_name ILIKE ? ESCAPE '\\' "
-        "OR m.tool_calls ILIKE ? ESCAPE '\\')"
-    ]
+    """Execute the pg_trgm-accelerable ILIKE path with boolean semantics."""
+    predicate, params = _compile_ilike_query(query)
+    if not predicate:
+        return []
+    where = [f"({predicate})"]
     where += _build_where(
         source_filter, exclude_sources, role_filter, include_inactive, params
     )
