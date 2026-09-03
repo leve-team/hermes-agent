@@ -199,6 +199,89 @@ class TestOpenStoreForProfile:
         assert db._is_postgres is True
         assert db._conn is fake_pg_conn
 
+    def test_readonly_pg_profile_open_uses_readonly_connection(
+        self, monkeypatch, tmp_path
+    ):
+        """``read_only=True`` must reach the Postgres branch (P0 gap 5d).
+
+        The seam used to drop the flag and build ``SessionDB(postgres_dsn=dsn)``,
+        i.e. a write-capable, schema-initialising connection for every
+        cross-profile reader. Now it must take the read-only open: no schema
+        init, and ``default_transaction_read_only = on`` issued first.
+        """
+        profile_dir = tmp_path / "zeta"
+        profile_dir.mkdir()
+        (profile_dir / "config.yaml").write_text(
+            "sessions:\n  state_backend: postgres\n"
+            "  postgres_dsn: postgresql://user:pw@localhost/test\n",
+            encoding="utf-8",
+        )
+        profiles_stub = types.SimpleNamespace(
+            normalize_profile_name=lambda n: n,
+            validate_profile_name=lambda n: None,
+            profile_exists=lambda n: True,
+            get_profile_dir=lambda n: profile_dir,
+        )
+
+        executed: list = []
+
+        class _RecordingConn:
+            """Records the raw statements the read-only preparation issues."""
+
+            def execute(self, sql, params=()):
+                executed.append(sql.strip())
+                if "information_schema.tables" in sql:
+                    return types.SimpleNamespace(fetchone=lambda: (1,))
+                return types.SimpleNamespace(fetchone=lambda: None)
+
+            def commit(self):
+                executed.append("COMMIT")
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
+        recording = _RecordingConn()
+        init_calls: list = []
+        expected_version = max(
+            m.version for m in hermes_state_postgres._PG_ONLY_MIGRATIONS
+        )
+
+        def fake_connect_postgres(dsn):
+            return recording
+
+        monkeypatch.setattr(hermes_state_postgres, "connect_postgres", fake_connect_postgres)
+        monkeypatch.setattr(
+            hermes_state_postgres,
+            "init_postgres_schema",
+            lambda conn, v: init_calls.append(conn),
+        )
+        monkeypatch.setattr(
+            hermes_state_postgres,
+            "postgres_migration_version",
+            lambda conn: expected_version,
+        )
+        monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
+
+        with _patched_profiles_module(profiles_stub):
+            db = hermes_state_postgres.open_store_for_profile("zeta", read_only=True)
+
+        assert db._is_postgres is True
+        assert db._conn is recording
+        assert init_calls == [], "read-only profile open ran schema init"
+        assert executed, "no statement reached the connection"
+        assert "default_transaction_read_only" in executed[0].lower()
+        assert " on" in executed[0].lower()
+
+        # And the writable open is untouched: schema init, no read-only SET.
+        executed.clear()
+        with _patched_profiles_module(profiles_stub):
+            hermes_state_postgres.open_store_for_profile("zeta", read_only=False)
+        assert init_calls == [recording]
+        assert not any("default_transaction_read_only" in s.lower() for s in executed)
+
     def test_unknown_profile_raises_value_error(self, monkeypatch, tmp_path):
         """open_store_for_profile raises ValueError for non-existent profiles."""
         profiles_stub = types.SimpleNamespace(
@@ -514,6 +597,19 @@ class TestCrossProfileReadSeam:
         monkeypatch.setattr(
             hermes_state_postgres, "init_postgres_schema", lambda c, v: None
         )
+        # _resolve_profile_db opens read-only, and the seam now forwards that
+        # to the Postgres branch, so the read-only preparation (SET
+        # default_transaction_read_only, information_schema probe, migration
+        # ledger check) would run against this SQLite-backed stub. Its
+        # behaviour is pinned by test_pg_readonly_enforcement.py and
+        # test_readonly_pg_profile_open_uses_readonly_connection; here the
+        # subject is routing, so stub it the same way init is stubbed above.
+        readonly_prep_calls: list = []
+        monkeypatch.setattr(
+            hermes_state_postgres,
+            "_prepare_readonly_postgres",
+            lambda c, v, dsn: readonly_prep_calls.append(c),
+        )
         monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
 
         # ── Stub profiles module ──
@@ -542,6 +638,10 @@ class TestCrossProfileReadSeam:
         assert db_b._is_postgres is True, (
             "Expected a Postgres-backed SessionDB for profile-b — "
             "got SQLite, which means the reader bypassed the seam"
+        )
+        assert readonly_prep_calls == [fake_pg], (
+            "the cross-profile reader opened profile-b's Postgres store "
+            "without the read-only preparation (read_only was dropped)"
         )
 
         # Now prove that B's session is visible.  get_session uses _conn directly.

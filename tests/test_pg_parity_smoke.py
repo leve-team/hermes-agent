@@ -25,6 +25,7 @@ Design notes
 
 import os
 import socket
+import sys
 from pathlib import Path
 
 import pytest
@@ -486,6 +487,66 @@ def test_a7b_lease_epoch_fences_reissued_holder_on_both_backends(pg_clean, tmp_p
         restore()
 
     assert pg_out == sq_out == (1, 2, True, True, None, ["live"])
+
+
+def test_a7c_readonly_pg_profile_open_rejects_insert(pg_clean, tmp_path, monkeypatch):
+    """a7c (levos S1, P0 gap 5d) - ``open_store_for_profile(read_only=True)``
+    on a profile whose config selects Postgres yields a connection the SERVER
+    holds read-only: an INSERT fails with SQLSTATE 25006
+    (read_only_sql_transaction), and no row lands."""
+    import types
+
+    import hermes_cli
+    import hermes_state
+    from hermes_state_postgres import open_store_for_profile
+
+    # Provision the schema and one row through a writable open first.
+    writer, restore = _pg_session_db(pg_clean)
+    try:
+        writer.create_session(session_id="ro-seed", source="cli")
+        writer.close()
+    finally:
+        restore()
+
+    profile_dir = tmp_path / "ro-profile"
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text(
+        "sessions:\n  state_backend: postgres\n"
+        f"  postgres_dsn: {pg_clean}\n",
+        encoding="utf-8",
+    )
+    profiles_stub = types.SimpleNamespace(
+        normalize_profile_name=lambda n: n,
+        validate_profile_name=lambda n: None,
+        profile_exists=lambda n: True,
+        get_profile_dir=lambda n: profile_dir,
+    )
+    monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", profiles_stub)
+    monkeypatch.setattr(hermes_cli, "profiles", profiles_stub, raising=False)
+
+    ro = open_store_for_profile("ro-profile", read_only=True)
+    try:
+        assert ro._is_postgres is True
+        assert ro.get_session("ro-seed") is not None, "read-only open cannot read"
+        with pytest.raises(Exception) as excinfo:
+            ro._conn.execute(
+                "INSERT INTO sessions (id, source, started_at, last_activity_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("ro-smuggled", "cli", 1.0, 1.0),
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "25006", excinfo.value
+    finally:
+        try:
+            ro._conn.rollback()
+        except Exception:
+            pass
+        ro.close()
+
+    with psycopg.connect(pg_clean) as check:
+        assert check.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'ro-smuggled'"
+        ).fetchone()[0] == 0
 
 
 def test_a8_json_extract_read(pg_clean, tmp_path):

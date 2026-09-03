@@ -2135,10 +2135,12 @@ def open_store_for_profile(
        ``postgres_dsn``, raise ``RuntimeError`` — silently falling back to an
        empty SQLite file is the very bug this seam was introduced to fix.
 
-    The ``read_only`` flag is forwarded to the SQLite path only; Postgres
-    connections do not have a "read-only attach" mode — the full adapter is
-    opened, which already issues only SELECTs when callers only call SELECT
-    methods.
+    ``read_only`` is forwarded to BOTH backends. On SQLite it is the URI
+    attach mode (no write lock). On Postgres it selects the read-only open in
+    :func:`maybe_open_postgres`: no DDL, fail-closed on an absent or stale
+    schema, and ``default_transaction_read_only = on`` so the SERVER rejects
+    any write (SQLSTATE 25006). Dropping the flag here used to give every
+    cross-profile reader a write-capable, schema-initialising connection.
 
     Raises:
         ValueError   – unknown profile name (via ``profiles_mod``)
@@ -2226,7 +2228,7 @@ def open_store_for_profile(
         # that, because the racing constructor is not a seam caller.
         from hermes_state import SessionDB
 
-        db = SessionDB(postgres_dsn=dsn)
+        db = SessionDB(postgres_dsn=dsn, read_only=read_only)
 
         if not getattr(db, "_is_postgres", False):
             db.close()
