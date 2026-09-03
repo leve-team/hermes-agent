@@ -82,6 +82,11 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def read_lifecycle_record(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Return the current lifecycle sentinel without mutating it."""
+    return _read_json(get_lifecycle_sentinel_path(home))
+
+
 def _write_sentinel(payload: Dict[str, Any], home: Optional[Path]) -> None:
     try:
         from utils import atomic_json_write
@@ -138,7 +143,7 @@ def _suspected_oom(mem: Dict[str, Any]) -> bool:
 
 def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Evidence dict when the previous life died uncleanly, else ``None``. Read-only."""
-    sentinel = _read_json(get_lifecycle_sentinel_path(home))
+    sentinel = read_lifecycle_record(home)
     if not sentinel or sentinel.get("phase") != "running":
         return None
     if _pid_alive_with_start_time(sentinel.get("pid"), sentinel.get("start_time")):
@@ -235,7 +240,7 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
     be clobbered.  ``pid=None`` / malformed sentinels have unknown ownership → left alone.
     """
     try:
-        sentinel = _read_json(get_lifecycle_sentinel_path(home))
+        sentinel = read_lifecycle_record(home)
         if sentinel is not None and sentinel.get("pid") != os.getpid():
             return
         _write_sentinel({"phase": "exited", "pid": os.getpid(), "exit_code": exit_code, "exit_reason": reason,
@@ -248,7 +253,7 @@ def read_prior_exit_label(profile_home: Path) -> str:
     """``clean``/``unclean``/``unknown`` for the profile's last gateway life; annotates
     ``container-boot.log``.  ``running`` is unclean: the old PID namespace is gone at container boot."""
     try:
-        phase = (_read_json(get_lifecycle_sentinel_path(profile_home)) or {}).get("phase")
+        phase = (read_lifecycle_record(profile_home) or {}).get("phase")
         return {"exited": "clean", "running": "unclean"}.get(phase, "unknown")
     except Exception:
         return "unknown"

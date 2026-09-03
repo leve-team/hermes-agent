@@ -1970,6 +1970,10 @@ DEFAULT_CONFIG = {
         # supervisor can't hammer the process. max_starts <= 0 disables. Env escape hatches:
         # HERMES_GATEWAY_MAX_STARTS / HERMES_GATEWAY_START_WINDOW_S.
         "respawn_storm": {"max_starts": 5, "window_seconds": 120},
+        # Optional Kubernetes Downward API directory (uid/name/namespace scalar files + labels and
+        # annotations map files). gateway-starts.log combines that pod identity with the lifecycle
+        # sentinel to classify deployment/crash/OOM/eviction starts. Blank = local-only (levos).
+        "restart_classification": {"pod_metadata_dir": ""},
         # Prefix user messages IN THE MODEL'S CONTEXT with a timestamp (e.g. "[Tue 2026-04-28
         # 13:40:53 CEST]") for temporal awareness. Persisted transcripts stay clean (timestamp is
         # message metadata regardless), so enabling later surfaces past send-times too.

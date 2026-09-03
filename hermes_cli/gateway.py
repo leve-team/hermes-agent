@@ -4672,6 +4672,7 @@ def _respawn_storm_backoff() -> None:
         from gateway.status import record_start_and_check_storm
         _max_starts = 5
         _win = 120.0
+        _restart_classification = None
         try:
             from hermes_cli.config import load_config
             _cfg = load_config()
@@ -4682,6 +4683,12 @@ def _respawn_storm_backoff() -> None:
                     _max_starts = _rs["max_starts"]
                 if isinstance(_rs.get("window_seconds"), (int, float)):
                     _win = float(_rs["window_seconds"])
+            _restart_classification = (
+                _gw.get("restart_classification")
+                if isinstance(_gw, dict)
+                and isinstance(_gw.get("restart_classification"), dict)
+                else None
+            )
         except Exception:
             pass
         try:
@@ -4692,7 +4699,9 @@ def _respawn_storm_backoff() -> None:
             _win = float(os.environ["HERMES_GATEWAY_START_WINDOW_S"])
         except (KeyError, ValueError):
             pass
-        _storm = record_start_and_check_storm(max_starts=_max_starts, window_s=_win) if _max_starts > 0 else None
+        _storm = (record_start_and_check_storm(
+            max_starts=_max_starts, window_s=_win, restart_classification=_restart_classification)
+            if _max_starts > 0 else None)
         if _storm is not None:
             logger.warning(
                 "Gateway (re)started %d times in %.0fs — backing off %.0fs to break a respawn storm.",
