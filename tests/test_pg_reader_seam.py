@@ -17,6 +17,7 @@ that profile A's reader reaches profile B's ACTUAL rows and not an empty
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import sqlite3
 import sys
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_cli
 import hermes_state
 import hermes_state_postgres
 
@@ -65,6 +67,22 @@ def _fake_postgres_connection(sqlite_conn):
     return pg
 
 
+@contextlib.contextmanager
+def _patched_profiles_module(profiles_stub):
+    """Swap ``hermes_cli.profiles`` for *profiles_stub* on every lookup path.
+
+    The seam resolves the module with ``from hermes_cli import profiles``. When
+    an earlier test module (``test_pg_config_authority.py``) has already bound
+    the real submodule as an attribute of the ``hermes_cli`` package, that
+    statement returns the attribute and never consults ``sys.modules`` — so
+    patching the module cache alone leaves the stub unused and the test order
+    dependent. Patch both in one context so either lookup sees the stub.
+    """
+    with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with mock.patch.object(hermes_cli, "profiles", profiles_stub, create=True):
+            yield
+
+
 # ---------------------------------------------------------------------------
 # Seam function: open_store_for_profile
 # ---------------------------------------------------------------------------
@@ -97,10 +115,7 @@ class TestOpenStoreForProfile:
             profile_exists=lambda n: True,
             get_profile_dir=lambda n: profile_dir,
         )
-        with mock.patch.dict(
-            "sys.modules",
-            {"hermes_cli.profiles": profiles_stub},
-        ):
+        with _patched_profiles_module(profiles_stub):
             # Must bypass _ensure_test_isolation
             monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
             db = hermes_state_postgres.open_store_for_profile("alpha", read_only=True)
@@ -130,7 +145,7 @@ class TestOpenStoreForProfile:
             profile_exists=lambda n: True,
             get_profile_dir=lambda n: profile_dir,
         )
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             with pytest.raises(RuntimeError, match="no DSN"):
                 hermes_state_postgres.open_store_for_profile("beta")
 
@@ -177,7 +192,7 @@ class TestOpenStoreForProfile:
         )
         monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
 
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             db = hermes_state_postgres.open_store_for_profile("gamma")
 
         assert isinstance(db, hermes_state.SessionDB)
@@ -192,7 +207,7 @@ class TestOpenStoreForProfile:
             profile_exists=lambda n: False,
             get_profile_dir=lambda n: tmp_path / n,
         )
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             with pytest.raises(ValueError, match="does not exist"):
                 hermes_state_postgres.open_store_for_profile("ghost")
 
@@ -212,7 +227,7 @@ class TestOpenStoreForProfile:
         )
         monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
 
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             db = hermes_state_postgres.open_store_for_profile("delta", read_only=False)
 
         assert isinstance(db, hermes_state.SessionDB)
@@ -247,7 +262,7 @@ class TestOpenStoreForProfile:
         )
         monkeypatch.setattr(hermes_state, "_ensure_test_isolation", lambda p: None)
 
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             db = hermes_state_postgres.open_store_for_profile("epsilon")
 
         assert db._is_postgres is True
@@ -400,10 +415,7 @@ class TestTuiGatewayRosterPath:
         profiles_stub = types.ModuleType("hermes_cli.profiles")
         profiles_stub.list_profiles = fake_list_profiles
 
-        with mock.patch.dict(
-            "sys.modules",
-            {"hermes_cli.profiles": profiles_stub},
-        ):
+        with _patched_profiles_module(profiles_stub):
             with mock.patch(
                 "tui_gateway.methods_profiles.open_store_for_profile",
                 fake_open,
@@ -515,7 +527,7 @@ class TestCrossProfileReadSeam:
         )
 
         # ── Profile A reads profile B ──
-        with mock.patch.dict("sys.modules", {"hermes_cli.profiles": profiles_stub}):
+        with _patched_profiles_module(profiles_stub):
             # Patch at the source module since _resolve_profile_db imports
             # open_store_for_profile inside the function body.
             with mock.patch.object(
