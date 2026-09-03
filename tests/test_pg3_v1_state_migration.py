@@ -12,6 +12,8 @@ from migrate_state_to_postgres import (
     InjectedBackfillFault,
     online_backfill,
 )
+from state_diff import RepairWriter, canonical_row_json, state_diff_connections
+from state_transfer import sqlite_table_specs
 
 
 def _init_sqlite_replica(path: Path) -> None:
@@ -207,3 +209,103 @@ def test_backfill_resume_disk_guard_saves_checkpoint_and_uses_rc4_error(
         )
     assert raised.value.checkpoint_path == checkpoint
     assert checkpoint.is_file()
+
+
+def test_state_diff_hash_detects_missing_extra_and_equal_count_difference(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    checkpoint = tmp_path / "backfill.json"
+    _seed_sessions(source_path, 3)
+    _init_sqlite_replica(target_path)
+
+    def target_factory(_dsn: str):
+        conn = sqlite3.connect(target_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    online_backfill(
+        source_path,
+        "test-only",
+        checkpoint_path=checkpoint,
+        budget_bytes=1024 * 1024 * 1024,
+        _target_factory=target_factory,
+        _initialize_target=lambda _conn: None,
+        _finalize_target=lambda _conn: None,
+    )
+    with sqlite3.connect(target_path) as target:
+        target.execute("DELETE FROM messages WHERE id = 1")
+        target.execute("UPDATE messages SET content = 'different' WHERE id = 2")
+        target.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp) "
+            "VALUES (999, 's-0002', 'user', 'extra', 999.0)"
+        )
+
+    source = sqlite3.connect(source_path, isolation_level=None)
+    source.row_factory = sqlite3.Row
+    target = sqlite3.connect(target_path, isolation_level=None)
+    target.row_factory = sqlite3.Row
+    specs = [
+        spec
+        for spec in sqlite_table_specs(source)
+        if spec.name in {"sessions", "messages"}
+    ]
+    try:
+        report = state_diff_connections(
+            source,
+            target,
+            specs=specs,
+            target_dialect="sqlite",
+            batch_rows=2,
+        )
+        assert report["tables"]["messages"] == {
+            "missing": 1,
+            "extra": 1,
+            "differ": 1,
+            "matched": 1,
+        }
+
+        writer_conn = sqlite3.connect(target_path, isolation_level=None)
+        # Keep the SQLite-test writer transaction open until the read cursor is
+        # exhausted. PostgreSQL's MVCC permits bounded mid-stream commits; a
+        # second SQLite connection cannot commit while this test cursor holds
+        # its read lock.
+        writer = RepairWriter(writer_conn, "sqlite", batch_rows=100)
+        repaired = state_diff_connections(
+            source,
+            target,
+            specs=specs,
+            target_dialect="sqlite",
+            repair_writer=writer,
+            batch_rows=2,
+        )
+        writer_conn.close()
+        assert repaired["mismatch_count"] >= 3
+    finally:
+        source.close()
+        target.close()
+
+    with sqlite3.connect(source_path) as source, sqlite3.connect(target_path) as target:
+        source.row_factory = sqlite3.Row
+        target.row_factory = sqlite3.Row
+        clean = state_diff_connections(
+            source,
+            target,
+            specs=specs,
+            target_dialect="sqlite",
+        )
+    assert clean["clean"] is True
+
+
+def test_state_diff_hash_normalization_fixes_numeric_bytes_and_null_rules() -> None:
+    encoded = canonical_row_json(
+        ("z", "a", "blob", "nothing"),
+        {"z": 1.25, "a": 7, "blob": b"\x00\xff", "nothing": None},
+    )
+    assert encoded == (
+        '{"a":{"type":"int","value":"7"},'
+        '"blob":{"type":"bytes","value":"00ff"},'
+        '"nothing":{"type":"null","value":null},'
+        '"z":{"type":"float","value":"1.25"}}'
+    )
