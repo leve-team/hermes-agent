@@ -41,9 +41,8 @@ def default_checkpoint_path(sqlite_path: Path) -> Path:
 
 def _open_postgres_snapshot(dsn: str) -> Any:
     import psycopg
-    from psycopg.rows import dict_row
 
-    conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row)
+    conn = psycopg.connect(dsn, autocommit=True)
     conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
     return conn
 
