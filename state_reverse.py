@@ -225,6 +225,7 @@ def reverse_backfill(
         )
     target = sqlite3.connect(sqlite_path, isolation_level=None)
     target.row_factory = sqlite3.Row
+    target.execute("PRAGMA foreign_keys=ON")
     source = (_source_factory or _open_postgres_snapshot)(dsn)
     source_dialect = "sqlite" if isinstance(source, sqlite3.Connection) else "postgres"
     started = time.monotonic()

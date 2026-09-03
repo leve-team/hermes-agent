@@ -11,6 +11,7 @@ from hermes_state import SessionDB
 from migrate_state_to_postgres import (
     BackfillBudgetExceeded,
     InjectedBackfillFault,
+    _backfill_fts,
     online_backfill,
 )
 from state_diff import RepairWriter, canonical_row_json, state_diff_connections
@@ -336,6 +337,34 @@ def test_backfill_resume_disk_guard_saves_checkpoint_and_uses_rc4_error(
         )
     assert raised.value.checkpoint_path == checkpoint
     assert checkpoint.is_file()
+
+
+def test_backfill_resume_fts_phase_keeps_disk_guard_active(tmp_path: Path) -> None:
+    class Cursor:
+        rowcount = 1
+
+    class Target:
+        raw = None
+
+        def __init__(self):
+            self.raw = self
+
+        def execute(self, sql, _params=()):
+            if sql.startswith("WITH batch"):
+                return Cursor()
+            if sql.startswith("SELECT pg_database_size"):
+                return type("SizeCursor", (), {"fetchone": lambda _self: (2,)})()
+            raise AssertionError(sql)
+
+    checkpoint = tmp_path / "backfill.json"
+    with pytest.raises(BackfillBudgetExceeded) as raised:
+        _backfill_fts(
+            Target(),
+            2,
+            budget_bytes=1,
+            checkpoint_path=checkpoint,
+        )
+    assert raised.value.checkpoint_path == checkpoint
 
 
 def test_state_diff_hash_detects_missing_extra_and_equal_count_difference(

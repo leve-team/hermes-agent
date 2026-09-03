@@ -97,6 +97,13 @@ def _target_database_size(target: Any) -> int:
     )
 
 
+def _enforce_budget(target: Any, budget_bytes: int, checkpoint_path: Path) -> int:
+    used_bytes = _target_database_size(target)
+    if used_bytes > budget_bytes:
+        raise BackfillBudgetExceeded(used_bytes, budget_bytes, checkpoint_path)
+    return used_bytes
+
+
 def _source_values(spec: TableSpec, row: Any) -> tuple[Any, ...]:
     values = [row[column] for column in spec.columns]
     # sessions has a self-reference.  PK-order loading cannot guarantee a
@@ -191,7 +198,13 @@ def _restore_session_parents(
         last_id = str(rows[-1][0])
 
 
-def _backfill_fts(target: Any, batch_rows: int) -> int:
+def _backfill_fts(
+    target: Any,
+    batch_rows: int,
+    *,
+    budget_bytes: int,
+    checkpoint_path: Path,
+) -> int:
     if _is_sqlite_target(target):
         return 0
     raw = _target_raw(target)
@@ -207,6 +220,7 @@ def _backfill_fts(target: Any, batch_rows: int) -> int:
         )
         changed = max(int(cursor.rowcount), 0)
         updated += changed
+        _enforce_budget(target, budget_bytes, checkpoint_path)
         if changed < batch_rows:
             return updated
 
@@ -293,10 +307,11 @@ def online_backfill(
         if not _is_sqlite_target(target):
             _target_raw(target).execute("SET SESSION synchronous_commit = off")
 
-        initial_size = _target_database_size(target)
-        if initial_size > budget_bytes:
+        try:
+            _enforce_budget(target, budget_bytes, checkpoint_path)
+        except BackfillBudgetExceeded:
             save_checkpoint(checkpoint_path, checkpoint)
-            raise BackfillBudgetExceeded(initial_size, budget_bytes, checkpoint_path)
+            raise
 
         sessions_spec: Optional[TableSpec] = None
         for spec in specs:
@@ -324,11 +339,7 @@ def online_backfill(
                 processed += len(rows)
                 save_checkpoint(checkpoint_path, checkpoint)
 
-                used_bytes = _target_database_size(target)
-                if used_bytes > budget_bytes:
-                    raise BackfillBudgetExceeded(
-                        used_bytes, budget_bytes, checkpoint_path
-                    )
+                _enforce_budget(target, budget_bytes, checkpoint_path)
                 if (
                     fault_fraction is not None
                     and total_rows > 0
@@ -344,13 +355,19 @@ def online_backfill(
             checkpoint["parents_restored"] = True
             save_checkpoint(checkpoint_path, checkpoint)
 
-        fts_rows = _backfill_fts(target, batch_rows)
+        fts_rows = _backfill_fts(
+            target,
+            batch_rows,
+            budget_bytes=budget_bytes,
+            checkpoint_path=checkpoint_path,
+        )
         _reset_message_identity(target)
         if _finalize_target is None:
             import hermes_state_postgres as hsp
 
             _finalize_target = hsp.finalize_postgres_schema
         _finalize_target(target)
+        _enforce_budget(target, budget_bytes, checkpoint_path)
         checkpoint["completed"] = True
         save_checkpoint(checkpoint_path, checkpoint)
 
