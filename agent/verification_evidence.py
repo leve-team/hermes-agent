@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import aux_db_path
 
 
 _DB_LOCK = threading.Lock()
@@ -108,7 +108,7 @@ def _utc_now() -> str:
 
 
 def _db_path() -> Path:
-    return get_hermes_home() / "verification_evidence.db"
+    return aux_db_path("verification_evidence.db")
 
 
 def _ledger_enabled() -> bool:

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from cron.ledger import ledger_transaction, open_ledger, prepare_ledger
-from hermes_constants import get_hermes_home
+from hermes_constants import aux_db_path
 from hermes_time import now as _hermes_now
 
 # Optional test override. Production resolves the path at transaction time so dashboard operations
@@ -34,7 +34,8 @@ _PROCESS_ID = uuid.uuid4().hex
 # --- executions ledger --------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
-    return open_ledger(EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db"))
+    # levos: auxiliary SQLite stores resolve through HERMES_AUX_DB_DIR (aux_db_path).
+    return open_ledger(EXECUTIONS_FILE or aux_db_path("cron/executions.db").resolve())
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
