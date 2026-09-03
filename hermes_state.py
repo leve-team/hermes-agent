@@ -3341,6 +3341,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_unavailable_warned = False
         self._is_postgres = False
         self._conn = None
+        # Transitional SQLite-primary dual-write mode.  This never changes the
+        # read backend: it only captures committed SQLite write transactions
+        # and replays them to the dedicated PostgreSQL shadow.
+        from hermes_state_dual import dual_write_enabled
+
+        self._dual_requested = dual_write_enabled()
+        self._dual_mode = bool(self._dual_requested and not read_only)
+        self._dual_replicator = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -3368,7 +3376,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             #
             # An explicit ``db_path`` still stays on SQLite: that names a
             # specific file, so honouring it is the caller's whole intent.
-            if db_path is None:
+            if db_path is None and not self._dual_requested:
                 # Detect whether the operator has explicitly selected the
                 # Postgres backend via an env var BEFORE attempting the import.
                 # An import-time failure (bad psycopg install, ABI mismatch,
@@ -3626,6 +3634,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if not report.get("repaired"):
                     raise
                 _connect_and_init_with_lock_patience()
+
+            if self._dual_mode:
+                from hermes_state_dual import DualWriteReplicator, dual_write_dsn
+
+                self._dual_replicator = DualWriteReplicator(
+                    self._conn,
+                    dual_write_dsn(),
+                )
+                # The failure journal and coverage counters live only in the
+                # SQLite authority.  Their tiny DDL is complete before the
+                # instance can accept its first write.
+                self._dual_replicator.initialize_source()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -4147,7 +4167,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
-                        result = fn(self._conn)
+                        dual = self._dual_replicator
+                        if dual is not None:
+                            mutation_id, recording_conn = dual.new_batch()
+                            result = fn(recording_conn)
+                            entrypoint = sys._getframe(1).f_code.co_name
+                            dual.mark_coverage(entrypoint, time.time())
+                            mutations = tuple(recording_conn.mutations)
+                        else:
+                            result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
                         try:
@@ -4155,6 +4183,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         except Exception:
                             pass
                         raise
+                    if dual is not None:
+                        # Load-bearing ordering: source commit is durable before
+                        # any replica statement.  A process death here leaves
+                        # no false claim that PostgreSQL is current; the
+                        # mandatory immediate full diff/repair closes that
+                        # irreducible crash window before rollback/cutover.
+                        dual.inject("after_source_commit")
+                        try:
+                            dual.apply(mutation_id, mutations)
+                        except Exception as exc:
+                            # Replica availability never aborts a user write.
+                            # Journal the entire source transaction as one
+                            # idempotency unit; a later replay either applies
+                            # all statements or observes its PG mutation marker.
+                            try:
+                                self._conn.execute("BEGIN IMMEDIATE")
+                                dual.journal_failure(
+                                    mutation_id, entrypoint, mutations, exc
+                                )
+                                self._conn.commit()
+                            except Exception:
+                                try:
+                                    self._conn.rollback()
+                                except Exception:
+                                    pass
+                                logger.exception(
+                                    "dual-write replica failed and its SQLite "
+                                    "failure journal could not be updated"
+                                )
+                            else:
+                                logger.warning(
+                                    "dual-write replica apply failed open; "
+                                    "mutation %s was journaled for replay (%s)",
+                                    mutation_id,
+                                    type(exc).__name__,
+                                )
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if (
