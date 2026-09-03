@@ -838,8 +838,10 @@ class ResponseStore:
         self._max_size = max_size
         if db_path is None:
             try:
-                from hermes_cli.config import get_hermes_home
-                db_path = str(get_hermes_home() / "response_store.db")
+                from hermes_constants import aux_db_path
+                _store_path = aux_db_path("response_store.db")
+                _store_path.parent.mkdir(parents=True, exist_ok=True)
+                db_path = str(_store_path)
             except Exception:
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None

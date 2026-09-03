@@ -139,6 +139,32 @@ def get_hermes_home() -> Path:
     return _hermes_home_from_env()
 
 
+#: Env var that relocates the *regenerable* auxiliary SQLite files (see
+#: ``docs/state-backend-aux-databases.md``). Empty/unset keeps every file
+#: under :func:`get_hermes_home`, exactly as before the knob existed.
+AUX_DB_DIR_ENV = "HERMES_AUX_DB_DIR"
+
+
+def aux_db_path(relative_path: str) -> Path:
+    """Resolve the on-disk path of a regenerable auxiliary SQLite file.
+
+    ``relative_path`` is the file's location relative to the Hermes home
+    (``"cron/executions.db"``, ``"response_store.db"``, ...). When
+    ``HERMES_AUX_DB_DIR`` is set and non-empty the file lives under that
+    directory instead, so a deployment can put audit/cache stores on
+    node-local scratch (an ``emptyDir``) while the authoritative
+    ``state.db`` stays on durable storage.
+
+    Only stores classified as regenerable route through here. The
+    directory is NOT profile-qualified: one process serves one profile, and
+    a deployment that runs several profiles on one host must give each its
+    own value (or leave the variable unset).
+    """
+    override = os.environ.get(AUX_DB_DIR_ENV, "").strip()
+    base = Path(override).expanduser() if override else get_hermes_home()
+    return base / relative_path
+
+
 def hermes_home_key(path: str | Path | None = None) -> str:
     """Return a stable key for a Hermes home/profile directory.
 

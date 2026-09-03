@@ -14,7 +14,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import aux_db_path
 from hermes_time import now as _hermes_now
 
 # Optional test override. Production resolves the path at transaction time so
@@ -28,7 +28,7 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path = EXECUTIONS_FILE or aux_db_path("cron/executions.db").resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(path, timeout=5)
 
