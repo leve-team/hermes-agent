@@ -178,11 +178,13 @@ in `sessions.state_backend`; setting a DSN alone does not switch backends.
 
 ## Migrating existing sessions
 
-The `hermes migrate state-to-postgres` subcommand performs a one-shot copy of
-an existing SQLite state database into PostgreSQL:
+The `hermes migrate state-to-postgres` subcommand performs an online,
+resumable backfill of an existing SQLite state database into PostgreSQL:
 
 ```bash
-hermes migrate state-to-postgres [--dsn 'postgresql://...'] [--sqlite-path PATH]
+hermes migrate state-to-postgres --dsn 'postgresql://...' --yes \
+  [--sqlite-path PATH] [--checkpoint PATH] [--resume] \
+  [--batch-rows 5000] [--budget-bytes 44023414784]
 ```
 
 Running without `--dsn` resolves the target from the
@@ -197,11 +199,11 @@ Use `-y` / `--yes` to skip the confirmation prompt in scripts or CI:
 hermes migrate state-to-postgres --dsn 'postgresql://...' --yes
 ```
 
-The equivalent direct invocation (documented for scripting or for users who
-prefer to run the module without the CLI) is:
+The equivalent direct invocation is:
 
 ```bash
-python -m migrate_state_to_postgres --dsn 'postgresql://...' [--sqlite-path PATH]
+python -m migrate_state_to_postgres --dsn 'postgresql://...' \
+  [--sqlite-path PATH] [--checkpoint PATH] [--resume]
 ```
 
 The migration reads raw database rows from one read-only SQLite snapshot and
@@ -253,6 +255,84 @@ Recommended sequence:
    search-backfill guidance below if imported history still needs indexing.
 5. Keep the SQLite file and backup for recovery and any remaining local outboxes.
 
+### Online resumable backfill and dual-write validation
+
+The resumable backfill mode (`--checkpoint`, `--resume`, `--batch-rows`,
+`--budget-bytes`) adds the following guarantees:
+
+- **Source-safe snapshot.** SQLite is opened with `mode=ro`, and one read
+  transaction pins the source snapshot. No local database copy is made.
+- **Bounded, resumable COPY.** Each table is streamed in primary-key order
+  through psycopg `COPY`. An atomically replaced JSON checkpoint records each
+  committed `(table, last_pk)` watermark. `--resume` continues that checkpoint,
+  and `ON CONFLICT DO NOTHING` makes a repeated batch idempotent.
+- **Disk guard.** PostgreSQL size is checked before loading and after every
+  batch. The default budget is 41 GiB; exceeding `--budget-bytes` preserves the
+  checkpoint and exits with status 4.
+- **Bulk-load indexes.** Secondary and GIN indexes are built after COPY. The
+  command also fills every `messages.fts_content IS NULL` row and resets the
+  message identity sequence after importing explicit SQLite ids.
+
+The checkpoint identifies the source file and cannot be reused for another
+source. It is not a change-data-capture log: enable dual-write before starting
+an online backfill, and use a final quiesced full diff before cutover.
+
+### SQLite-primary dual-write validation
+
+`HERMES_STATE_DUAL_WRITE=1` is a transition mode. It keeps SQLite as the read
+and write authority, then replays each committed mutation synchronously to the
+PostgreSQL DSN in `HERMES_CORE_PG_DSN`. A replica failure is fail-open for the
+primary operation and is recorded in SQLite's `_hermes_dual_failures` table for
+idempotent replay. It does not select the PostgreSQL read backend and does not
+change the default `sessions.state_backend: sqlite`.
+
+Use the dedicated migration DSN; the dual-write and validation tools never
+borrow an unrelated application's PostgreSQL DSN.
+
+```bash
+export HERMES_STATE_DUAL_WRITE=1
+export HERMES_CORE_PG_DSN='postgresql://...'
+
+# Replay journaled transactions, then compare Python-normalized row hashes.
+python -m state_diff --sqlite-path ~/.hermes/state.db --replay-failures --full
+
+# Repair missing/different/extra target rows from the SQLite authority.
+python -m state_diff --sqlite-path ~/.hermes/state.db --full --repair
+
+# Report dual-write mutation entrypoints not exercised in the validation window.
+python -m state_diff --sqlite-path ~/.hermes/state.db --full --coverage \
+  [--coverage-waive reviewed-waivers.json]
+```
+
+`state_diff` exits 0 for parity, 1 for a mismatch, and 2 when either store is
+unavailable. `--since` accepts an epoch timestamp or ISO-8601 value and checks
+only tables with `updated_at`; it excludes the newest five minutes so in-flight
+dual writes do not create false alarms. A full repair compares cross-database
+snapshots, so stop or otherwise quiesce source writers before using its result
+as a cutover or rollback decision. Never reuse an earlier full-diff result.
+
+To rehearse rollback into a new SQLite file, use the resumable reverse tool. Its
+checkpoint stores only a SHA-256 identity for the credential-bearing DSN, and a
+successful run finishes with a full PG-to-SQLite hash comparison:
+
+```bash
+python -m state_reverse --dsn "$HERMES_CORE_PG_DSN" \
+  --sqlite-path /safe/path/rollback-state.db [--checkpoint PATH] [--resume]
+```
+
+Recommended sequence:
+
+1. Provision an empty target and enable SQLite-primary dual-write.
+2. Run or resume the online backfill while Hermes continues serving SQLite
+   reads. If the disk guard exits 4, increase capacity or choose a reviewed
+   budget before resuming; do not simply disable the guard.
+3. Replay failures and run incremental hash checks throughout the validation
+   window. Exercise every write entrypoint or record a reviewed waiver.
+4. Quiesce writes and run a new full diff/repair/full-diff sequence. Rehearse
+   reverse backfill and verify its final hash result.
+5. Only then set `sessions.state_backend: postgres` in a separately controlled
+   cutover. Keep the SQLite authority until the rollback window closes.
+
 ## Behavioral notes
 
 **Failure is loud, not silent.** If the DSN is wrong or the server is
@@ -286,8 +366,10 @@ While any rows still need indexing, search uses the `ILIKE` fallback across all
 rows. Multi-word queries use substring matching during this period, with
 `pg_trgm` indexes providing acceleration when available.
 
-Run or repeat this backfill whenever rows have `fts_content IS NULL`. It updates
-only those rows and is safe to re-run:
+
+The resumable migration command fills this column automatically before it
+builds the deferred indexes. For a database imported by an older tool, the
+following repair remains safe to re-run:
 
 ```sql
 UPDATE messages

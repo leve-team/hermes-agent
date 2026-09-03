@@ -501,6 +501,9 @@ def test_state_reverse_backfill_resume_after_fault_finishes_with_hash_diff_zero(
             fault_inject_at="50%",
             _source_factory=source_factory,
         )
+    checkpoint_text = checkpoint.read_text(encoding="utf-8")
+    assert "test-only" not in checkpoint_text
+    assert "postgres-sha256:" in checkpoint_text
 
     summary = reverse_backfill(
         "test-only",
