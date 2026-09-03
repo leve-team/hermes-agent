@@ -86,3 +86,29 @@ without turning one incomplete row into a full-table substring search.
 Backend acceptance is measured with recall@20. SQLite top-20 message ids are
 the reference set; PostgreSQL ordering may differ, so exact rank equality is
 not a requirement.
+
+## Recall gate
+
+`scripts/fts_recall.py` opens the SQLite sample with `mode=ro`, samples at most
+5,000 messages, and deterministically derives at least ten non-empty queries for
+each contract kind (word, prefix, phrase, OR, negative). For each query it
+compares the SQLite top 20 id set with the PostgreSQL top 20 id set:
+
+```text
+recall@20 = |sqlite_top20 intersect postgres_top20| / |sqlite_top20|
+```
+
+The reported overall value is the macro mean across all queries. Exit 0 means
+it meets `--threshold` (default 0.9), exit 1 means it does not, and exit 2 means
+the sample or database connection was invalid. Supply the credential-bearing
+DSN through the existing environment variable rather than shell history:
+
+```bash
+HERMES_CORE_PG_DSN='postgresql://...' \
+  python scripts/fts_recall.py /path/to/sample-state.db
+```
+
+Without a DSN the CLI prints an explicit PostgreSQL `SKIP` marker and runs the
+same corpus SQLite-to-SQLite. That self-check must report recall@20 = 1.0; it
+validates corpus generation, ranking bounds, set overlap, reporting, and exit
+codes but is not evidence of real PostgreSQL recall.
