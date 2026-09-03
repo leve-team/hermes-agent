@@ -542,11 +542,50 @@ class SessionCompressionMixin:
         expires_at = now + max(0.1, float(ttl_seconds))
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            return _claim_lease_row(
-                conn, "session_turn_leases", "conversation_id", conversation_id, holder, now, expires_at,
-                lambda h, e: float(e) <= now or (not self._is_postgres and _compression_lock_holder_process_is_dead(h)),
-            )[0]
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
+            # levos S1: every successful acquire advances ``lease_epoch`` (fencing token). A
+            # reclaim UPDATEs the row in place (never DELETE + INSERT) so the epoch never
+            # restarts for a conversation; release leaves a tombstone for the same reason.
+            row = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,)).fetchone()
+            if row is not None:
+                current_holder = row["holder"]
+                if float(row["expires_at"]) <= now or (
+                        not self._is_postgres and _compression_lock_holder_process_is_dead(current_holder)):
+                    conn.execute(
+                        "UPDATE session_turn_leases SET holder = ?, acquired_at = ?, expires_at = ?, "
+                        "lease_epoch = lease_epoch + 1 WHERE conversation_id = ? AND holder = ?",
+                        (holder, now, expires_at, conversation_id, current_holder))
+            conn.execute(
+                "INSERT OR IGNORE INTO session_turn_leases "
+                "(conversation_id, holder, acquired_at, expires_at, lease_epoch) VALUES (?, ?, ?, ?, 1)",
+                (conversation_id, holder, now, expires_at))
+            owner = conn.execute(
+                "SELECT holder FROM session_turn_leases WHERE conversation_id = ?", (conversation_id,)).fetchone()
+            return owner is not None and owner["holder"] == holder
         return bool(self._execute_write(_do, patience_s=patience_s))
+
+    def _serialize_session_turn_lease_on_conn(self, conn, conversation_id: str) -> None:
+        """Serialize lease mutation and lease-fenced writes per conversation. SQLite needs nothing
+        (``BEGIN IMMEDIATE`` is single-writer); PostgreSQL gets a plain ``BEGIN``, so a transaction-scoped
+        advisory lock keyed on the conversation makes acquire / refresh / release and the transcript-write
+        guard mutually exclusive until commit — the epoch check becomes a commit-time fence."""
+        if self._is_postgres:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (conversation_id,))
+
+    def session_turn_lease_epoch(self, session_id: str, holder: str) -> Optional[int]:
+        """``lease_epoch`` of the lease *holder* currently owns, or None (no row, tombstone, other holder).
+        Expiry is deliberately not consulted: a starved refresher's owner can still recover its epoch and
+        let the write guard revive the row. Pass it as ``turn_lease_epoch`` to the transcript writers."""
+        if not session_id or not holder:
+            return None
+        with self._read_ctx() as conn:
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            row = conn.execute(
+                "SELECT lease_epoch FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+                (conversation_id, holder)).fetchone()
+        return None if row is None else int(row["lease_epoch"])
 
     def acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
@@ -600,28 +639,48 @@ class SessionCompressionMixin:
                 last_notice_at = now
             time.sleep(min(max(0.01, float(poll_interval_seconds)), remaining))
 
-    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0) -> bool:
-        """Extend a turn lease only while ``holder`` still owns it."""
+    def refresh_session_turn_lease(self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
+        lease_epoch: Optional[int] = None) -> bool:
+        """Extend a turn lease only while ``holder`` still owns it. Refresh never changes ``lease_epoch``;
+        when *lease_epoch* is given the extension is additionally fenced on it, so a refresher that outlived
+        a reclaim-and-reissue to the same holder string cannot keep the newer incarnation alive."""
         if not session_id or not holder:
             return False
         expires_at = time.time() + max(0.1, float(ttl_seconds))
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            return conn.execute(
-                "UPDATE session_turn_leases SET expires_at = ? "
-                "WHERE conversation_id = ? AND holder = ?", (expires_at, conversation_id, holder),
-            ).rowcount > 0
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
+            if lease_epoch is None:
+                cursor = conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ?", (expires_at, conversation_id, holder))
+            else:
+                cursor = conn.execute(
+                    "UPDATE session_turn_leases SET expires_at = ? "
+                    "WHERE conversation_id = ? AND holder = ? AND lease_epoch = ?",
+                    (expires_at, conversation_id, holder, int(lease_epoch)))
+            return cursor.rowcount > 0
         return bool(self._execute_write(_do))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
+    def release_session_turn_lease(self, session_id: str, holder: str, *,
+        lease_epoch: Optional[int] = None) -> None:
+        """Release a turn lease iff ``holder`` still owns it; idempotent. The row is not deleted: it becomes
+        a tombstone (empty holder, expired, epoch advanced) the next acquire reclaims in place — deleting
+        would restart ``lease_epoch`` at 1 and let a writer keeping an old token match a fresh lease."""
         if not session_id or not holder:
             return
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            conn.execute(
-                "DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
-                (conversation_id, holder))
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
+            if lease_epoch is None:
+                conn.execute(
+                    "UPDATE session_turn_leases SET holder = '', expires_at = 0, lease_epoch = lease_epoch + 1 "
+                    "WHERE conversation_id = ? AND holder = ?", (conversation_id, holder))
+            else:
+                conn.execute(
+                    "UPDATE session_turn_leases SET holder = '', expires_at = 0, lease_epoch = lease_epoch + 1 "
+                    "WHERE conversation_id = ? AND holder = ? AND lease_epoch = ?",
+                    (conversation_id, holder, int(lease_epoch)))
         self._execute_write(_do)
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:

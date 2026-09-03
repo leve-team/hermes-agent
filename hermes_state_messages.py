@@ -33,7 +33,7 @@ _BUMP_GENERATION_SQL = """
                 SET generation = conversation_generations.generation + 1
             """
 
-_TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?"
+_TURN_LEASE_ROW_SQL = "SELECT holder, expires_at, lease_epoch FROM session_turn_leases WHERE conversation_id = ?"
 _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?"
 _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
 _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?"
@@ -193,7 +193,7 @@ class SessionMessagesMixin:
     def _check_transcript_write_guards(self, conn, session_id: str, compression_lock_holder: Optional[str],
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
-        allow_closed_compression_parent: bool = False) -> None:
+        allow_closed_compression_parent: bool = False, turn_lease_epoch: Optional[int] = None) -> None:
         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
         NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
         commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
@@ -206,7 +206,7 @@ class SessionMessagesMixin:
         unowned turn lease in that same transaction.
         """
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+        from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError, StaleLeaseError
         # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
         # COMPRESSIONS colliding, not to fence ordinary transcript writes. Concurrent appends during a
         # compression are safe by construction: archive_and_compact() commits against a watermark captured
@@ -225,12 +225,20 @@ class SessionMessagesMixin:
                         f"Session {session_id!r} is being compressed by another writer")
         if turn_lease_holder or reject_active_turn_lease:
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            self._serialize_session_turn_lease_on_conn(conn, conversation_id)
             lease = conn.execute(_TURN_LEASE_ROW_SQL, (conversation_id,)).fetchone()
             now = time.time()
             if turn_lease_holder:
                 if lease is None or lease["holder"] != turn_lease_holder:
                     raise SessionTurnLeaseLostError(
                         f"Session turn lease lost; refusing transcript write for {session_id!r}")
+                # levos S1: ``turn_lease_epoch`` is the fencing token read after acquire. Checked inside
+                # the txn (and on PostgreSQL under the advisory lock) so no acquire can advance the epoch
+                # between this check and our commit.
+                if turn_lease_epoch is not None and int(lease["lease_epoch"]) != int(turn_lease_epoch):
+                    raise StaleLeaseError(
+                        f"Session turn lease lost; refusing transcript write for {session_id!r}: "
+                        f"lease_epoch {int(turn_lease_epoch)} is stale (current {int(lease['lease_epoch'])})")
                 if float(lease["expires_at"]) <= now:
                     # Expiry makes the row reclaimable, not taken over; BEGIN IMMEDIATE serializes this
                     # renewal with acquisition, so a still-matching owner recovers from a starved refresher.
@@ -298,7 +306,8 @@ class SessionMessagesMixin:
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
+        turn_lease_epoch: Optional[int] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates."""
@@ -311,7 +320,8 @@ class SessionMessagesMixin:
             session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=True)
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
-                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                turn_lease_epoch=turn_lease_epoch)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
@@ -354,7 +364,7 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, turn_lease_epoch: Optional[int] = None) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
         if not messages:
@@ -362,11 +372,12 @@ class SessionMessagesMixin:
         if chunk_rows is not None and len(messages) > chunk_rows:
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, turn_lease_epoch=turn_lease_epoch)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
-                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds,
+                turn_lease_epoch=turn_lease_epoch)
             from agent.transcript_repair import resolve_and_repair_transcript_batch
             inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, messages,
                 encode_content_fn=self._encode_content, decode_content_fn=self._decode_content)

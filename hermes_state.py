@@ -33,6 +33,7 @@ from hermes_state_errors import (
     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
     StateDbReplacedError, _is_no_more_rows, classify_persistence_error, is_malformed_db_error,
     is_malformed_schema_error,
+    SessionTurnLeaseLostError, StaleLeaseError,  # noqa: F401  (levos: lease_epoch fencing, re-exported)
 )
 from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,

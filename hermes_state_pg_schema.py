@@ -185,7 +185,8 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at DOUBLE PRECISION NOT NULL,
-    expires_at DOUBLE PRECISION NOT NULL
+    expires_at DOUBLE PRECISION NOT NULL,
+    lease_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
@@ -551,7 +552,13 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             # hotfix): the shared read path filters on it, so a Postgres database
             # converged before the fork carried the column would otherwise fail
             # the schema-parity guard. ADD COLUMN IF NOT EXISTS is idempotent.
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_only INTEGER DEFAULT 0"
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_only INTEGER DEFAULT 0;\n"
+            # session_turn_leases.lease_epoch (levos S1 fencing token) rides here too:
+            # the pg-only range must stay below the shared SCHEMA_VERSION, so no new
+            # entry. A database that recorded v25 before this column existed is healed
+            # on its next writable connect by reconcile_postgres_columns().
+            "ALTER TABLE session_turn_leases ADD COLUMN IF NOT EXISTS\n"
+            "    lease_epoch INTEGER NOT NULL DEFAULT 0"
         ),
     ),
     # Required state used by current conversation boundaries, liveness and

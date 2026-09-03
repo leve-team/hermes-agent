@@ -34,6 +34,16 @@ class DurableTurnLease:
         self.db = db
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
+        # levos S1 fencing token for this incarnation of the lease. Stores without the epoch API
+        # (older builds, test doubles) leave it None and the flush falls back to holder-only fencing.
+        self.lease_epoch: Optional[int] = None
+        _epoch_reader = getattr(db, "session_turn_lease_epoch", None)
+        if callable(_epoch_reader):
+            try:
+                self.lease_epoch = _epoch_reader(session_id, holder)
+            except Exception:
+                logger.debug("session turn lease epoch read failed: %s", session_id, exc_info=True)
+        agent._active_session_turn_lease_epoch = self.lease_epoch
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
         self._lock = threading.Lock()
@@ -98,12 +108,15 @@ class DurableTurnLease:
         """Release the row and drop the agent's holder attrs (only if they still name this lease)."""
         agent = self.agent
         try:
-            self.db.release_session_turn_lease(self.session_id, self.holder)
+            self.db.release_session_turn_lease(
+                self.session_id, self.holder,
+                **({"lease_epoch": self.lease_epoch} if self.lease_epoch is not None else {}))
         except Exception:
             logger.error("Failed to release session turn lease: %s", self.session_id, exc_info=True)
         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
             agent._active_session_turn_lease_holder = None
             agent._active_session_turn_lease_ttl_seconds = None
+            agent._active_session_turn_lease_epoch = None
 
     def is_turn_active(self) -> bool:
         with self._lock:
@@ -183,7 +196,8 @@ class DurableTurnLease:
             return False
         try:
             if self.db.refresh_session_turn_lease(
-                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS
+                self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
+                **({"lease_epoch": self.lease_epoch} if self.lease_epoch is not None else {}),
             ):
                 return None
             if self.stop.is_set():

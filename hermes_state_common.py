@@ -239,6 +239,10 @@ SCHEMA_VERSION = 30
 # few MB (#54189). Composes with ``min_vacuum_interval_days``.
 AUTO_VACUUM_MIN_FREELIST_RATIO = 0.25
 
+# Re-exported so backend modules can raise / catch them without importing hermes_state.
+from hermes_state_errors import SessionTurnLeaseLostError, StaleLeaseError  # noqa: E402,F401
+
+
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
 # freely on open (so future migrations always land); the FTS *layout* only
@@ -517,7 +521,8 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    lease_epoch INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (

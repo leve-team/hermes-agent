@@ -436,6 +436,58 @@ def test_a7_boolean_active_filter(pg_clean, tmp_path):
     assert pg_pair == sq_pair == (0, 1)
 
 
+def test_a7b_lease_epoch_fences_reissued_holder_on_both_backends(pg_clean, tmp_path):
+    """a7b (levos S1) - the turn-lease fencing token behaves identically:
+    acquire -> epoch 1, expiry + re-acquire by the SAME holder string -> epoch 2,
+    a write carrying epoch 1 is refused with StaleLeaseError, epoch 2 lands.
+    On PostgreSQL the guard runs under pg_advisory_xact_lock(hashtext(conv)),
+    which the strict adapter must pass through untranslated."""
+    import time
+
+    from hermes_state import StaleLeaseError
+
+    def reissue_and_fence(db):
+        db.create_session(session_id="s1", source="cli")
+        holder = "pid=7:turn=reused"
+        assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=0.05)
+        first = db.session_turn_lease_epoch("s1", holder)
+        time.sleep(0.12)
+        assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=5)
+        second = db.session_turn_lease_epoch("s1", holder)
+        try:
+            db.append_message(
+                "s1", "assistant", "stale", turn_lease_holder=holder,
+                turn_lease_epoch=first,
+            )
+            stale_refused = False
+        except StaleLeaseError:
+            stale_refused = True
+        landed = db.append_message(
+            "s1", "assistant", "live", turn_lease_holder=holder,
+            turn_lease_epoch=second,
+        )
+        assert db.refresh_session_turn_lease(
+            "s1", holder, ttl_seconds=5, lease_epoch=second
+        )
+        db.release_session_turn_lease("s1", holder, lease_epoch=second)
+        after_release = db.session_turn_lease_epoch("s1", holder)
+        contents = [m["content"] for m in db.get_messages("s1")]
+        return first, second, stale_refused, bool(landed), after_release, contents
+
+    sq = _sqlite_session_db(tmp_path)
+    sq_out = reissue_and_fence(sq)
+    sq.close()
+
+    pg, restore = _pg_session_db(pg_clean)
+    try:
+        pg_out = reissue_and_fence(pg)
+        pg.close()
+    finally:
+        restore()
+
+    assert pg_out == sq_out == (1, 2, True, True, None, ["live"])
+
+
 def test_a8_json_extract_read(pg_clean, tmp_path):
     """a8 [case-c5] - reading a session's model_config returns an equal Python
     value on both backends."""

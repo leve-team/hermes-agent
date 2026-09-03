@@ -150,6 +150,16 @@ class SessionTurnLeaseLostError(RuntimeError):
     be persisting a newer turn, and landing this one would interleave a stale reply."""
 
 
+class StaleLeaseError(SessionTurnLeaseLostError):
+    """A transcript write presented a ``lease_epoch`` the row has moved past (levos S1).
+
+    The holder string still matches but the lease was reclaimed and re-issued in between
+    (expiry, dead-PID reclaim, or an explicit release followed by a new acquire), so the
+    writer holds a token from an older incarnation of the lease. Subclasses
+    :class:`SessionTurnLeaseLostError` so every existing handler and
+    ``classify_persistence_error`` keep treating it as a lost lease."""
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened
     (out-of-band cp/mv/restore). In-place FTS repair and fail-open trigger
