@@ -934,7 +934,7 @@ class SessionMessagesMixin:
         and would break tool-call adjacency). Display-only rows (levos) are excluded by default so every
         context caller is duplication-safe without opting in; display callers opt back in. IFNULL guards
         a row written before the column existed."""
-        display_clause = "" if include_display_only else " AND IFNULL(display_only, 0) = 0"
+        display_clause = "" if include_display_only else " AND COALESCE(display_only, 0) = 0"  # COALESCE: IFNULL is SQLite-only
         return self._read_all(
             f"SELECT {'session_id, ' if with_session_id else ''}{self._CONVERSATION_ROW_COLUMNS} "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)})"

@@ -97,3 +97,28 @@ def test_strict_translation_refuses_unsupported_json_paths(monkeypatch):
     monkeypatch.setenv("HERMES_PG_ADAPTER_STRICT", "1")
     with pytest.raises(RuntimeError, match="json_extract"):
         _translate_sql("SELECT json_extract(model_config, ?) FROM sessions")
+
+
+def test_strict_mode_forbids_ifnull(monkeypatch):
+    """``IFNULL`` is SQLite-only; the portable spelling is ``COALESCE``. The levos display_only
+    guard in ``_fetch_conversation_rows`` once emitted ``IFNULL(display_only, 0) = 0``, which
+    PostgreSQL rejects at parse time; strict mode names it so a regression fails here."""
+    from hermes_state_pg_sql import _STRICT_FORBIDDEN
+    assert "ifnull(" in _STRICT_FORBIDDEN
+    monkeypatch.setenv("HERMES_PG_ADAPTER_STRICT", "1")
+    with pytest.raises(RuntimeError, match="ifnull"):
+        _translate_sql("SELECT 1 FROM messages WHERE IFNULL(display_only, 0) = 0")
+    out = _translate_sql("SELECT 1 FROM messages WHERE COALESCE(display_only, 0) = 0")
+    assert "COALESCE(display_only, 0) = 0" in out
+
+
+def test_no_ifnull_in_sql_emitting_state_modules():
+    import re
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(repo.glob("hermes_state*.py")) + [repo / "tui_gateway" / "server.py"]:
+        source = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\bIFNULL\s*\(", source, flags=re.IGNORECASE):
+            offenders.append(f"{path.name}:{source[: m.start()].count(chr(10)) + 1}")
+    assert not offenders, "SQLite-only IFNULL( in SQL-emitting code — use COALESCE(: " + ", ".join(offenders)

@@ -16,6 +16,7 @@ _SQLITE_JSON_FNS = ("json_extract", "json_type", "json_remove", "json_set", "jso
 _STRICT_FORBIDDEN = (
     *_SQLITE_JSON_FNS, "json_quote", "json_patch", "json_each", "json_array_length",
     "autoincrement", "pragma", " glob ", "strftime", "fts5", "match ", "x'", "instr(", "char(",
+    "ifnull(",   # SQLite spelling of COALESCE; slipped in via a levos hotfix once
 )
 
 # State SQL uses ordinary quoted strings/identifiers and comments, not
