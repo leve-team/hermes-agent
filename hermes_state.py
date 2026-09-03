@@ -3241,6 +3241,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         read_only: bool = False,
         *,
         postgres_dsn: Optional[str] = None,
+        dual_write: Optional[bool] = None,
     ):
         """Open the session store.
 
@@ -3346,7 +3347,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # and replays them to the dedicated PostgreSQL shadow.
         from hermes_state_dual import dual_write_enabled
 
-        self._dual_requested = dual_write_enabled()
+        self._dual_requested = (
+            dual_write_enabled() if dual_write is None else bool(dual_write)
+        )
         self._dual_mode = bool(self._dual_requested and not read_only)
         self._dual_replicator = None
         # Async token accounting (see queue_token_counts). The condition

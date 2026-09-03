@@ -158,9 +158,19 @@ class RepairWriter:
         self.dialect = dialect
         self.batch_rows = batch_rows
         self.pending = 0
+        self.deferred_session_parents: dict[Any, Any] = {}
 
     def upsert(self, spec: TableSpec, row: Any) -> None:
         values = _row_dict(spec, row)
+        # sessions.parent_session_id is a self-reference.  A missing child can
+        # sort before its missing parent, so writing the relationship during
+        # the PK-ordered repair would violate the target FK.  Load the row with
+        # a NULL parent and restore the edge after every session exists.
+        if spec.name == "sessions" and "parent_session_id" in values:
+            parent_id = values["parent_session_id"]
+            values["parent_session_id"] = None
+            if parent_id is not None:
+                self.deferred_session_parents[values["id"]] = parent_id
         columns_sql = ", ".join(quote_identifier(column) for column in spec.columns)
         placeholders = ", ".join("?" for _ in spec.columns)
         conflict_sql = ", ".join(
@@ -197,6 +207,18 @@ class RepairWriter:
             f"{quote_identifier(column)} = ?" for column in spec.primary_key
         )
         self._begin_if_needed()
+        if spec.name == "sessions":
+            # Target-only session trees are not necessarily ordered child
+            # before parent by their text primary key.  Break those local
+            # edges before deleting the authoritative-extra row.
+            self.conn.execute(
+                _pg_sql(
+                    "UPDATE sessions SET parent_session_id = NULL "
+                    "WHERE parent_session_id = ?",
+                    self.dialect,
+                ),
+                (key[0],),
+            )
         self.conn.execute(
             _pg_sql(
                 f"DELETE FROM {quote_identifier(spec.name)} WHERE {where}",
@@ -205,6 +227,19 @@ class RepairWriter:
             key,
         )
         self._after_operation()
+
+    def restore_session_parents(self) -> None:
+        for session_id, parent_id in self.deferred_session_parents.items():
+            self._begin_if_needed()
+            self.conn.execute(
+                _pg_sql(
+                    "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+                    self.dialect,
+                ),
+                (parent_id, session_id),
+            )
+            self._after_operation()
+        self.deferred_session_parents.clear()
 
     def _begin_if_needed(self) -> None:
         if self.pending == 0:
@@ -358,6 +393,8 @@ def state_diff_connections(
                     writer=repair_writer,
                     repair_extra_only=True,
                 )
+            repair_writer.flush()
+            repair_writer.restore_session_parents()
             repair_writer.flush()
     except BaseException:
         if repair_writer is not None:

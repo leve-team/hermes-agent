@@ -797,6 +797,15 @@ def init_postgres_schema(
         cur.execute("INSERT INTO schema_version (version) VALUES (?)", (schema_version,))
     conn.commit()
     if defer_indexes:
+        # COPY must still see every shared SQLite column.  The reconciler only
+        # adds columns and therefore preserves the no-secondary-index bulk-load
+        # contract, while avoiding drift failures before the first batch.
+        try:
+            from hermes_state import SCHEMA_SQL
+
+            reconcile_postgres_columns(conn, SCHEMA_SQL)
+        except Exception as exc:
+            logger.warning("pg column reconciliation skipped: %s", exc)
         return
     # Apply Postgres-only migrations (e.g. pg_trgm GIN indexes). They are
     # tracked in pg_migration_version, a ledger separate from the shared
