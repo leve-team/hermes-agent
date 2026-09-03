@@ -134,6 +134,16 @@ CREATE TABLE IF NOT EXISTS messages (
     fts_content tsvector
 );
 
+-- Derived manifest: canonical messages remain lossless while oversized search
+-- documents are indexed from a bounded UTF-8 prefix. This table is not part of
+-- SQLite authority or dual-write; it is rebuilt/maintained with fts_content.
+CREATE TABLE IF NOT EXISTS hermes_fts_truncations (
+    message_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    source_bytes BIGINT NOT NULL,
+    indexed_bytes BIGINT NOT NULL,
+    recorded_at DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS system_prompts (
     hash TEXT PRIMARY KEY,
     prompt TEXT NOT NULL

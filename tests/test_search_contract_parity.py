@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ from hermes_state_postgres import (
     _PG_ONLY_MIGRATIONS,
     _build_tsquery,
     _replace_prefix_terms,
+    _update_fts_content,
     _search_messages_fts,
+    prepare_fts_document,
     search_messages_postgres,
 )
 
@@ -218,6 +221,7 @@ def test_postgres_null_rows_are_auxiliary_not_a_global_ilike_downgrade() -> None
     assert "m.fts_content IS NOT NULL AND m.fts_content @@" in sql
     assert "m.fts_content IS NULL AND" in sql
     assert "ILIKE" in sql
+    assert "COALESCE(ts_rank(m.fts_content" in sql
     assert "s.source IN" in sql and "m.role IN" in sql
     assert params[0] == "'blue' & !'green'"
     assert "%blue%" in params and "%green%" in params
@@ -242,3 +246,98 @@ def test_postgres_cjk_uses_ilike_when_pg_trgm_is_unavailable() -> None:
     assert trigram_migrations and all(
         migration.optional for migration in trigram_migrations
     )
+
+
+def test_live_and_backfill_document_uses_all_fields_and_utf8_byte_bound() -> None:
+    text, source_bytes, indexed_bytes, truncated = prepare_fts_document(
+        "body", "deploy_probe", '{"command":"release_canary"}', max_bytes=24
+    )
+    assert text.startswith("body deploy_probe")
+    assert source_bytes > indexed_bytes
+    assert indexed_bytes <= 24
+    assert truncated is True
+
+    multibyte, _, multibyte_bytes, multibyte_truncated = prepare_fts_document(
+        "데이터베이스", None, None, max_bytes=7
+    )
+    assert multibyte.encode("utf-8").decode("utf-8") == multibyte
+    assert multibyte_bytes <= 7
+    assert multibyte_truncated is True
+
+
+def test_live_oversized_document_is_indexed_and_persistently_listed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_state_postgres
+
+    class Raw:
+        def __init__(self):
+            self.calls: list[tuple[str, tuple]] = []
+            self.transaction_events: list[str] = []
+
+        def execute(self, sql: str, params=()):
+            self.calls.append((sql, tuple(params)))
+            return _Rows()
+
+        @contextmanager
+        def transaction(self):
+            self.transaction_events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.transaction_events.append("rollback")
+                raise
+            else:
+                self.transaction_events.append("commit")
+
+    raw = Raw()
+    conn = type(
+        "Connection",
+        (),
+        {"_conn": raw, "_fts_col_available": True},
+    )()
+    monkeypatch.setattr(hermes_state_postgres, "FTS_INDEX_MAX_BYTES", 32)
+
+    _update_fts_content(conn, 41, "body", "tool", "x" * 100)
+
+    assert raw.transaction_events == ["begin", "commit"]
+    update_sql, update_params = raw.calls[0]
+    manifest_sql, manifest_params = raw.calls[1]
+    assert "SET fts_content = to_tsvector" in update_sql
+    assert len(update_params[0].encode("utf-8")) <= 32
+    assert update_params[1] == 41
+    assert "INSERT INTO hermes_fts_truncations" in manifest_sql
+    assert manifest_params[0] == 41
+    assert manifest_params[1] > manifest_params[2]
+
+
+def test_live_fts_failure_rolls_back_only_the_nested_transaction() -> None:
+    class Raw:
+        def __init__(self):
+            self.transaction_events: list[str] = []
+
+        def execute(self, sql: str, params=()):
+            del params
+            if "SET fts_content" in sql:
+                raise RuntimeError("derived index failure")
+            return _Rows()
+
+        @contextmanager
+        def transaction(self):
+            self.transaction_events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.transaction_events.append("rollback")
+                raise
+
+    raw = Raw()
+    conn = type(
+        "Connection",
+        (),
+        {"_conn": raw, "_fts_col_available": True},
+    )()
+
+    _update_fts_content(conn, 42, "body", None, None)
+
+    assert raw.transaction_events == ["begin", "rollback"]

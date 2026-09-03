@@ -204,25 +204,67 @@ def _backfill_fts(
     *,
     budget_bytes: int,
     checkpoint_path: Path,
+    checkpoint: dict[str, Any],
 ) -> int:
     if _is_sqlite_target(target):
         return 0
+    from hermes_state_postgres import _record_fts_truncation, prepare_fts_document
+
     raw = _target_raw(target)
-    updated = 0
+    state = checkpoint.setdefault(
+        "fts",
+        {"last_pk": None, "rows": 0, "truncated_rows": 0, "complete": False},
+    )
+    if state.get("complete"):
+        return int(state.get("rows", 0))
+
     while True:
-        cursor = raw.execute(
-            "WITH batch AS ("
-            " SELECT id FROM messages WHERE fts_content IS NULL ORDER BY id LIMIT %s"
-            ") UPDATE messages m SET fts_content = to_tsvector('simple', "
-            "concat_ws(' ', m.content, m.tool_name, m.tool_calls)) "
-            "FROM batch WHERE m.id = batch.id",
-            (batch_rows,),
+        last_pk = state.get("last_pk")
+        if last_pk is None:
+            where = ""
+            params: tuple[int, ...] = (batch_rows,)
+        else:
+            where = " AND id > %s"
+            params = (int(last_pk), batch_rows)
+        rows = raw.execute(
+            "SELECT id, content, tool_name, tool_calls FROM messages"
+            f" WHERE fts_content IS NULL{where} ORDER BY id LIMIT %s",
+            params,
+        ).fetchall()
+        if not rows:
+            state["complete"] = True
+            save_checkpoint(checkpoint_path, checkpoint)
+            return int(state.get("rows", 0))
+
+        truncated_rows = 0
+        raw.execute("BEGIN")
+        try:
+            for msg_id, content, tool_name, tool_calls in rows:
+                text, source_bytes, indexed_bytes, truncated = prepare_fts_document(
+                    content, tool_name, tool_calls
+                )
+                raw.execute(
+                    "UPDATE messages SET fts_content = to_tsvector('simple', %s)"
+                    " WHERE id = %s AND fts_content IS NULL",
+                    (text, msg_id),
+                )
+                if truncated:
+                    _record_fts_truncation(
+                        raw, int(msg_id), source_bytes, indexed_bytes
+                    )
+                    truncated_rows += 1
+            raw.commit()
+        except BaseException:
+            raw.rollback()
+            raise
+
+        state["last_pk"] = int(rows[-1][0])
+        state["rows"] = int(state.get("rows", 0)) + len(rows)
+        state["truncated_rows"] = (
+            int(state.get("truncated_rows", 0)) + truncated_rows
         )
-        changed = max(int(cursor.rowcount), 0)
-        updated += changed
+        save_checkpoint(checkpoint_path, checkpoint)
         _enforce_budget(target, budget_bytes, checkpoint_path)
-        if changed < batch_rows:
-            return updated
 
 
 def _reset_message_identity(target: Any) -> None:
@@ -360,6 +402,7 @@ def online_backfill(
             batch_rows,
             budget_bytes=budget_bytes,
             checkpoint_path=checkpoint_path,
+            checkpoint=checkpoint,
         )
         _reset_message_identity(target)
         if _finalize_target is None:
@@ -391,6 +434,9 @@ def online_backfill(
             "target_messages": target_messages,
             "rows_by_table": counts,
             "fts_rows": fts_rows,
+            "fts_truncated_rows": int(
+                (checkpoint.get("fts") or {}).get("truncated_rows", 0)
+            ),
             "nul_rows": 0,
             "field_check": {
                 "sessions_checked": source_sessions,

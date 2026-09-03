@@ -367,9 +367,27 @@ rows. Multi-word queries use substring matching during this period, with
 `pg_trgm` indexes providing acceleration when available.
 
 
-The resumable migration command fills this column automatically before it
-builds the deferred indexes. For a database imported by an older tool, the
-following repair remains safe to re-run:
+**Search uses native full-text indexing, with a bounded `ILIKE` auxiliary
+path.** SQLite's FTS5 index has no direct PostgreSQL equivalent, so the backend
+builds a `tsvector` column (`messages.fts_content`) with a GIN index. The indexed
+document is the same for live writes and backfill: `content`, `tool_name`, and
+`tool_calls`, separated by spaces. Queries use the `simple` dictionary
+(lowercasing, no stemming) and preserve words, `deploy*` prefixes, quoted
+phrases, `OR`, and `-term` exclusions. See `docs/search-contract.md` for the
+portable syntax and ordering contract.
+
+Rows written *before* the full-text column existed may have
+`fts_content IS NULL`. They do not force every indexed row into a full-table
+scan: indexed rows continue through `fts_content @@ tsquery`, while only NULL
+rows use a parameter-bound `ILIKE` predicate in the same query. CJK substring
+queries also use `ILIKE`, corresponding to SQLite's trigram route. The optional
+`pg_trgm` GIN indexes accelerate those predicates; without the extension the
+result contract is unchanged, but PostgreSQL may sequential-scan them.
+
+The migration command backfills NULL rows in primary-key chunks (default
+5,000), commits one chunk, and atomically records `fts.last_pk`, processed row
+count, truncation count, and completion in the same JSON checkpoint used by the
+COPY phases. Resume after interruption with the original checkpoint:
 
 ```sql
 UPDATE messages
@@ -382,6 +400,27 @@ UPDATE messages
 Search switches to the FTS path automatically once no `NULL` rows remain.
 Later content repairs can require another backfill, including on a database
 that has always used PostgreSQL.
+
+```bash
+python -m migrate_state_to_postgres \
+  --sqlite-path ~/.hermes/state.db \
+  --checkpoint /safe/path/state.pg3-backfill.json \
+  --batch-rows 5000 --resume
+```
+
+PostgreSQL limits a `tsvector` input to roughly 1 MiB. Hermes leaves the
+canonical message untouched and indexes at most 512 KiB of the derived UTF-8
+document. Truncated rows are persistently listed without storing their content:
+
+```sql
+SELECT message_id, source_bytes, indexed_bytes, recorded_at
+  FROM hermes_fts_truncations
+ ORDER BY message_id;
+```
+
+This derived manifest and `fts_content` are not dual-write authority. A fresh
+database populated only through live PostgreSQL writes normally has no NULL
+rows, but the same byte bound protects those writes as well.
 
 **Two independent schema version counters.** `SCHEMA_VERSION` in
 `hermes_state_common.py` governs the shared and SQLite schema and is recorded
