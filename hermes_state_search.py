@@ -1042,6 +1042,13 @@ class SessionSearchMixin:
         by default; compaction-archived rows ARE included; ``include_inactive`` = every row."""
         result_fields = self._search_message_fields(fields)
         if self._is_postgres:
+            # PostgreSQL has no FTS5; dispatch to the Postgres search helper,
+            # which keeps native tsvector search for indexed rows and uses an
+            # ILIKE auxiliary predicate only for rows still unindexed.
+            # Placed before every FTS gate below, which would otherwise
+            # short-circuit to [] on the PostgreSQL backend.
+            # NOTE: the PG helper predates the ``fields`` projection and always
+            # returns the complete legacy result shape.
             from hermes_state_postgres import search_messages_postgres
 
             with self._read_ctx() as conn:
