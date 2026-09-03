@@ -297,11 +297,19 @@ def _compare_table(
         spec.name, {"missing": 0, "extra": 0, "differ": 0, "matched": 0}
     )
     while left is not None or right is not None:
-        left_key = _key(spec, left) if left is not None else None
-        right_key = _key(spec, right) if right is not None else None
-        if right is None or (
-            left is not None and left_key is not None and left_key < right_key
-        ):
+        if left is None:
+            assert right is not None
+            right_key = _key(spec, right)
+            if repair_extra_only:
+                if writer is not None:
+                    writer.delete(spec, right_key)
+            else:
+                table_report["extra"] += 1
+                _append_sample(report["samples"], "extra", spec, right_key)
+            right = _next(target_rows)
+            continue
+        if right is None:
+            left_key = _key(spec, left)
             if not repair_extra_only:
                 table_report["missing"] += 1
                 _append_sample(report["samples"], "missing", spec, left_key)
@@ -309,7 +317,17 @@ def _compare_table(
                     writer.upsert(spec, left)
             left = _next(source_rows)
             continue
-        if left is None or (right_key is not None and right_key < left_key):
+        left_key = _key(spec, left)
+        right_key = _key(spec, right)
+        if left_key < right_key:
+            if not repair_extra_only:
+                table_report["missing"] += 1
+                _append_sample(report["samples"], "missing", spec, left_key)
+                if writer is not None:
+                    writer.upsert(spec, left)
+            left = _next(source_rows)
+            continue
+        if right_key < left_key:
             if repair_extra_only:
                 if writer is not None:
                     writer.delete(spec, right_key)
@@ -410,9 +428,8 @@ def state_diff_connections(
 
 def _open_postgres(dsn: str, *, read_only: bool) -> Any:
     import psycopg
-    from psycopg.rows import dict_row
 
-    conn = psycopg.connect(dsn, autocommit=read_only, row_factory=dict_row)
+    conn = psycopg.connect(dsn, autocommit=read_only)
     if read_only:
         conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
     return conn
@@ -432,15 +449,14 @@ def run_state_diff(
     writer_conn = None
     try:
         specs = sqlite_table_specs(source)
-        factory = _target_factory or _open_postgres
         if _target_factory is None:
-            target = factory(dsn, read_only=True)
+            target = _open_postgres(dsn, read_only=True)
             if repair:
-                writer_conn = factory(dsn, read_only=False)
+                writer_conn = _open_postgres(dsn, read_only=False)
         else:
-            target = factory(dsn, True)
+            target = _target_factory(dsn, True)
             if repair:
-                writer_conn = factory(dsn, False)
+                writer_conn = _target_factory(dsn, False)
         writer = (
             RepairWriter(
                 writer_conn,
