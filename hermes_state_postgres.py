@@ -186,6 +186,16 @@ CREATE TABLE IF NOT EXISTS messages (
     fts_content tsvector
 );
 
+-- Derived manifest: canonical messages remain lossless while oversized search
+-- documents are indexed from a bounded UTF-8 prefix. This table is not part of
+-- SQLite authority or dual-write; it is rebuilt/maintained with fts_content.
+CREATE TABLE IF NOT EXISTS hermes_fts_truncations (
+    message_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    source_bytes BIGINT NOT NULL,
+    indexed_bytes BIGINT NOT NULL,
+    recorded_at DOUBLE PRECISION NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS system_prompts (
     hash TEXT PRIMARY KEY,
     prompt TEXT NOT NULL
@@ -369,10 +379,8 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
     # rewrite, no ACCESS EXCLUSIVE lock beyond milliseconds. The GIN index build
     # is CONCURRENTLY (non-blocking). NEW rows are populated by the per-INSERT
     # hook (_update_fts_content); EXISTING rows stay fts_content IS NULL until
-    # the operator runs the one-time backfill UPDATE (documented in the
-    # PostgreSQL backend guide under website/docs/user-guide/features/).
-    # Until backfill completes, search stays on the ILIKE
-    # path (which covers all rows) — see _fts_backfill_complete. optional=True so
+    # the operator runs the bounded resumable backfill. During that window,
+    # indexed rows keep using tsvector and only NULL rows use ILIKE. optional=True so
     # a transient CONCURRENTLY failure retries next connect without hard-failing
     # startup. Uses 'simple' dictionary (lowercase only, no stemming) — correct
     # for a multilingual corpus with code identifiers, proper nouns, and names.
@@ -1320,6 +1328,10 @@ def _fts_column_available(conn: Any) -> bool:
 
 
 _PREFIX_TERM_RE = re.compile(r"(?<![\w*])([\w]+)\*+(?=\s|$)", re.UNICODE)
+# The tsvector value, not just its input, is capped at 1 MiB. Keep substantial
+# room for the WordEntry array, aligned lexemes, and position metadata even for
+# high-entropy text instead of treating the input-byte limit as the vector limit.
+FTS_INDEX_MAX_BYTES = 256 * 1024
 
 
 def _replace_prefix_terms(query: str) -> Tuple[str, List[Tuple[str, str]]]:
@@ -1478,6 +1490,46 @@ def _compile_ilike_query(query: str, *, prefix: str = "m") -> Tuple[str, List[st
     return " OR ".join(compiled_groups), params
 
 
+def prepare_fts_document(
+    content: Any,
+    tool_name: Any,
+    tool_calls: Any,
+    *,
+    max_bytes: Optional[int] = None,
+) -> Tuple[str, int, int, bool]:
+    """Build the live/backfill FTS document and bound it below tsvector's 1 MiB.
+
+    The canonical columns are untouched. Truncation operates on the derived
+    UTF-8 bytes and drops only an incomplete trailing code point.
+    """
+    limit = FTS_INDEX_MAX_BYTES if max_bytes is None else max_bytes
+    if limit <= 0:
+        raise ValueError("max_bytes must be greater than zero")
+    text = " ".join(str(value or "") for value in (content, tool_name, tool_calls))
+    encoded = text.encode("utf-8")
+    source_bytes = len(encoded)
+    if source_bytes <= limit:
+        return text, source_bytes, source_bytes, False
+    bounded = encoded[:limit].decode("utf-8", errors="ignore")
+    indexed_bytes = len(bounded.encode("utf-8"))
+    return bounded, source_bytes, indexed_bytes, True
+
+
+def _record_fts_truncation(
+    raw: Any, msg_id: int, source_bytes: int, indexed_bytes: int
+) -> None:
+    raw.execute(
+        "INSERT INTO hermes_fts_truncations"
+        " (message_id, source_bytes, indexed_bytes, recorded_at)"
+        " VALUES (%s, %s, %s, EXTRACT(EPOCH FROM clock_timestamp()))"
+        " ON CONFLICT (message_id) DO UPDATE SET"
+        " source_bytes = EXCLUDED.source_bytes,"
+        " indexed_bytes = EXCLUDED.indexed_bytes,"
+        " recorded_at = EXCLUDED.recorded_at",
+        (msg_id, source_bytes, indexed_bytes),
+    )
+
+
 def _update_fts_content(conn: Any, msg_id: int,
                         content: Any, tool_name: Any, tool_calls: Any) -> None:
     """Update the fts_content column for a freshly inserted message row.
@@ -1490,16 +1542,29 @@ def _update_fts_content(conn: Any, msg_id: int,
     if not _fts_column_available(conn):
         return
     try:
-        text = (
-            str(content or "") + " " +
-            str(tool_name or "") + " " +
-            str(tool_calls or "")
+        text, source_bytes, indexed_bytes, truncated = prepare_fts_document(
+            content, tool_name, tool_calls
         )
-        conn._conn.execute(
-            "UPDATE messages SET fts_content = to_tsvector('simple', %s)"
-            " WHERE id = %s",
-            (text, msg_id),
-        )
+        # psycopg transaction() becomes a savepoint when the caller already
+        # has an open write transaction. A derived-index failure therefore
+        # rolls back only this hook instead of leaving the canonical INSERT's
+        # transaction in PostgreSQL's aborted state.
+        with conn._conn.transaction():
+            conn._conn.execute(
+                "UPDATE messages SET fts_content = to_tsvector('simple', %s)"
+                " WHERE id = %s",
+                (text, msg_id),
+            )
+            if truncated:
+                _record_fts_truncation(
+                    conn._conn, msg_id, source_bytes, indexed_bytes
+                )
+                logger.warning(
+                    "truncated oversized FTS document for message %s: %s -> %s bytes",
+                    msg_id,
+                    source_bytes,
+                    indexed_bytes,
+                )
     except Exception:
         logger.debug("fts_content update failed for message %s", msg_id, exc_info=True)
 
@@ -2691,12 +2756,16 @@ def _search_messages_fts(
         source_filter, exclude_sources, role_filter, include_inactive, params
     )
 
+    # NULL auxiliary rows have no tsvector rank. PostgreSQL sorts NULL first
+    # for DESC by default, which would let an incomplete backfill displace the
+    # indexed top-K. Give those rows a zero rank; actual @@ matches are > 0.
+    rank_sql = "COALESCE(ts_rank(m.fts_content, %s::tsquery), 0)"
     if sort_norm == "oldest":
-        order_by = "ORDER BY m.timestamp ASC, ts_rank(m.fts_content, %s::tsquery) DESC"
+        order_by = f"ORDER BY m.timestamp ASC, {rank_sql} DESC"
     elif sort_norm == "newest":
-        order_by = "ORDER BY m.timestamp DESC, ts_rank(m.fts_content, %s::tsquery) DESC"
+        order_by = f"ORDER BY m.timestamp DESC, {rank_sql} DESC"
     else:
-        order_by = "ORDER BY ts_rank(m.fts_content, %s::tsquery) DESC, m.timestamp DESC"
+        order_by = f"ORDER BY {rank_sql} DESC, m.timestamp DESC"
     params.append(tsq)  # for ts_rank
     params.extend([limit, offset])
 

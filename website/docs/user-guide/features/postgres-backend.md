@@ -287,33 +287,48 @@ unreachable, opening the session store raises. Hermes does **not** quietly fall
 back to SQLite — a silent fallback would write to a different database than the
 one you configured and split your history across two stores.
 
-**Search uses native full-text indexing, with an `ILIKE` fallback.** SQLite's
-FTS5 index has no direct PostgreSQL equivalent, so the backend builds its own:
-a `tsvector` column (`messages.fts_content`) with a GIN index, populated for
-every message as it is written. Queries use `fts_content @@ tsquery` with the
-`simple` dictionary (lowercasing, no stemming — the right choice for a corpus
-mixing code identifiers, proper nouns, and multiple languages), which gives
-tokenized multi-word AND search.
+**Search uses native full-text indexing, with a bounded `ILIKE` auxiliary
+path.** SQLite's FTS5 index has no direct PostgreSQL equivalent, so the backend
+builds a `tsvector` column (`messages.fts_content`) with a GIN index. The indexed
+document is the same for live writes and backfill: `content`, `tool_name`, and
+`tool_calls`, separated by spaces. Queries use the `simple` dictionary
+(lowercasing, no stemming) and preserve words, `deploy*` prefixes, quoted
+phrases, `OR`, and `-term` exclusions. See `docs/search-contract.md` for the
+portable syntax and ordering contract.
 
-Rows written *before* the full-text column existed have `fts_content IS NULL`.
-Until every such row is backfilled, search deliberately stays on a
-trigram-indexed `ILIKE` scan, because an FTS-only query would silently miss
-every un-backfilled row — `ILIKE` covers all rows, so it is the correct choice
-during that window. The `pg_trgm` GIN indexes keep it usable.
+Rows written *before* the full-text column existed may have
+`fts_content IS NULL`. They do not force every indexed row into a full-table
+scan: indexed rows continue through `fts_content @@ tsquery`, while only NULL
+rows use a parameter-bound `ILIKE` predicate in the same query. CJK substring
+queries also use `ILIKE`, corresponding to SQLite's trigram route. The optional
+`pg_trgm` GIN indexes accelerate those predicates; without the extension the
+result contract is unchanged, but PostgreSQL may sequential-scan them.
 
-The resumable migration command fills this column automatically before it
-builds the deferred indexes. For a database imported by an older tool, the
-following repair remains safe to re-run:
+The migration command backfills NULL rows in primary-key chunks (default
+5,000), commits one chunk, and atomically records `fts.last_pk`, processed row
+count, truncation count, and completion in the same JSON checkpoint used by the
+COPY phases. Resume after interruption with the original checkpoint:
 
-```sql
-UPDATE messages
-   SET fts_content = to_tsvector(
-       'simple', concat_ws(' ', content, tool_name, tool_calls))
- WHERE fts_content IS NULL;
+```bash
+python -m migrate_state_to_postgres \
+  --sqlite-path ~/.hermes/state.db \
+  --checkpoint /safe/path/state.pg3-backfill.json \
+  --batch-rows 5000 --resume
 ```
 
-Search switches to the FTS path automatically once no `NULL` rows remain; there
-is no flag to flip. A fresh database that starts on PostgreSQL never needs this.
+PostgreSQL limits a `tsvector` input to roughly 1 MiB. Hermes leaves the
+canonical message untouched and indexes at most 512 KiB of the derived UTF-8
+document. Truncated rows are persistently listed without storing their content:
+
+```sql
+SELECT message_id, source_bytes, indexed_bytes, recorded_at
+  FROM hermes_fts_truncations
+ ORDER BY message_id;
+```
+
+This derived manifest and `fts_content` are not dual-write authority. A fresh
+database populated only through live PostgreSQL writes normally has no NULL
+rows, but the same byte bound protects those writes as well.
 
 **Two independent schema version counters.** `SCHEMA_VERSION` governs the shared
 and SQLite schema and is recorded in the `schema_version` table. The PostgreSQL

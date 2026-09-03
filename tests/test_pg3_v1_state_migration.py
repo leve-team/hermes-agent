@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from migrate_state_to_postgres import (
 )
 from state_diff import RepairWriter, canonical_row_json, state_diff_connections
 from state_reverse import InjectedReverseFault, reverse_backfill
-from state_transfer import sqlite_table_specs
+from state_transfer import checkpoint_template, sqlite_table_specs
 
 
 def _init_sqlite_replica(path: Path) -> None:
@@ -340,31 +341,78 @@ def test_backfill_resume_disk_guard_saves_checkpoint_and_uses_rc4_error(
 
 
 def test_backfill_resume_fts_phase_keeps_disk_guard_active(tmp_path: Path) -> None:
-    class Cursor:
-        rowcount = 1
-
     class Target:
-        raw = None
-
         def __init__(self):
             self.raw = self
+            self.rows = {
+                1: (1, "body one", "tool-one", "calls-one"),
+                2: (2, "body two", "tool-two", "calls-two"),
+            }
+            self.indexed: set[int] = set()
+            self.database_size = 2
+            self.select_params: list[tuple] = []
 
-        def execute(self, sql, _params=()):
-            if sql.startswith("WITH batch"):
-                return Cursor()
+        def execute(self, sql, params=()):
+            if sql.startswith("SELECT id, content"):
+                self.select_params.append(tuple(params))
+                last_pk = int(params[0]) if len(params) == 2 else 0
+                limit = int(params[-1])
+                rows = [
+                    row
+                    for message_id, row in sorted(self.rows.items())
+                    if message_id > last_pk and message_id not in self.indexed
+                ][:limit]
+                return type("BatchCursor", (), {"fetchall": lambda _self: rows})()
+            if sql.startswith("UPDATE messages SET fts_content"):
+                self.indexed.add(int(params[1]))
+                return type("Cursor", (), {"rowcount": 1})()
+            if sql == "BEGIN" or sql.startswith(
+                "INSERT INTO hermes_fts_truncations"
+            ):
+                return type("Cursor", (), {"rowcount": 1})()
             if sql.startswith("SELECT pg_database_size"):
-                return type("SizeCursor", (), {"fetchone": lambda _self: (2,)})()
+                size = self.database_size
+                return type("SizeCursor", (), {"fetchone": lambda _self: (size,)})()
             raise AssertionError(sql)
 
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
     checkpoint = tmp_path / "backfill.json"
+    payload = checkpoint_template("test-source", "sqlite-to-postgres")
+    target = Target()
     with pytest.raises(BackfillBudgetExceeded) as raised:
         _backfill_fts(
-            Target(),
-            2,
+            target,
+            1,
             budget_bytes=1,
             checkpoint_path=checkpoint,
+            checkpoint=payload,
         )
     assert raised.value.checkpoint_path == checkpoint
+    assert checkpoint.is_file()
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert saved["fts"] == {
+        "last_pk": 1,
+        "rows": 1,
+        "truncated_rows": 0,
+        "complete": False,
+    }
+
+    target.database_size = 0
+    assert _backfill_fts(
+        target,
+        1,
+        budget_bytes=10,
+        checkpoint_path=checkpoint,
+        checkpoint=saved,
+    ) == 2
+    assert target.indexed == {1, 2}
+    assert (1, 1) in target.select_params
+    assert saved["fts"]["complete"] is True
 
 
 def test_state_diff_hash_detects_missing_extra_and_equal_count_difference(
