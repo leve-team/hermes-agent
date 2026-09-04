@@ -3,7 +3,8 @@
 This module owns PostgreSQL connections and backend dispatch. Schema, SQL
 translation, and migration helpers live in neighboring ``hermes_state_pg_*``
 modules. SQLite remains the default backend; the driver is loaded only when
-the operator selects ``sessions.state_backend = "postgres"``.
+the operator selects the ``probe`` or ``authority`` mode
+(``postgres`` remains an authority alias).
 
 Design contract (kept deliberately narrow):
 
@@ -756,19 +757,89 @@ _ENV_DSN_KEYS = ("HERMES_STATE_DATABASE_URL", "HERMES_STATE_POSTGRES_DSN")
 _ENV_BACKEND_KEYS = ("HERMES_STATE_BACKEND",)
 
 
+def _backend_config(
+    config: Optional[Dict[str, Any]], *, allow_load_failure: bool = False
+) -> Dict[str, Any]:
+    if config is not None:
+        return config
+    # The backend selector is load-bearing: if this file is the only place
+    # Postgres is selected, silently reading defaults out of a malformed file
+    # routes the process to SQLite and splits history.
+    _assert_active_config_parseable()
+    from hermes_cli.config import load_config
+
+    try:
+        return load_config()
+    except Exception:
+        if allow_load_failure:
+            return {}
+        raise
+
+
+def resolve_state_backend(config: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve ``sqlite`` / ``probe`` / ``authority`` with env precedence.
+
+    ``postgres``, ``postgresql`` and ``pg`` remain compatibility spellings for
+    ``authority``.  Unknown values fail at this boundary instead of quietly
+    selecting SQLite.
+    """
+
+    from hermes_state_read import normalize_read_mode
+
+    for key in _ENV_BACKEND_KEYS:
+        env_val = (os.environ.get(key) or "").strip()
+        if env_val:
+            return normalize_read_mode(env_val)
+    loaded = _backend_config(config, allow_load_failure=True)
+    sessions_cfg = (loaded or {}).get("sessions") or {}
+    return normalize_read_mode(sessions_cfg.get("state_backend") or "sqlite")
+
+
+def _dsn_for_mode(config: Optional[Dict[str, Any]], *, mode: str) -> str:
+    loaded = _backend_config(config)
+    sessions_cfg = (loaded or {}).get("sessions") or {}
+
+    # Probe targets the V1 dual-write shadow, whose existing secret contract is
+    # HERMES_CORE_PG_DSN. Authority keeps the established HERMES_STATE_* DSN
+    # precedence. No new environment control is introduced for Y3.
+    keys = (
+        ("HERMES_CORE_PG_DSN",) + _ENV_DSN_KEYS
+        if mode == "probe"
+        else _ENV_DSN_KEYS
+    )
+    for key in keys:
+        env_val = (os.environ.get(key) or "").strip()
+        if env_val:
+            return env_val
+    dsn = str(sessions_cfg.get("postgres_dsn") or "").strip()
+    if not dsn:
+        env_hint = (
+            "HERMES_CORE_PG_DSN, HERMES_STATE_DATABASE_URL, or "
+            "HERMES_STATE_POSTGRES_DSN"
+            if mode == "probe"
+            else "HERMES_STATE_DATABASE_URL or HERMES_STATE_POSTGRES_DSN"
+        )
+        raise RuntimeError(
+            f"sessions.state_backend is {mode!r} but no DSN was provided; set "
+            f"sessions.postgres_dsn, {env_hint}"
+        )
+    return dsn
+
+
 def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Return the configured PostgreSQL DSN, or None when not selected.
+    """Return the authority PostgreSQL DSN, or None for sqlite/probe.
 
     Resolution order, first non-empty wins:
       1. ``HERMES_STATE_DATABASE_URL`` / ``HERMES_STATE_POSTGRES_DSN`` env vars
       2. ``sessions.postgres_dsn`` in config.yaml
 
-    Backend selection (must equal "postgres" to engage this module):
+    Backend selection (must resolve to ``authority`` to engage this module):
       1. ``HERMES_STATE_BACKEND`` env var
       2. ``sessions.state_backend`` in config.yaml
 
-    Returns None when ``sessions.state_backend`` is not "postgres" (the default
-    "sqlite" path), so callers can cheaply decide whether to engage this module.
+    ``postgres`` remains an alias for ``authority``. ``probe`` is intentionally
+    excluded here because its response authority remains SQLite; use
+    :func:`resolve_probe_postgres_dsn` for its comparison target.
 
     Fail-loud invariant: ``None`` means "Postgres was NOT selected."  It never
     means "selection could not be evaluated."  Once the operator has expressed an
@@ -776,78 +847,22 @@ def resolve_postgres_dsn(config: Optional[Dict[str, Any]] = None) -> Optional[st
     MUST propagate as a targeted error rather than silently returning None (which
     the caller interprets as "use SQLite instead").
     """
-    # Read the env backend selector FIRST — before any config I/O.  A config
-    # load failure must not mask an explicit env-var selection.
-    env_backend = ""
-    for key in _ENV_BACKEND_KEYS:
-        env_val = (os.environ.get(key) or "").strip().lower()
-        if env_val:
-            env_backend = env_val
-            break
-    if env_backend in ("postgresql", "pg"):
-        env_backend = "postgres"
-
-    if config is None:
-        # The backend selector is load-bearing: if this file is the only place
-        # Postgres is selected, silently reading defaults out of a malformed
-        # file routes the process to SQLite and splits history.
-        #
-        # ``load_config()`` deliberately degrades a broken config.yaml to
-        # DEFAULT_CONFIG (or last-known-good) rather than raising — correct for
-        # its own callers, wrong here, because the degraded value is
-        # indistinguishable from a genuine "sqlite" selection. So validate the
-        # file with a strict raw parse FIRST, then use the normal loader for
-        # the merged values.
-        authority = _assert_active_config_parseable()
-        try:
-            from hermes_cli.config import load_config
-
-            config = load_config()
-        except Exception as _cfg_exc:
-            selected = str((authority.get("sessions") or {}).get("state_backend") or "").strip().lower()
-            if env_backend == "postgres" or (not env_backend and selected in {"postgres", "postgresql", "pg"}):
-                # The operator explicitly selected Postgres via env var.
-                # A config-loading failure must NOT silently degrade to SQLite.
-                raise RuntimeError(
-                    f"PostgreSQL state is selected but config loading "
-                    f"failed; cannot evaluate backend selection: {_cfg_exc}"
-                ) from _cfg_exc
-            # No explicit env selection — genuinely not configured for Postgres.
-            return None
-
-    if not isinstance(config, dict):
-        raise RuntimeError("State backend configuration must be a mapping")
-    sessions_cfg = config.get("sessions") or {}
-    if not isinstance(sessions_cfg, dict):
-        raise RuntimeError("sessions must be a mapping for backend selection")
-
-    # Resolve backend: env var (already read) takes precedence over config.yaml.
-    backend = env_backend
-    if not backend:
-        backend = str(sessions_cfg.get("state_backend") or "sqlite").strip().lower()
-        if backend in ("postgresql", "pg"):
-            backend = "postgres"
-
-    if backend not in {"sqlite", "postgres"}:
-        raise RuntimeError(f"Unknown sessions.state_backend: {backend!r}")
-    if backend == "sqlite":
+    if resolve_state_backend(config) != "authority":
         return None
-
-    for key in _ENV_DSN_KEYS:
-        env_val = (os.environ.get(key) or "").strip()
-        if env_val:
-            return env_val
-    dsn = (sessions_cfg.get("postgres_dsn") or "").strip()
-    if not dsn:
-        raise RuntimeError(
-            "sessions.state_backend is 'postgres' but no DSN was provided; set "
-            "sessions.postgres_dsn, HERMES_STATE_DATABASE_URL, or "
-            "HERMES_STATE_POSTGRES_DSN"
-        )
-    return dsn
+    return _dsn_for_mode(config, mode="authority")
 
 
-def _dsn_from_profile_env(profile_dir: Any) -> str:
+def resolve_probe_postgres_dsn(
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return the comparison DSN only while SQLite-authority probe is on."""
+
+    if resolve_state_backend(config) != "probe":
+        return None
+    return _dsn_for_mode(config, mode="probe")
+
+
+def _dsn_from_profile_env(profile_dir: Any, *, include_core: bool = False) -> str:
     """Read a Postgres DSN out of a specific profile's own ``.env`` file.
 
     Parses the file directly rather than loading it into ``os.environ``: the
@@ -855,11 +870,12 @@ def _dsn_from_profile_env(profile_dir: Any) -> str:
     state would let a concurrent ``SessionDB()`` on another thread observe it
     and open the wrong physical store.
 
-    Only the two documented DSN keys are read, in the same precedence
-    ``resolve_postgres_dsn`` uses. Returns "" when the file is absent or holds
-    neither key. A malformed line is skipped rather than raising: unlike the
-    backend *selector*, an unparseable line here cannot silently redirect the
-    store — a missing DSN raises at the call site.
+    The authority keys use the same precedence as ``resolve_postgres_dsn``.
+    When ``include_core`` is true, the V1 ``HERMES_CORE_PG_DSN`` shadow target
+    precedes them for probe mode. Returns "" when the file is absent or holds
+    no applicable key. A malformed line is skipped rather than raising: unlike
+    the backend *selector*, an unparseable line here cannot silently redirect
+    the store — a missing DSN raises at the call site.
     """
     from pathlib import Path
 
@@ -867,6 +883,7 @@ def _dsn_from_profile_env(profile_dir: Any) -> str:
     if not env_path.is_file():
         return ""
 
+    keys = (("HERMES_CORE_PG_DSN",) + _ENV_DSN_KEYS) if include_core else _ENV_DSN_KEYS
     from dotenv import dotenv_values
 
     try:
@@ -876,7 +893,7 @@ def _dsn_from_profile_env(profile_dir: Any) -> str:
     except OSError:
         return ""
 
-    for key in _ENV_DSN_KEYS:
+    for key in keys:
         if found.get(key):
             return found[key]
     return ""
@@ -1120,11 +1137,15 @@ def _home_sessions_config(profile_home: Any) -> Dict[str, Any]:
 
 def home_selects_postgres(profile_home: Any) -> bool:
     """Resolve the backend of an explicit home, independent of process profile context."""
+    from hermes_state_read import normalize_read_mode
+
     sessions = _home_sessions_config(profile_home)
-    backend = str(sessions.get("state_backend") or "sqlite").strip().lower()
-    if backend not in {"sqlite", "postgres", "postgresql", "pg"}:
-        raise RuntimeError(f"Unknown sessions.state_backend: {backend!r}")
-    return backend in {"postgres", "postgresql", "pg"}
+    backend = normalize_read_mode(sessions.get("state_backend") or "sqlite")
+    # Probe still returns SQLite data, but it needs open_store_for_home() to
+    # attach the target profile's own PG comparison DSN. Returning False here
+    # would send cross-profile readers down their legacy explicit-SQLite path
+    # and silently bypass every probe.
+    return backend in {"authority", "probe"}
 
 
 def open_store_for_home(profile_home: Any, read_only: bool = False) -> Any:
@@ -1133,19 +1154,26 @@ def open_store_for_home(profile_home: Any, read_only: bool = False) -> Any:
     from hermes_state import SessionDB
 
     home = Path(profile_home)
+    from hermes_state_read import normalize_read_mode
+
     sessions = _home_sessions_config(home)
-    backend = str(sessions.get("state_backend") or "sqlite").strip().lower()
+    backend = normalize_read_mode(sessions.get("state_backend") or "sqlite")
     if backend == "sqlite":
         return SessionDB(db_path=home / "state.db", read_only=read_only)
-    if backend not in {"postgres", "postgresql", "pg"}:
-        raise RuntimeError(f"Unknown sessions.state_backend: {backend!r}")
-    dsn = _dsn_from_profile_env(home) or (sessions.get("postgres_dsn") or "").strip()
+    # Probe first checks the V1 shadow DSN (HERMES_CORE_PG_DSN) of the TARGET home.
+    dsn = _dsn_from_profile_env(home, include_core=backend == "probe") or (
+        sessions.get("postgres_dsn") or ""
+    ).strip()
     if not dsn:
         raise RuntimeError(
-            f"profile at {home} has sessions.state_backend = 'postgres' but no DSN was found "
+            f"profile at {home} has sessions.state_backend = {backend!r} but no DSN was found "
             "in its .env (HERMES_STATE_DATABASE_URL / HERMES_STATE_POSTGRES_DSN) "
             "or sessions.postgres_dsn; cannot open the store for that profile"
         )
+    if backend == "probe":
+        # The target home's SQLite remains authoritative; pin its PG comparison
+        # DSN on this instance without mutating process-global env.
+        return SessionDB(db_path=home / "state.db", read_only=read_only, read_probe_dsn=dsn)
     db = SessionDB(db_path=home / "state.db", read_only=read_only, postgres_dsn=dsn)
     if not db._is_postgres:
         db.close()

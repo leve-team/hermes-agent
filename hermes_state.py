@@ -429,12 +429,80 @@ class SessionDB(
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
     def __init__(
-        self, db_path: Path = None, read_only: bool = False, *, postgres_dsn: Optional[str] = None,
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        postgres_dsn: Optional[str] = None,
+        read_probe_dsn: Optional[str] = None,
         dual_write: Optional[bool] = None,
     ):
+        """Open the session store.
+
+        ``postgres_dsn`` pins the physical store explicitly for this instance.
+        Callers that must open a *specific* profile's store (the backend-aware
+        seam) pass it here instead of mutating process-global
+        ``HERMES_STATE_*`` env vars: env mutation is visible to every other
+        thread constructing a ``SessionDB`` concurrently, so a caller could
+        observe another profile's pinned DSN and open the wrong physical store.
+        When None, the backend is resolved normally from env vars + config.
+
+        ``read_probe_dsn`` pins only the PostgreSQL comparison target. SQLite
+        remains the response and write authority; PostgreSQL failures and
+        mismatches are diagnostic markers, never fallback data.
+        """
+        implicit_db_path = db_path is None
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
+        self._read_probe = None
+        self._read_probe_dsn = read_probe_dsn
+        if postgres_dsn:
+            self._state_backend_mode = "authority"
+        elif read_probe_dsn:
+            self._state_backend_mode = "probe"
+        elif implicit_db_path:
+            try:
+                from hermes_state_postgres import resolve_state_backend
+
+                self._state_backend_mode = resolve_state_backend()
+            except ImportError as exc:
+                # Base installs are allowed to omit the optional PostgreSQL
+                # module only while no PostgreSQL mode was selected. Preserve
+                # the pre-Y3 fail-loud contract for either selector aliases or
+                # the established authority DSN env vars.
+                from hermes_state_read import normalize_read_mode
+
+                raw_backend = (os.environ.get("HERMES_STATE_BACKEND") or "").strip()
+                selected = (
+                    normalize_read_mode(raw_backend) if raw_backend else "sqlite"
+                )
+                explicit_dsn = bool(
+                    (os.environ.get("HERMES_STATE_DATABASE_URL") or "").strip()
+                    or (os.environ.get("HERMES_STATE_POSTGRES_DSN") or "").strip()
+                )
+                if selected == "sqlite" and not raw_backend:
+                    try:
+                        from hermes_cli.config import load_config
+
+                        selected = normalize_read_mode(
+                            (load_config().get("sessions") or {}).get(
+                                "state_backend", "sqlite"
+                            )
+                        )
+                    except Exception:
+                        # No usable config and no explicit env selection is the
+                        # ordinary SQLite-only base-install path.
+                        selected = "sqlite"
+                if selected != "sqlite" or explicit_dsn:
+                    raise RuntimeError(
+                        "PostgreSQL state mode is explicitly configured but "
+                        f"hermes_state_postgres could not be imported: {exc}"
+                    ) from exc
+                self._state_backend_mode = "sqlite"
+        else:
+            self._state_backend_mode = "sqlite"
+
         self._lock = threading.Lock()
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
@@ -502,11 +570,18 @@ class SessionDB(
         initialization_complete = False
         try:
             # levos dual-write keeps SQLite as the authority; never open Postgres as primary then.
-            if (db_path is None or postgres_dsn is not None) and not self._dual_requested:
+            # Optional PostgreSQL authority. The selector is resolved before
+            # any store opens; ``authority`` never falls back to SQLite.
+            if self._state_backend_mode == "authority" and not self._dual_requested:
                 from hermes_state_postgres import maybe_open_postgres
 
                 self._conn = maybe_open_postgres(read_only, _SCHEMA_VERSION, dsn_override=postgres_dsn)
-                self._is_postgres = self._conn is not None
+                if self._conn is None:
+                    raise RuntimeError(
+                        "PostgreSQL authority was selected but no PostgreSQL "
+                        "connection was opened; refusing a SQLite fallback"
+                    )
+                self._is_postgres = True
                 if self._is_postgres:
                     self._postgres_dsn = postgres_dsn or self._conn._dsn
                     initialization_complete = True
@@ -528,6 +603,7 @@ class SessionDB(
                     # authority; their tiny DDL completes before the first write is accepted.
                     self._dual_replicator.initialize_source()
             self._record_db_file_identity()
+            self._enable_read_probe()
             initialization_complete = True
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path.
@@ -537,6 +613,40 @@ class SessionDB(
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+
+    # ── Read-path split ──
+
+    def _enable_read_probe(self) -> None:
+        """Wrap the SQLite connection with a lazy PostgreSQL comparator."""
+
+        if self._state_backend_mode != "probe" or self._conn is None:
+            return
+        from hermes_state_postgres import (
+            maybe_open_postgres,
+            resolve_probe_postgres_dsn,
+        )
+        from hermes_state_read import PostgresReadProbe
+
+        def _connect_probe():
+            dsn = self._read_probe_dsn or resolve_probe_postgres_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "probe mode selected but no PostgreSQL comparison DSN resolved"
+                )
+            conn = maybe_open_postgres(
+                True,
+                _SCHEMA_VERSION,
+                dsn_override=dsn,
+            )
+            if conn is None:
+                raise RuntimeError(
+                    "probe mode selected but the PostgreSQL comparison store "
+                    "did not open"
+                )
+            return conn
+
+        self._read_probe = PostgresReadProbe(_connect_probe, logger=logger)
+        self._conn = self._read_probe.wrap(self._conn)
 
     def _open_writer(self) -> None:
         """Writable open: preflight, zero-byte quarantine, connect + schema (one in-place repair of a
@@ -778,9 +888,12 @@ class SessionDB(
         degradation: slower beats EMFILE, which the supervisor cannot see."""
         conn = self._checkout_read_conn()
         if conn is not None:
+            probe_conn = self._read_probe.wrap(conn) if self._read_probe else conn
             try:
-                yield conn
+                yield probe_conn
             finally:
+                if self._read_probe:
+                    probe_conn.close_probe_cursors()
                 returned = False
                 with self._read_conns_lock:
                     if not self._read_conns_closed:
@@ -797,7 +910,11 @@ class SessionDB(
         with self._lock:
             if self._conn is None:  # close() raced a still-unwinding reader
                 self._reopen_after_close_locked(context="read")
-            yield cast(sqlite3.Connection, self._conn)
+            try:
+                yield cast(sqlite3.Connection, self._conn)
+            finally:
+                if self._read_probe and self._conn is not None:
+                    self._conn.close_probe_cursors()
 
     def _reopen_after_close_locked(self, context: str = "write") -> None:
         """Reopen the writer after ``close()`` raced a live caller (a teardown owner
@@ -1444,6 +1561,9 @@ class SessionDB(
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
+        if self._read_probe is not None:
+            probe, self._read_probe = self._read_probe, None
+            probe.close()
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays

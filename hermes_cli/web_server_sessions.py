@@ -197,16 +197,28 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     SQLite retains its bootstrap/schema-heal path. PostgreSQL readers must reach
     the configured store even when no local ``state.db`` exists.
     """
-    from hermes_state_postgres import home_selects_postgres, open_store_for_home, resolve_postgres_dsn
+    from hermes_state_postgres import (
+        home_selects_postgres,
+        open_store_for_home,
+        resolve_postgres_dsn,
+        resolve_probe_postgres_dsn,
+        resolve_state_backend,
+    )
 
     db_path = _session_db_path_for_profile(profile)
     if profile:
         if home_selects_postgres(db_path.parent):
             return open_store_for_home(db_path.parent, read_only=read_only)
-    elif dsn := resolve_postgres_dsn():
+    elif (mode := resolve_state_backend()) == "authority":
         from hermes_state import SessionDB
 
-        return SessionDB(db_path=db_path, read_only=read_only, postgres_dsn=dsn)
+        return SessionDB(db_path=db_path, read_only=read_only, postgres_dsn=resolve_postgres_dsn())
+    elif mode == "probe":
+        from hermes_state import SessionDB
+
+        return SessionDB(
+            db_path=db_path, read_only=read_only, read_probe_dsn=resolve_probe_postgres_dsn()
+        )
     return _open_session_db_at_path(db_path, read_only=read_only)
 
 
