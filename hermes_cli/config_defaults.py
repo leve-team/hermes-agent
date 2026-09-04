@@ -3101,16 +3101,16 @@ DEFAULT_CONFIG = {
     # inserts, /resume listing, and insights queries.
     "sessions": {
         # Durable session/state backend selector. "sqlite" (default) keeps the
-        # single-file state.db. "postgres" routes session/state storage to an
-        # external PostgreSQL database, opt-in for installs where the
-        # single-file backend is unsuitable (multi-host deployments, shared
-        # state). The connection string is supplied via postgres_dsn (or an
-        # env override) and carries its own TLS/credential settings.
+        # single-file state.db. "probe" returns SQLite reads while comparing
+        # them with PostgreSQL. "authority" routes reads and writes only to
+        # PostgreSQL; "postgres" remains an authority alias. The connection
+        # string is supplied via postgres_dsn (or an env override) and carries
+        # its own TLS/credential settings.
         "state_backend": "sqlite",
-        # PostgreSQL connection string (DSN), consulted only when
-        # state_backend is "postgres". Empty by default. The DSN is passed
-        # through unchanged to the driver, so sslmode, host, port, and
-        # credentials all come from this value.
+        # PostgreSQL connection string (DSN), consulted in probe/authority
+        # modes. Empty by default. The DSN is passed through unchanged to the
+        # driver, so sslmode, host, port, and credentials all come from this
+        # value. Probe mode first checks the existing HERMES_CORE_PG_DSN.
         #
         # A DSN normally carries a password, and secrets belong in .env rather
         # than here. Prefer the HERMES_STATE_DATABASE_URL or
@@ -4475,8 +4475,8 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "HERMES_STATE_BACKEND": {
-        "description": "Session/state backend override: 'sqlite' (default) or 'postgres'; takes precedence over sessions.state_backend",
-        "prompt": "State backend (sqlite | postgres)",
+        "description": "Session/state backend override: 'sqlite' (default), 'probe', or 'authority' ('postgres' alias); takes precedence over sessions.state_backend",
+        "prompt": "State backend (sqlite | probe | authority)",
         "password": False,
         "category": "tool",
         "advanced": True,

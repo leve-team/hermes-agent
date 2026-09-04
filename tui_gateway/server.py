@@ -1561,9 +1561,9 @@ def _open_profile_store(profile: str | None, profile_home: Path | str):
         # live write path runs on Postgres, splitting the default profile's
         # history across two physical stores.
         try:
-            from hermes_state_postgres import resolve_postgres_dsn
+            from hermes_state_postgres import resolve_state_backend
 
-            if resolve_postgres_dsn():
+            if resolve_state_backend() in {"probe", "authority"}:
                 return SessionDB()
         except ImportError:
             pass  # Postgres backend not installed — SQLite is correct.

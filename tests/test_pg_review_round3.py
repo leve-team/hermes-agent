@@ -154,8 +154,8 @@ class TestReadOnlyDoesNotBypassPostgres:
 
         sentinel = object()
         monkeypatch.setattr(
-            "hermes_state_postgres.resolve_postgres_dsn",
-            lambda *a, **k: "postgresql://example/db",
+            "hermes_state_postgres.resolve_state_backend",
+            lambda *a, **k: "authority",
         )
 
         captured: dict = {}

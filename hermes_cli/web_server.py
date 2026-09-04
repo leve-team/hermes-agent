@@ -12199,9 +12199,9 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
         # explicit db_path here would pin SQLite and split the dashboard's
         # reads away from a Postgres-backed live write path.
         try:
-            from hermes_state_postgres import resolve_postgres_dsn
+            from hermes_state_postgres import resolve_state_backend
 
-            if resolve_postgres_dsn():
+            if resolve_state_backend() in {"probe", "authority"}:
                 from hermes_state import SessionDB
 
                 return SessionDB(read_only=read_only)

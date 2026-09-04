@@ -3241,6 +3241,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         read_only: bool = False,
         *,
         postgres_dsn: Optional[str] = None,
+        read_probe_dsn: Optional[str] = None,
         dual_write: Optional[bool] = None,
     ):
         """Open the session store.
@@ -3252,13 +3253,65 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         thread constructing a ``SessionDB`` concurrently, so a caller could
         observe another profile's pinned DSN and open the wrong physical store.
         When None, the backend is resolved normally from env vars + config.
+
+        ``read_probe_dsn`` pins only the PostgreSQL comparison target. SQLite
+        remains the response and write authority; PostgreSQL failures and
+        mismatches are diagnostic markers, never fallback data.
         """
+        implicit_db_path = db_path is None
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
+        self._read_probe = None
+        self._read_probe_dsn = read_probe_dsn
+        if postgres_dsn:
+            self._state_backend_mode = "authority"
+        elif read_probe_dsn:
+            self._state_backend_mode = "probe"
+        elif implicit_db_path:
+            try:
+                from hermes_state_postgres import resolve_state_backend
+
+                self._state_backend_mode = resolve_state_backend()
+            except ImportError as exc:
+                # Base installs are allowed to omit the optional PostgreSQL
+                # module only while no PostgreSQL mode was selected. Preserve
+                # the pre-Y3 fail-loud contract for either selector aliases or
+                # the established authority DSN env vars.
+                from hermes_state_read import normalize_read_mode
+
+                raw_backend = (os.environ.get("HERMES_STATE_BACKEND") or "").strip()
+                selected = (
+                    normalize_read_mode(raw_backend) if raw_backend else "sqlite"
+                )
+                explicit_dsn = bool(
+                    (os.environ.get("HERMES_STATE_DATABASE_URL") or "").strip()
+                    or (os.environ.get("HERMES_STATE_POSTGRES_DSN") or "").strip()
+                )
+                if selected == "sqlite" and not raw_backend:
+                    try:
+                        from hermes_cli.config import load_config
+
+                        selected = normalize_read_mode(
+                            (load_config().get("sessions") or {}).get(
+                                "state_backend", "sqlite"
+                            )
+                        )
+                    except Exception:
+                        # No usable config and no explicit env selection is the
+                        # ordinary SQLite-only base-install path.
+                        selected = "sqlite"
+                if selected != "sqlite" or explicit_dsn:
+                    raise RuntimeError(
+                        "PostgreSQL state mode is explicitly configured but "
+                        f"hermes_state_postgres could not be imported: {exc}"
+                    ) from exc
+                self._state_backend_mode = "sqlite"
+        else:
+            self._state_backend_mode = "sqlite"
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
@@ -3363,9 +3416,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_atexit_hook: Optional[Callable[[], None]] = None
         initialization_complete = False
         try:
-            # Optional PostgreSQL state backend. Engaged only when configured
-            # (sessions.state_backend = "postgres"); the import is lazy so a
-            # default install without the 'postgres' extra never loads it.
+            # Optional PostgreSQL authority. The selector is resolved before
+            # any store opens; ``authority`` never falls back to SQLite.
             #
             # ``read_only`` is deliberately NOT a gate here. It is a SQLite
             # *attach mode* (a URI open that takes no write lock), not a
@@ -3379,89 +3431,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             #
             # An explicit ``db_path`` still stays on SQLite: that names a
             # specific file, so honouring it is the caller's whole intent.
-            if db_path is None and not self._dual_requested:
-                # Detect whether the operator has explicitly selected the
-                # Postgres backend via an env var BEFORE attempting the import.
-                # An import-time failure (bad psycopg install, ABI mismatch,
-                # missing dep) must NOT silently degrade to SQLite when Postgres
-                # was explicitly configured — that would split history across
-                # two stores with no warning to the operator.
-                _pg_env_backend = (
-                    os.environ.get("HERMES_STATE_BACKEND") or ""
-                ).strip().lower()
-                if _pg_env_backend in ("postgresql", "pg"):
-                    _pg_env_backend = "postgres"
-                _pg_env_dsn = (
-                    os.environ.get("HERMES_STATE_DATABASE_URL")
-                    or os.environ.get("HERMES_STATE_POSTGRES_DSN")
-                    or ""
-                ).strip()
-                _pg_explicitly_selected = _pg_env_backend == "postgres" or bool(_pg_env_dsn)
-                # An explicit DSN passed to the constructor pins the physical
-                # store for THIS instance only — no process-global env
-                # mutation, so a concurrent SessionDB() on another thread can
-                # never observe it and open the wrong store.
-                if postgres_dsn:
-                    _pg_explicitly_selected = True
-                try:
-                    from hermes_state_postgres import maybe_open_postgres
+            if self._state_backend_mode == "authority":
+                from hermes_state_postgres import maybe_open_postgres
 
-                    # Also check config.yaml so the fallback is never silent
-                    # regardless of which configuration path the user took.
-                    if not _pg_explicitly_selected:
-                        try:
-                            from hermes_cli.config import load_config as _lc
-
-                            _c = _lc()
-                            if (
-                                str(
-                                    (_c.get("sessions") or {}).get(
-                                        "state_backend", ""
-                                    )
-                                ).strip().lower() == "postgres"
-                            ):
-                                _pg_explicitly_selected = True
-                        except Exception:
-                            pass
-                except Exception as _pg_import_exc:
-                    if _pg_explicitly_selected:
-                        raise RuntimeError(
-                            "Postgres backend is explicitly configured "
-                            "(HERMES_STATE_BACKEND/HERMES_STATE_DATABASE_URL "
-                            "or sessions.state_backend in config.yaml) "
-                            "but the hermes_state_postgres module could not be "
-                            f"imported: {_pg_import_exc}"
-                        ) from _pg_import_exc
-                    logger.warning(
-                        "hermes_state_postgres could not be imported; "
-                        "falling back to SQLite backend: %s",
-                        _pg_import_exc,
+                pg_conn = maybe_open_postgres(
+                    read_only, SCHEMA_VERSION, dsn_override=postgres_dsn
+                )
+                if pg_conn is None:
+                    raise RuntimeError(
+                        "PostgreSQL authority was selected but no PostgreSQL "
+                        "connection was opened; refusing a SQLite fallback"
                     )
-                    maybe_open_postgres = None  # type: ignore[assignment]
-                if maybe_open_postgres is not None:
-                    pg_conn = maybe_open_postgres(
-                        read_only, SCHEMA_VERSION, dsn_override=postgres_dsn
-                    )
-                    if pg_conn is not None:
-                        self._conn = pg_conn
-                        self._is_postgres = True
-                        # Mark the open as complete before returning: the
-                        # ``finally`` below closes and drops self._conn for
-                        # any path that leaves this block without setting it.
-                        initialization_complete = True
-                        return
-                    if _pg_explicitly_selected:
-                        # postgres configured but no DSN resolved — warn so the
-                        # operator knows writes are going to SQLite, not their
-                        # intended backend.
-                        logger.warning(
-                            "Postgres backend is configured "
-                            "(sessions.state_backend=postgres) but no DSN was "
-                            "resolved from sessions.postgres_dsn, "
-                            "HERMES_STATE_DATABASE_URL, or "
-                            "HERMES_STATE_POSTGRES_DSN; falling back to SQLite. "
-                            "Set the DSN to engage the Postgres backend."
-                        )
+                self._conn = pg_conn
+                self._is_postgres = True
+                # A row miss on this connection is authoritative. No SQLite
+                # connection is opened, so deleted/missing rows cannot revive.
+                initialization_complete = True
+                return
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
@@ -3511,6 +3497,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except Exception:
                         pass
                     raise
+                self._enable_read_probe()
                 initialization_complete = True
                 return
 
@@ -3650,6 +3637,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # instance can accept its first write.
                 self._dual_replicator.initialize_source()
 
+            self._enable_read_probe()
+
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
             # v22 inline FTS untouched here; only the explicit foreground
@@ -3679,6 +3668,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._close_connection_quietly(conn)
 
     # ── Read-path split ──
+
+    def _enable_read_probe(self) -> None:
+        """Wrap the SQLite connection with a lazy PostgreSQL comparator."""
+
+        if self._state_backend_mode != "probe" or self._conn is None:
+            return
+        from hermes_state_postgres import (
+            maybe_open_postgres,
+            resolve_probe_postgres_dsn,
+        )
+        from hermes_state_read import PostgresReadProbe
+
+        def _connect_probe():
+            dsn = self._read_probe_dsn or resolve_probe_postgres_dsn()
+            if not dsn:
+                raise RuntimeError(
+                    "probe mode selected but no PostgreSQL comparison DSN resolved"
+                )
+            conn = maybe_open_postgres(
+                True,
+                SCHEMA_VERSION,
+                dsn_override=dsn,
+            )
+            if conn is None:
+                raise RuntimeError(
+                    "probe mode selected but the PostgreSQL comparison store "
+                    "did not open"
+                )
+            return conn
+
+        self._read_probe = PostgresReadProbe(_connect_probe, logger=logger)
+        self._conn = self._read_probe.wrap(self._conn)
 
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Open a fresh read-only connection, or None when unavailable.
@@ -3854,9 +3875,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         conn = self._checkout_read_conn()
         if conn is not None:
+            probe_conn = self._read_probe.wrap(conn) if self._read_probe else conn
             try:
-                yield conn
+                yield probe_conn
             finally:
+                if self._read_probe:
+                    probe_conn.close_probe_cursors()
                 returned = False
                 with self._read_conns_lock:
                     if not self._read_conns_closed:
@@ -3878,7 +3902,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._close_read_conn(conn)
             return
         with self._lock:
-            yield self._conn
+            try:
+                yield self._conn
+            finally:
+                if self._read_probe and self._conn is not None:
+                    self._conn.close_probe_cursors()
 
     # ── Core write helper ──
 
@@ -4652,6 +4680,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         )
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+        if self._read_probe is not None:
+            probe, self._read_probe = self._read_probe, None
+            probe.close()
 
     def __del__(self) -> None:
         """Safety net: close the connection if the caller forgot.

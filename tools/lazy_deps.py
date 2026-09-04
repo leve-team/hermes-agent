@@ -190,10 +190,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "image.fal": ("fal-client==0.13.1",),
 
     # ─── State backends ────────────────────────────────────────────────────
-    # Optional PostgreSQL session/state backend, engaged only when
-    # sessions.state_backend = "postgres". Tracks the `postgres` extra in
-    # pyproject.toml — bump both together. The default single-file SQLite
-    # backend needs no extra dependency, so plain installs never pay this.
+    # Optional PostgreSQL session/state backend, engaged by probe/authority
+    # (with "postgres" retained as an authority alias). Tracks the `postgres`
+    # extra in pyproject.toml — bump both together. The default single-file
+    # SQLite backend needs no extra dependency, so plain installs never pay it.
     "state.postgres": ("psycopg[binary]==3.3.4",),
 
     # ─── Memory providers ──────────────────────────────────────────────────
