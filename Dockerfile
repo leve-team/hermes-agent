@@ -159,8 +159,8 @@ COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
-RUN [ "$(uv --version)" = "uv 0.11.29" ] && \
-    [ "$(uvx --version)" = "uvx 0.11.29" ] || { \
+RUN [ "$(uv --version | cut -d' ' -f1-2)" = "uv 0.11.29" ] && \
+    [ "$(uvx --version | cut -d' ' -f1-2)" = "uvx 0.11.29" ] || { \
         echo "uv/uvx 0.11.29 required; got $(uv --version) / $(uvx --version)" >&2; \
         exit 1; \
     }
