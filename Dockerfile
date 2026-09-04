@@ -319,7 +319,13 @@ RUN set -eu; \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra postgres
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra postgres && \
+    actual_tornado="$(/opt/hermes/.venv/bin/python -c \
+        'from importlib.metadata import version; print(version("tornado"))')" && \
+    [ "${actual_tornado}" = "6.5.8" ] || { \
+        echo "tornado: wanted 6.5.8, got ${actual_tornado}" >&2; \
+        exit 1; \
+    }
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
