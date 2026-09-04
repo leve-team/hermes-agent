@@ -43,7 +43,9 @@ RUN apt-get -o Acquire::Retries=3 update && \
     make -j"$(nproc)" && \
     make install
 
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+# uv 0.11.29 updates its static Rust graph to quinn-proto 0.11.15 and
+# rustls-webpki 0.103.13. Keep the multi-platform image index immutable.
+FROM ghcr.io/astral-sh/uv:0.11.29-python3.13-trixie@sha256:d880a6830733cadff8d92e4f7fda20d9a23985f7c198183ef7e5f86bea170cf8 AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
 # node:26 image instead (Hermes pins its toolchain to Node 26 everywhere).
@@ -157,6 +159,11 @@ COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+RUN [ "$(uv --version)" = "uv 0.11.29" ] && \
+    [ "$(uvx --version)" = "uvx 0.11.29" ] || { \
+        echo "uv/uvx 0.11.29 required; got $(uv --version) / $(uvx --version)" >&2; \
+        exit 1; \
+    }
 
 # Node 26: copy the node binary plus the bundled npm JS install from the
 # upstream image.  npm and npx are recreated as symlinks because they're
