@@ -317,7 +317,7 @@ python -m migrate_state_to_postgres \
 ```
 
 PostgreSQL limits a `tsvector` input to roughly 1 MiB. Hermes leaves the
-canonical message untouched and indexes at most 512 KiB of the derived UTF-8
+canonical message untouched and indexes at most 256 KiB of the derived UTF-8
 document. Truncated rows are persistently listed without storing their content:
 
 ```sql
