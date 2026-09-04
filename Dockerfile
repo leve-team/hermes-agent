@@ -173,6 +173,28 @@ COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modu
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+# npm 11.17.0 in the pinned Node source image vendors four dependencies below
+# their patched versions. Replace only those bundled copies with exact npm
+# tarballs; the application dependency tree is governed by package-lock.json.
+RUN set -eu; \
+    mkdir -p /tmp/npm-cve-fixes/tar \
+             /tmp/npm-cve-fixes/undici \
+             /tmp/npm-cve-fixes/brace-expansion \
+             /tmp/npm-cve-fixes/ip-address && \
+    cd /tmp/npm-cve-fixes && \
+    npm pack --silent tar@7.5.22 undici@6.28.0 \
+        brace-expansion@5.0.9 ip-address@10.3.1 && \
+    tar -xzf tar-7.5.22.tgz -C tar --strip-components=1 && \
+    tar -xzf undici-6.28.0.tgz -C undici --strip-components=1 && \
+    tar -xzf brace-expansion-5.0.9.tgz -C brace-expansion --strip-components=1 && \
+    tar -xzf ip-address-10.3.1.tgz -C ip-address --strip-components=1 && \
+    for package in tar undici brace-expansion ip-address; do \
+        rm -rf "/usr/local/lib/node_modules/npm/node_modules/${package}" && \
+        cp -a "/tmp/npm-cve-fixes/${package}" \
+            "/usr/local/lib/node_modules/npm/node_modules/${package}"; \
+    done && \
+    rm -rf /tmp/npm-cve-fixes
+
 WORKDIR /opt/hermes
 
 # ---------- Layer-cached dependency install ----------
@@ -225,6 +247,26 @@ COPY plugins/platforms/photon/sidecar/package.json \
 RUN cd plugins/platforms/photon/sidecar && \
     npm ci --no-audit --fetch-retries=5 && \
     npm cache clean --force
+
+# Fail the build if either the npm-bundled replacements or the application
+# lockfile install drifts away from the reviewed CVE-fix versions.
+RUN set -eu; \
+    assert_node_package() { \
+        package_path="$1"; expected="$2"; \
+        actual="$(node -e 'console.log(require(process.argv[1]).version)' \
+            "${package_path}/package.json")"; \
+        [ "${actual}" = "${expected}" ] || { \
+            echo "${package_path}: wanted ${expected}, got ${actual}" >&2; \
+            exit 1; \
+        }; \
+    }; \
+    assert_node_package /usr/local/lib/node_modules/npm/node_modules/tar 7.5.22; \
+    assert_node_package /usr/local/lib/node_modules/npm/node_modules/undici 6.28.0; \
+    assert_node_package /usr/local/lib/node_modules/npm/node_modules/brace-expansion 5.0.9; \
+    assert_node_package /usr/local/lib/node_modules/npm/node_modules/ip-address 10.3.1; \
+    assert_node_package /opt/hermes/node_modules/browserslist 4.28.7; \
+    assert_node_package /opt/hermes/node_modules/sanitize-html/node_modules/nanoid 3.3.18; \
+    assert_node_package /opt/hermes/node_modules/vite/node_modules/nanoid 3.3.18
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel

@@ -47,6 +47,7 @@
     "yauzl": "^3.3.1",
     "protobufjs": "^8.7.1",
     "brace-expansion": "5.0.9",
+    "browserslist": "4.28.7",
     "mermaid": "11.16.1",
     "dompurify": "3.4.13",
     "ip-address": "10.3.1",
