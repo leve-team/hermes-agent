@@ -67,9 +67,11 @@ logger = logging.getLogger(__name__)
 # The integer/boolean flag columns (observed, active, archived, rewind_count)
 # stay INTEGER to match how SessionDB writes and filters them (``active = 1``).
 #
-# Tables in SCHEMA_SQL deliberately absent here: ``async_delegations``, which is
-# SQLite-local by design (tools/async_delegation.py connects to
-# HERMES_HOME/state.db directly and never goes through SessionDB).
+# PG3 also carries the state.db ledgers whose current owners connect to SQLite
+# directly.  Declaring them here makes fresh and already-initialized writable
+# PostgreSQL stores converge when this base schema is replayed.  Their writers
+# must still move behind SessionDB before a live dual-write window can cover
+# new mutations; schema/COPY parity alone cannot observe a bypass writer.
 
 SCHEMA_SQL_POSTGRES = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -255,6 +257,94 @@ CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS levos_control_tower_event (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload_text TEXT NOT NULL DEFAULT '',
+    origin_session_id TEXT,
+    created_at DOUBLE PRECISION NOT NULL,
+    interval_open INTEGER NOT NULL DEFAULT 0 CHECK (interval_open IN (0, 1)),
+    responded_at DOUBLE PRECISION,
+    consumed_at DOUBLE PRECISION,
+    consumed_by_session_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS levos_control_tower_delivery (
+    event_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    claimed_at DOUBLE PRECISION NOT NULL,
+    injected_at DOUBLE PRECISION,
+    inject_ok INTEGER NOT NULL DEFAULT 0 CHECK (inject_ok IN (0, 1)),
+    responded_at DOUBLE PRECISION,
+    PRIMARY KEY (event_id, attempt_no),
+    UNIQUE (event_id, session_id),
+    FOREIGN KEY (event_id) REFERENCES levos_control_tower_event(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS levos_control_tower_role (
+    role TEXT PRIMARY KEY CHECK (role = 'control_tower'),
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    assigned_at DOUBLE PRECISION NOT NULL,
+    last_event_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS levos_control_tower_forward (
+    forward_key TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    control_session_id TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    text_sha256 TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    delivered_at DOUBLE PRECISION,
+    FOREIGN KEY (event_id) REFERENCES levos_control_tower_event(event_id)
+);
+
+CREATE TABLE IF NOT EXISTS async_delegations (
+    delegation_id TEXT PRIMARY KEY,
+    origin_session TEXT NOT NULL,
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT,
+    state TEXT NOT NULL,
+    dispatched_at DOUBLE PRECISION NOT NULL,
+    completed_at DOUBLE PRECISION,
+    updated_at DOUBLE PRECISION NOT NULL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at DOUBLE PRECISION,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    task_json TEXT,
+    delivery_claim TEXT,
+    delivery_claimed_at DOUBLE PRECISION,
+    origin_session_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS delivery_obligations (
+    obligation_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    content TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    last_error TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_levos_control_empty_open
+    ON levos_control_tower_event(kind)
+    WHERE kind = 'empty_epoch' AND interval_open = 1;
+CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+    ON async_delegations(delivery_state, completed_at);
 
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 
@@ -447,13 +537,11 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
     # first — fixing only the columns would have unmasked a missing-relation
     # error on every ``update_token_counts`` call instead.
     #
-    # NOT included, deliberately: ``async_delegations``. It is declared in
-    # SCHEMA_SQL but ``tools/async_delegation.py`` opens its own raw
-    # ``sqlite3.connect(HERMES_HOME/state.db)`` and never routes through
-    # SessionDB, so it is SQLite-local by design. Creating it here would
-    # provision a table nothing on the Postgres path ever reads or writes.
-    # ``reconcile_postgres_columns`` (below) enforces the same boundary: it
-    # only ADDs columns to tables that already exist, never CREATEs tables.
+    # At v21 ``async_delegations`` was deliberately absent because its writer
+    # bypassed SessionDB. PG3 X1a later classified it as an upstream schema
+    # omission and put it in the replayed base schema; the historical v21 SQL
+    # stays unchanged. ``reconcile_postgres_columns`` (below) still only ADDs
+    # columns to tables that already exist, never CREATEs tables.
     #
     # optional=True matches its siblings: a transient failure retries on the
     # next connect rather than hard-failing boot.
@@ -928,12 +1016,10 @@ def postgres_migration_version(conn: Any) -> int:
 # ------------------------------------
 # This mirrors the SQLite reconciler's contract exactly: it reconciles columns
 # on tables that already exist and skips tables that do not. That is not an
-# omission, it is the Chesterton's-fence boundary — ``async_delegations`` is
-# declared in SCHEMA_SQL but is SQLite-local by design (tools/async_delegation.py
-# opens its own raw sqlite3 connection to HERMES_HOME/state.db and never routes
-# through SessionDB). A reconciler that created every declared table would
-# provision tables the Postgres path never reads. Tables that genuinely belong
-# on both backends are declared in SCHEMA_SQL_POSTGRES and created there.
+# omission, it is the Chesterton's-fence boundary. A reconciler that created
+# every declared table would still invent tables without an explicit ownership
+# decision. Tables that genuinely belong on both backends, including the PG3
+# extra-ledger inventory, are declared in SCHEMA_SQL_POSTGRES and created there.
 
 # SQLite declared type -> Postgres equivalent. Closed set: exactly the types
 # SCHEMA_SQL uses today. Anything else is skipped with a warning (see above).
@@ -1001,11 +1087,10 @@ def reconcile_postgres_columns(conn: Any, schema_sql: str) -> List[str]:
     for table_name, columns in declared.items():
         live_cols = live.get(table_name)
         if live_cols is None:
-            # Table absent on Postgres. Either SQLite-local by design
-            # (async_delegations) or not yet created — creating it here is not
-            # this function's job. DEBUG, not WARNING: this is the expected
-            # steady state for SQLite-local tables, and warning on every
-            # connect would train operators to ignore the log.
+            # Table absent on Postgres. Creating it here is not this function's
+            # job; cross-backend tables belong in SCHEMA_SQL_POSTGRES. DEBUG,
+            # not WARNING, because optional SQLite feature tables can still be
+            # absent in a valid steady state.
             logger.debug(
                 "pg reconcile: table %s not present on Postgres, skipping",
                 table_name,

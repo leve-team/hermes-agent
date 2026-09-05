@@ -35,6 +35,7 @@ import sqlite3
 import pytest
 
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_dual import MIGRATED_TABLES
 from hermes_state_postgres import (
     SCHEMA_SQL_POSTGRES,
     _PG_ONLY_MIGRATIONS,
@@ -44,18 +45,13 @@ from hermes_state_postgres import (
 )
 
 # ---------------------------------------------------------------------------
-# Tables in SCHEMA_SQL that intentionally do NOT exist on PostgreSQL.
-#
-# ``async_delegations`` is SQLite-local by design: tools/async_delegation.py
-# opens its own ``sqlite3.connect(HERMES_HOME/state.db)`` and never routes
-# through SessionDB, so it is never read or written on the Postgres path.
-#
-# This is an allowlist, not a blanket exemption — a NEW table added to
+# Tables in SCHEMA_SQL that intentionally do NOT exist on PostgreSQL. This is
+# an allowlist, not a blanket exemption — a NEW table added to
 # SCHEMA_SQL and not to SCHEMA_SQL_POSTGRES fails the table-parity test until
 # someone either adds it to Postgres or justifies it here. That is the point:
 # the exemption has to be argued, not inherited.
 # ---------------------------------------------------------------------------
-SQLITE_LOCAL_TABLES = {"async_delegations"}
+SQLITE_LOCAL_TABLES = set()
 
 
 def _sqlite_tables() -> dict:
@@ -154,6 +150,15 @@ def test_every_sqlite_table_exists_on_postgres():
         f"{missing}. Add them to SCHEMA_SQL_POSTGRES (plus a migration so "
         f"existing databases converge), or add them to SQLITE_LOCAL_TABLES "
         f"with a comment explaining why the Postgres path never touches them."
+    )
+
+
+def test_every_migrated_table_is_declared_in_postgres_schema():
+    """COPY/diff targets must have a destination table on PostgreSQL."""
+    missing = sorted(set(MIGRATED_TABLES) - set(_pg_ddl_tables()))
+    assert not missing, (
+        "tables selected for COPY/hash diff but absent from "
+        f"SCHEMA_SQL_POSTGRES: {missing}"
     )
 
 
@@ -353,11 +358,7 @@ class _RecordingConn:
 
 
 def _live_shape(drop=()):
-    """The SQLite-declared shape, minus *drop*, and minus the SQLite-local tables.
-
-    Models a real Postgres database: the shared tables exist, and the tables
-    that are SQLite-local (or not yet created) simply are not there.
-    """
+    """The declared shared shape, minus *drop*, as information_schema rows."""
     tables = _sqlite_tables()
     shape = {}
     for table, columns in tables.items():
@@ -400,18 +401,14 @@ def test_reconciler_adds_exactly_the_missing_columns():
 def test_reconciler_never_creates_a_table():
     """ADD COLUMN only — the Chesterton's-fence boundary.
 
-    ``async_delegations`` is declared in SCHEMA_SQL but is SQLite-local; a
-    reconciler that created every declared table would provision it on
-    Postgres where nothing reads it. ``session_model_usage`` is also absent
-    from the fake live shape here, and must likewise be left to the migration
-    rather than conjured by the reconciler.
+    ``session_model_usage`` is absent from the fake live shape here and must be
+    left to the base schema/migration rather than conjured by the reconciler.
     """
     conn = _RecordingConn(_live_shape())
 
     reconcile_postgres_columns(conn, SCHEMA_SQL)
 
     assert not [s for s in conn.executed if "CREATE TABLE" in s.upper()]
-    assert not [s for s in conn.executed if "async_delegations" in s]
     assert not [s for s in conn.executed if "session_model_usage" in s]
 
 
@@ -561,11 +558,9 @@ def test_reconciler_converges_live_database():
             # Idempotent: a second pass is a no-op, not a duplicate-column error.
             assert reconcile_postgres_columns(conn, SCHEMA_SQL) == []
 
-            # And it must NOT have created the SQLite-local table.
-            assert not any(t == "async_delegations" for t, _ in live), (
-                "reconciler created async_delegations, which is SQLite-local "
-                "by design and never read on the Postgres path"
-            )
+            # Extra state.db ledgers are created by the base schema, not by the
+            # ADD-COLUMN reconciler.
+            assert any(t == "async_delegations" for t, _ in live)
 
 
 # ---------------------------------------------------------------------------
