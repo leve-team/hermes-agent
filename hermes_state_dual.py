@@ -25,9 +25,9 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 DUAL_TIMEOUT_SECONDS = 2.0
 
-# Shared tables that have a PostgreSQL counterpart.  SQLite FTS shadow tables,
-# async_delegations, opt-in feature tables, and the local dual journal are not
-# replication targets.
+# Core tables that have a PostgreSQL counterpart.  Keep this tuple stable: the
+# extra ledgers below are owned by writers outside SessionDB and have a
+# different cutover risk even though they share the same physical state.db.
 CORE_TABLES = (
     "system_prompts",
     "sessions",
@@ -40,7 +40,22 @@ CORE_TABLES = (
     "gateway_hygiene_state",
 )
 
-_CORE_TABLE_SET = frozenset(CORE_TABLES)
+# Additional state.db ledgers included in PG3 schema, COPY, hash diff, and the
+# mutation recorder.  Their current writers still open SQLite directly, so
+# they only reach the recorder after those writers move behind SessionDB; the
+# migration tooling must not silently omit their existing rows in the meantime.
+EXTRA_STATE_TABLES = (
+    "levos_control_tower_event",
+    "levos_control_tower_delivery",
+    "levos_control_tower_role",
+    "levos_control_tower_forward",
+    "async_delegations",
+    "delivery_obligations",
+)
+
+MIGRATED_TABLES = CORE_TABLES + EXTRA_STATE_TABLES
+
+_MIGRATED_TABLE_SET = frozenset(MIGRATED_TABLES)
 _GENERATED_PRIMARY_KEYS = {"messages": "id"}
 _MUTATION_RE = re.compile(
     r"\b(INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)\s+"
@@ -328,7 +343,7 @@ class RecordingConnection:
 
     def _capture(self, sql: str, params: Any, cursor: Any) -> None:
         table, operation = _mutation_target(sql)
-        if table not in _CORE_TABLE_SET or operation is None:
+        if table not in _MIGRATED_TABLE_SET or operation is None:
             return
         if _DATABASE_TIME_RE.search(sql):
             raise RuntimeError(

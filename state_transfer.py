@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from hermes_state_dual import CORE_TABLES
+from hermes_state_dual import MIGRATED_TABLES
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -44,7 +44,7 @@ def open_sqlite_snapshot(path: Path) -> sqlite3.Connection:
 
 
 def sqlite_table_specs(conn: sqlite3.Connection) -> list[TableSpec]:
-    """Return shared tables in dependency-safe load order."""
+    """Return PG3-migrated tables in dependency-safe load order."""
     available = {
         str(row[0])
         for row in conn.execute(
@@ -52,7 +52,7 @@ def sqlite_table_specs(conn: sqlite3.Connection) -> list[TableSpec]:
         ).fetchall()
     }
     specs: list[TableSpec] = []
-    for table in CORE_TABLES:
+    for table in MIGRATED_TABLES:
         if table not in available:
             continue
         info = conn.execute(f"PRAGMA table_info({quote_identifier(table)})").fetchall()
@@ -64,7 +64,7 @@ def sqlite_table_specs(conn: sqlite3.Connection) -> list[TableSpec]:
             )
         )
         if not primary_key:
-            raise RuntimeError(f"shared state table {table!r} has no primary key")
+            raise RuntimeError(f"migrated state table {table!r} has no primary key")
         specs.append(TableSpec(table, columns, primary_key))
     return specs
 

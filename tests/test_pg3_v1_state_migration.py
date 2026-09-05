@@ -20,9 +20,157 @@ from state_reverse import InjectedReverseFault, reverse_backfill
 from state_transfer import checkpoint_template, sqlite_table_specs
 
 
+_EXTRA_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS levos_control_tower_event (
+    event_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    payload_text TEXT NOT NULL DEFAULT '',
+    origin_session_id TEXT,
+    created_at REAL NOT NULL,
+    interval_open INTEGER NOT NULL DEFAULT 0 CHECK (interval_open IN (0, 1)),
+    responded_at REAL,
+    consumed_at REAL,
+    consumed_by_session_id TEXT
+);
+CREATE TABLE IF NOT EXISTS levos_control_tower_delivery (
+    event_id TEXT NOT NULL,
+    attempt_no INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    injected_at REAL,
+    inject_ok INTEGER NOT NULL DEFAULT 0 CHECK (inject_ok IN (0, 1)),
+    responded_at REAL,
+    PRIMARY KEY (event_id, attempt_no),
+    UNIQUE (event_id, session_id),
+    FOREIGN KEY (event_id) REFERENCES levos_control_tower_event(event_id)
+);
+CREATE TABLE IF NOT EXISTS levos_control_tower_role (
+    role TEXT PRIMARY KEY CHECK (role = 'control_tower'),
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    assigned_at REAL NOT NULL,
+    last_event_id TEXT
+);
+CREATE TABLE IF NOT EXISTS levos_control_tower_forward (
+    forward_key TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    control_session_id TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    text_sha256 TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    delivered_at REAL,
+    FOREIGN KEY (event_id) REFERENCES levos_control_tower_event(event_id)
+);
+CREATE TABLE IF NOT EXISTS delivery_obligations (
+    obligation_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    content TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    last_error TEXT
+);
+"""
+
+
 def _init_sqlite_replica(path: Path) -> None:
     db = SessionDB(db_path=path)
     db.close()
+
+
+def _init_extra_state_tables(path: Path) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_EXTRA_SQLITE_SCHEMA)
+        async_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(async_delegations)")
+        }
+        if "origin_session_id" not in async_columns:
+            conn.execute(
+                "ALTER TABLE async_delegations ADD COLUMN origin_session_id TEXT"
+            )
+
+
+def _seed_extra_state_tables(path: Path, event_count: int = 190) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executemany(
+            "INSERT INTO levos_control_tower_event"
+            " (event_id, kind, payload_text, origin_session_id, created_at,"
+            " interval_open, responded_at, consumed_at, consumed_by_session_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"event-{index:03d}",
+                    "empty_epoch",
+                    f"payload-{index}",
+                    f"origin-{index}",
+                    1_788_569_108.0 + index,
+                    0,
+                    None,
+                    None,
+                    None,
+                )
+                for index in range(event_count)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO levos_control_tower_delivery"
+            " (event_id, attempt_no, session_id, claimed_at, injected_at,"
+            " inject_ok, responded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    f"event-{index:03d}",
+                    1,
+                    f"session-{index:03d}",
+                    1_788_569_109.0 + index,
+                    1_788_569_110.0 + index,
+                    1,
+                    None,
+                )
+                for index in range(event_count)
+            ],
+        )
+        conn.execute(
+            "INSERT INTO levos_control_tower_role"
+            " (role, session_id, source, assigned_at, last_event_id)"
+            " VALUES ('control_tower', 'session-000', 'fixture', ?, 'event-000')",
+            (1_787_493_712.0,),
+        )
+        conn.execute(
+            "INSERT INTO levos_control_tower_forward"
+            " (forward_key, event_id, control_session_id, target_session_id,"
+            " text_sha256, created_at, delivered_at)"
+            " VALUES ('forward-000', 'event-000', 'session-000',"
+            " 'target-000', ?, ?, NULL)",
+            ("0" * 64, 1_788_569_111.0),
+        )
+        conn.execute(
+            "INSERT INTO async_delegations"
+            " (delegation_id, origin_session, origin_ui_session_id,"
+            " parent_session_id, state, dispatched_at, completed_at, updated_at,"
+            " event_json, result_json, delivery_state, delivery_attempts,"
+            " delivered_at, owner_pid, owner_started_at, task_json,"
+            " delivery_claim, delivery_claimed_at, origin_session_id)"
+            " VALUES ('delegation-1', 'origin', '', NULL, 'running', ?, NULL, ?,"
+            " NULL, NULL, 'pending', 0, NULL, NULL, NULL, NULL, NULL, NULL, 'ui-1')",
+            (1_787_664_570.0, 1_787_664_570.0),
+        )
+        conn.execute(
+            "INSERT INTO delivery_obligations"
+            " (obligation_id, session_key, platform, chat_id, thread_id, content,"
+            " state, attempts, created_at, updated_at, owner_pid,"
+            " owner_started_at, last_error)"
+            " VALUES ('obligation-1', 'session-key', 'test', 'chat', NULL,"
+            " 'content', 'pending', 0, ?, ?, NULL, NULL, NULL)",
+            (1_788_569_112.0, 1_788_569_112.0),
+        )
 
 
 def _sqlite_target_factory(path: Path):
@@ -92,6 +240,21 @@ def _full_hash_diff(source_path: Path, target_path: Path, *, repair: bool = Fals
 
 class _ProcessKilled(BaseException):
     """Simulate an uncatchable process death at a fault-matrix boundary."""
+
+
+@pytest.mark.parametrize("table", hermes_state_dual.EXTRA_STATE_TABLES)
+def test_extra_state_table_mutations_are_dual_write_recording_targets(
+    table: str,
+) -> None:
+    source = sqlite3.connect(":memory:", isolation_level=None)
+    source.execute(f'CREATE TABLE "{table}" (id TEXT PRIMARY KEY)')
+    recorder = hermes_state_dual.RecordingConnection(source)
+
+    recorder.execute(f'INSERT INTO "{table}" (id) VALUES (?)', ("row-1",))
+
+    assert [
+        (mutation.table, mutation.operation) for mutation in recorder.mutations
+    ] == [(table, "insert")]
 
 
 def test_dual_write_explicit_message_id_refreshes_postgres_fts(
@@ -312,6 +475,61 @@ def test_backfill_resume_after_fifty_percent_fault_uses_checkpoint(
     assert summary["source_sessions"] == 20
     assert summary["source_messages"] == 20
     assert _ledger_rows(source_path) == _ledger_rows(target_path)
+
+
+def test_extra_state_tables_backfill_190_rows_and_join_hash_diff(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.db"
+    target_path = tmp_path / "target.db"
+    checkpoint = tmp_path / "backfill.json"
+    _init_sqlite_replica(source_path)
+    _init_sqlite_replica(target_path)
+    _init_extra_state_tables(source_path)
+    _init_extra_state_tables(target_path)
+    _seed_extra_state_tables(source_path)
+
+    def target_factory(_dsn: str):
+        conn = sqlite3.connect(target_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    summary = online_backfill(
+        source_path,
+        "test-only",
+        checkpoint_path=checkpoint,
+        batch_rows=17,
+        budget_bytes=1024 * 1024 * 1024,
+        _target_factory=target_factory,
+        _initialize_target=lambda _conn: None,
+        _finalize_target=lambda _conn: None,
+    )
+
+    assert summary["rows_by_table"]["levos_control_tower_event"] == 190
+    assert summary["rows_by_table"]["levos_control_tower_delivery"] == 190
+    assert summary["rows_by_table"]["async_delegations"] == 1
+    assert summary["rows_by_table"]["delivery_obligations"] == 1
+
+    with sqlite3.connect(source_path) as source, sqlite3.connect(target_path) as target:
+        source.row_factory = sqlite3.Row
+        target.row_factory = sqlite3.Row
+        specs = [
+            spec
+            for spec in sqlite_table_specs(source)
+            if spec.name in hermes_state_dual.EXTRA_STATE_TABLES
+        ]
+        report = state_diff_connections(
+            source,
+            target,
+            specs=specs,
+            target_dialect="sqlite",
+            batch_rows=19,
+        )
+
+    assert set(report["tables"]) == set(hermes_state_dual.EXTRA_STATE_TABLES)
+    assert report["clean"] is True
+    assert report["mismatch_count"] == 0
 
 
 def test_backfill_resume_disk_guard_saves_checkpoint_and_uses_rc4_error(

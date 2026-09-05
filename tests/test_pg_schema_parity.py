@@ -12,6 +12,7 @@ import sqlite3
 import pytest
 
 from hermes_state_common import DEFERRED_INDEX_SQL, SCHEMA_SQL, SCHEMA_VERSION
+from hermes_state_dual import MIGRATED_TABLES
 from hermes_state_pg_schema import (
     SCHEMA_SQL_POSTGRES, PostgresMigration, _PG_ONLY_MIGRATIONS, _apply_single_migration,
     _pg_column_type, _schema_statements, apply_postgres_migrations, init_postgres_schema,
@@ -21,7 +22,14 @@ from hermes_state_pg_schema import (
 from hermes_state_schema import SessionSchemaMixin
 from tests.pg_trigger_harness import TriggerDDL
 
-SQLITE_LOCAL_TABLES = {"async_delegations"}
+# ---------------------------------------------------------------------------
+# Tables in SCHEMA_SQL that intentionally do NOT exist on PostgreSQL. This is
+# an allowlist, not a blanket exemption — a NEW table added to
+# SCHEMA_SQL and not to SCHEMA_SQL_POSTGRES fails the table-parity test until
+# someone either adds it to Postgres or justifies it here. That is the point:
+# the exemption has to be argued, not inherited.
+# ---------------------------------------------------------------------------
+SQLITE_LOCAL_TABLES = set()
 
 
 def _columns(db):
@@ -289,6 +297,19 @@ def test_extension_optimizations_are_optional():
     for migration in _PG_ONLY_MIGRATIONS:
         if "CREATE EXTENSION" in migration.sql.upper() or "GIN_TRGM_OPS" in migration.sql.upper():
             assert migration.optional
+
+
+def test_every_migrated_table_is_declared_in_postgres_schema():
+    """COPY/diff targets must have a destination table on PostgreSQL."""
+    declared = {
+        m.group(1).strip('"')
+        for m in re.finditer(r"CREATE TABLE IF NOT EXISTS\s+([\w\"]+)", SCHEMA_SQL_POSTGRES)
+    }
+    missing = sorted(set(MIGRATED_TABLES) - declared)
+    assert not missing, (
+        "tables selected for COPY/hash diff but absent from "
+        f"SCHEMA_SQL_POSTGRES: {missing}"
+    )
 
 
 def test_planner_is_empty_when_all_versions_are_recorded():
