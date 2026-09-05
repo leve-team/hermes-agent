@@ -76,17 +76,11 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    from hermes_state import SessionDB
+
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
-    try:
-        _initialize_schema(conn)
-    except Exception:
-        # A PRAGMA/DDL failure after a successful connect() must not leak the
-        # just-opened connection back to the caller.
-        conn.close()
-        raise
-    return conn
+    return SessionDB.open_writer(path, timeout=10, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

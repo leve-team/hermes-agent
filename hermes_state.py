@@ -3235,6 +3235,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             logger.debug("Could not close a SessionDB connection", exc_info=True)
 
+    @staticmethod
+    def open_writer(db_path, *, timeout, initialize):
+        """Open a SQLite-primary auxiliary writer without core bootstrap/retries.
+
+        The caller retains its SQL, initialization and transaction boundaries.
+        Dual mode records committed batches through RecordingConnection; reads
+        remain on the explicitly supplied SQLite file, as before cutover.
+        """
+        from hermes_state_writer import open_writer
+
+        _ensure_test_isolation(db_path)
+        return open_writer(db_path, timeout=timeout, initialize=initialize)
+
     def __init__(
         self,
         db_path: Path = None,
