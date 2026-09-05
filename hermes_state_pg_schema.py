@@ -837,13 +837,110 @@ def apply_postgres_migrations(conn: Any) -> None:
             logger.info("pg-only migration v%d applied", migration.version)
 
 
+def _split_sql_statements(sql_script: str) -> List[str]:
+    """Split DDL at unquoted semicolons, removing comments as whitespace.
+
+    Handles line comments, nested block comments, single/double quotes with
+    doubled delimiters, E-string backslash escapes, and dollar-quoted bodies
+    (including named tags). Ordinary strings assume PostgreSQL's default
+    standard_conforming_strings=on. Unterminated quotes/blocks raise ValueError
+    before any statements are executed; other SQL validation belongs to PG.
+    """
+    statements: List[str] = []
+    buffer: List[str] = []
+    position = 0
+    delimiter = ""
+    escape_string = False
+    line_comment = False
+    block_depth = 0
+    dollar_tag = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+    while position < len(sql_script):
+        char = sql_script[position]
+        pair = sql_script[position : position + 2]
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+                buffer.append(char)
+        elif block_depth:
+            if pair == "/*":
+                block_depth += 1
+                position += 1
+            elif pair == "*/":
+                block_depth -= 1
+                position += 1
+            elif char in "\r\n":
+                buffer.append(char)
+        elif delimiter:
+            if sql_script.startswith(delimiter, position):
+                buffer.append(delimiter)
+                position += len(delimiter) - 1
+                if delimiter in ("'", '"') and pair == delimiter * 2:
+                    buffer.append(delimiter)
+                    position += 1
+                else:
+                    delimiter = ""
+            else:
+                buffer.append(char)
+                if escape_string and char == "\\" and position + 1 < len(sql_script):
+                    position += 1
+                    buffer.append(sql_script[position])
+        elif pair == "--":
+            line_comment = True
+            buffer.append(" ")
+            position += 1
+        elif pair == "/*":
+            block_depth = 1
+            buffer.append(" ")
+            position += 1
+        elif char in ("'", '"'):
+            delimiter = char
+            escape_string = (
+                char == "'"
+                and position > 0
+                and sql_script[position - 1] in "eE"
+                and (
+                    position < 2
+                    or not (
+                        sql_script[position - 2].isalnum()
+                        or sql_script[position - 2] in "_$"
+                    )
+                )
+            )
+            buffer.append(char)
+        elif (
+            char == "$"
+            and (
+                position == 0
+                or not (
+                    sql_script[position - 1].isalnum()
+                    or sql_script[position - 1] in "_$"
+                )
+            )
+            and (match := dollar_tag.match(sql_script, position))
+        ):
+            delimiter = match.group()
+            escape_string = False
+            buffer.append(delimiter)
+            position += len(delimiter) - 1
+        elif char == ";":
+            statement = "".join(buffer).strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+        else:
+            buffer.append(char)
+        position += 1
+    if delimiter or block_depth:
+        raise ValueError("Unterminated SQL quote or block comment")
+    statement = "".join(buffer).strip()
+    if statement:
+        statements.append(statement)
+    return statements
+
+
 def _schema_statements(sql: str):
-    # These declarative scripts contain no procedural bodies or quoted
-    # semicolons. Strip comments before splitting so comment prose cannot
-    # accidentally become an executable statement.
-    for statement in re.sub(r"--[^\n]*", "", sql).split(";"):
-        if statement.strip():
-            yield statement.strip()
+    """Yield executable statements using the quote/comment-aware splitter."""
+    yield from _split_sql_statements(sql)
 
 
 def init_postgres_schema(

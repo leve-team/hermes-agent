@@ -370,13 +370,9 @@ class _PostgresCursor:
         return self
 
     def executescript(self, sql_script: str):
-        """Run a multi-statement DDL/script. PostgreSQL's driver executes one
-        statement per ``execute``; split on ``;`` and run the non-empty pieces.
-        """
-        for statement in sql_script.split(";"):
-            statement = statement.strip()
-            if statement:
-                self.execute(statement)
+        """Run DDL using the same quote/comment-aware splitter as schema setup."""
+        for statement in pg_schema._split_sql_statements(sql_script):
+            self.execute(statement)
         return self
 
     def executemany(self, sql: str, seq_of_params):
