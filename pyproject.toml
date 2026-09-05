@@ -444,7 +444,12 @@ py-modules = [
   "hermes_time",
   "hermes_logging",
   "utils",
-  "mcp_serve",
+  "mcp_serve",,
+  "state_diff",
+  "state_transfer",
+  "state_reverse",
+  "state_go_candidate",
+  "migrate_state_to_postgres"
 ]
 
 [tool.setuptools.packages.find]
