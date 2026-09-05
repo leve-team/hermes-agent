@@ -94,7 +94,11 @@ def fetch_sqlite_batch(
 
 
 def primary_key_from_row(spec: TableSpec, row: Any) -> list[Any]:
-    return [row[column] for column in spec.primary_key]
+    """Read named rows or tuple rows projected in ``spec.columns`` order."""
+    try:
+        return [row[column] for column in spec.primary_key]
+    except (KeyError, TypeError, IndexError):
+        return [row[spec.columns.index(column)] for column in spec.primary_key]
 
 
 def _checkpoint_source_identity(source: Path | str) -> str:
