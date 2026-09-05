@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Derived manifest: canonical messages remain lossless while oversized search
 -- documents are indexed from a bounded UTF-8 prefix. This table is not part of
--- SQLite authority or dual-write; it is rebuilt/maintained with fts_content.
+-- SQLite authority or dual-write. It is rebuilt/maintained with fts_content.
 CREATE TABLE IF NOT EXISTS hermes_fts_truncations (
     message_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     source_bytes BIGINT NOT NULL,
@@ -842,6 +842,107 @@ def apply_postgres_migrations(conn: Any) -> None:
             logger.info("pg-only migration v%d applied", migration.version)
 
 
+def _split_sql_statements(sql_script: str) -> List[str]:
+    """Split DDL at unquoted semicolons, removing comments as whitespace.
+
+    Handles line comments, nested block comments, single/double quotes with
+    doubled delimiters, E-string backslash escapes, and dollar-quoted bodies
+    (including named tags). Ordinary strings assume PostgreSQL's default
+    standard_conforming_strings=on. Unterminated quotes/blocks raise ValueError
+    before any statements are executed; other SQL validation belongs to PG.
+    """
+    statements: List[str] = []
+    buffer: List[str] = []
+    position = 0
+    delimiter = ""
+    escape_string = False
+    line_comment = False
+    block_depth = 0
+    dollar_tag = re.compile(r"\$(?:[^\W\d]\w*)?\$")
+    while position < len(sql_script):
+        char = sql_script[position]
+        pair = sql_script[position : position + 2]
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+                buffer.append(char)
+        elif block_depth:
+            if pair == "/*":
+                block_depth += 1
+                position += 1
+            elif pair == "*/":
+                block_depth -= 1
+                position += 1
+            elif char in "\r\n":
+                buffer.append(char)
+        elif delimiter:
+            if sql_script.startswith(delimiter, position):
+                buffer.append(delimiter)
+                position += len(delimiter) - 1
+                if delimiter in ("'", '"') and pair == delimiter * 2:
+                    buffer.append(delimiter)
+                    position += 1
+                else:
+                    delimiter = ""
+            else:
+                buffer.append(char)
+                if escape_string and char == "\\" and position + 1 < len(sql_script):
+                    position += 1
+                    buffer.append(sql_script[position])
+        elif pair == "--":
+            line_comment = True
+            buffer.append(" ")
+            position += 1
+        elif pair == "/*":
+            block_depth = 1
+            buffer.append(" ")
+            position += 1
+        elif char in ("'", '"'):
+            delimiter = char
+            escape_string = (
+                char == "'"
+                and position > 0
+                and sql_script[position - 1] in "eE"
+                and (
+                    position < 2
+                    or not (
+                        sql_script[position - 2].isalnum()
+                        or sql_script[position - 2] in "_$"
+                    )
+                )
+            )
+            buffer.append(char)
+        elif (
+            char == "$"
+            and (
+                position == 0
+                or not (
+                    sql_script[position - 1].isalnum()
+                    or sql_script[position - 1] in "_$"
+                )
+            )
+            and (match := dollar_tag.match(sql_script, position))
+        ):
+            delimiter = match.group()
+            escape_string = False
+            buffer.append(delimiter)
+            position += len(delimiter) - 1
+        elif char == ";":
+            statement = "".join(buffer).strip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+        else:
+            buffer.append(char)
+        position += 1
+    if delimiter or block_depth:
+        raise ValueError("Unterminated SQL quote or block comment")
+    statement = "".join(buffer).strip()
+    if statement:
+        statements.append(statement)
+    return statements
+
+
 def _postgres_schema_statements(*, indexes: bool) -> List[str]:
     """Select base-schema statements by whether they create an index.
 
@@ -850,15 +951,13 @@ def _postgres_schema_statements(*, indexes: bool) -> List[str]:
     of CREATE TABLE because they are required for conflict-idempotent batches.
     """
     selected: List[str] = []
-    for statement in SCHEMA_SQL_POSTGRES.split(";"):
-        if not statement.strip():
-            continue
-        uncommented = re.sub(r"--[^\n]*", "", statement).strip().upper()
-        is_index = uncommented.startswith("CREATE INDEX") or uncommented.startswith(
+    for statement in _split_sql_statements(SCHEMA_SQL_POSTGRES):
+        normalized = statement.upper()
+        is_index = normalized.startswith("CREATE INDEX") or normalized.startswith(
             "CREATE UNIQUE INDEX"
         )
         if is_index == indexes:
-            selected.append(statement.strip())
+            selected.append(statement)
     return selected
 
 
@@ -1718,13 +1817,9 @@ class _PostgresCursor:
         return self
 
     def executescript(self, sql_script: str):
-        """Run a multi-statement DDL/script. PostgreSQL's driver executes one
-        statement per ``execute``; split on ``;`` and run the non-empty pieces.
-        """
-        for statement in sql_script.split(";"):
-            statement = statement.strip()
-            if statement:
-                self.execute(statement)
+        """Run DDL using the same quote/comment-aware splitter as schema setup."""
+        for statement in _split_sql_statements(sql_script):
+            self.execute(statement)
         return self
 
     def executemany(self, sql: str, seq_of_params):
