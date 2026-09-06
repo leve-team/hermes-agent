@@ -25,6 +25,7 @@ from state_transfer import (
     open_sqlite_snapshot,
     quote_identifier,
     sqlite_table_specs,
+    normalize_legacy_content_prefix,
 )
 
 
@@ -60,7 +61,7 @@ def canonical_row_json(
 ) -> str:
     ignored = frozenset(ignored_columns)
     normalized = {
-        column: _normalize_value(_row_value(row, column, index))
+        column: _normalize_value(normalize_legacy_content_prefix(_row_value(row, column, index)))
         for index, column in enumerate(columns)
         if column not in ignored
     }

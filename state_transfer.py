@@ -168,6 +168,43 @@ def reconcile_transfer_columns(
     return [name for name, _statement in pending]
 
 
+
+# ── 레거시 NUL 접두 정규화 (결함 #5, 2026-09-06) ─────────────────────────────
+# 구버전 코어는 구조화 content 를 "\x00json:" 접두로 저장했다. 현행 코어
+# (hermes_state.py SessionDB._CONTENT_JSON_PREFIX) 는 "\x01json:" 로 쓰고 읽기는
+# 양쪽을 동등하게 받는다. PostgreSQL text 는 NUL 을 거부하므로 이관 시 레거시
+# 접두를 현행 접두로 바꾼다 — 디코드 결과가 같으므로 의미 보존이다.
+# 접두가 아닌 위치의 NUL 은 데이터 결함이므로 조용히 지우지 않고 예외로 올린다.
+LEGACY_CONTENT_JSON_PREFIX = "\x00json:"
+CURRENT_CONTENT_JSON_PREFIX = "\x01json:"
+
+
+class SourceValueError(ValueError):
+    """소스 값이 대상 백엔드에 표현 불가능하고 안전한 정규화도 없을 때."""
+
+
+def normalize_legacy_content_prefix(value: Any, *, table: str = "", column: str = "", key: Any = None) -> Any:
+    """``\x00json:`` 접두 문자열을 ``\x01json:`` 로 바꾼다. 그 외 NUL 은 거부."""
+    if not isinstance(value, str) or "\x00" not in value:
+        return value
+    if value.startswith(LEGACY_CONTENT_JSON_PREFIX):
+        rest = value[len(LEGACY_CONTENT_JSON_PREFIX):]
+        if "\x00" not in rest:
+            return CURRENT_CONTENT_JSON_PREFIX + rest
+    raise SourceValueError(
+        f"NUL byte outside legacy json prefix in {table or '?'}.{column or '?'} key={key!r}; "
+        "refusing to strip or truncate"
+    )
+
+
+def normalize_row_values(spec: "TableSpec", values: list[Any]) -> list[Any]:
+    """행 값 리스트에 컬럼별 정규화를 적용한다(현재는 NUL 접두 하나)."""
+    key = tuple(values[spec.columns.index(pk)] for pk in spec.primary_key if pk in spec.columns) or None
+    return [
+        normalize_legacy_content_prefix(v, table=spec.name, column=c, key=key)
+        for c, v in zip(spec.columns, values)
+    ]
+
 def fetch_sqlite_batch(
     conn: sqlite3.Connection,
     spec: TableSpec,
