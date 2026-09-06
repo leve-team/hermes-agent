@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 

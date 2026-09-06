@@ -81,7 +81,8 @@ def test_copy_into_sqlite_target_end_to_end(tmp_path: Path):
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT)")
     conn.executemany("INSERT INTO messages VALUES (?,?,?,?)",
                      [(i, "s", "user", LEGACY if i % 4 == 0 else f"plain {i}") for i in range(1, 549)])
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     spec = _spec()
     source = st.open_sqlite_snapshot(src)
     rows = st.fetch_sqlite_batch(source, spec, None, 1000)

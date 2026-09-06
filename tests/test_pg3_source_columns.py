@@ -115,6 +115,8 @@ def test_source_pragma_types_are_nullable_idempotent_and_copyable(
     spec = next(spec for spec in specs if spec.name == "messages")
     rows = source.execute("SELECT * FROM messages ORDER BY id").fetchall()
     assert _copy_batch(target, spec, rows) == 2
+    assert target.copy_columns == list(spec.columns)
+    assert target.primary_keys[spec.name] == spec.primary_key
     position = spec.columns.index("duration_s")
     assert [row[position] for row in target.written] == [value, None]
     target.statements.clear()
@@ -223,6 +225,8 @@ def test_online_entrypoint_reconciles_before_like_copy_or_checkpoint(
         with pytest.raises(InjectedBackfillFault):
             online_backfill(path, "test-only", **options)
     assert raw.written == [(1, 12.375), (2, None)]
+    assert raw.copy_columns == ["id", "duration_s"]
+    assert raw.primary_keys["messages"] == ("id",)
     assert raw.staging["_hermes_backfill_messages"]["duration_s"] == "DOUBLE PRECISION"
     assert json.loads(checkpoint.read_text())["tables"]["messages"]["rows"] == 2
     with open_sqlite_snapshot(path) as snapshot:

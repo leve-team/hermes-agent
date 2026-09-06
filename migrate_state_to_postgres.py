@@ -1,9 +1,10 @@
 """Online, resumable SQLite-to-PostgreSQL state backfill.
 
 Rows are read from one SQLite ``mode=ro`` snapshot, streamed through psycopg3
-COPY into a per-batch temporary table, and merged with ``ON CONFLICT DO
-NOTHING``.  The source file is never copied or written.  A small atomic JSON
-checkpoint records ``(table, last primary key)`` after every committed batch.
+COPY into a per-batch temporary table, and merged by primary key. Each resume
+pins a new snapshot and rescans parents before children, including completed
+tables. ``complete`` means snapshot completion, never absence of future rows.
+The source is read-only; checkpoints advance only after committed batches.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from state_transfer import (
 
 DEFAULT_BATCH_ROWS = 5_000
 DEFAULT_BUDGET_BYTES = 41 * 1024 * 1024 * 1024
+IMMUTABLE_TABLES = frozenset({"system_prompts"})
+LOOKUP_BATCH_ROWS = 100
 
 
 class BackfillBudgetExceeded(RuntimeError):
@@ -48,6 +51,10 @@ class BackfillBudgetExceeded(RuntimeError):
 
 class InjectedBackfillFault(RuntimeError):
     """Test/drill-only interruption requested by ``--fault-inject-at``."""
+
+
+class MissingSessionError(RuntimeError):
+    """A message's parent or ancestor is absent from target and source snapshot."""
 
 
 def _resolve_sqlite_path(explicit: str | None) -> Path:
@@ -120,6 +127,7 @@ def _copy_batch(target: Any, spec: TableSpec, rows: Sequence[Any]) -> int:
     if not rows:
         return 0
     columns_sql = ", ".join(quote_identifier(column) for column in spec.columns)
+    conflict_sql = _conflict_clause(spec, reset_fts=not _is_sqlite_target(target))
     values = [_source_values(spec, row) for row in rows]
     if _is_sqlite_target(target):
         placeholders = ", ".join("?" for _ in spec.columns)
@@ -127,8 +135,8 @@ def _copy_batch(target: Any, spec: TableSpec, rows: Sequence[Any]) -> int:
         try:
             before = target.total_changes
             target.executemany(
-                f"INSERT OR IGNORE INTO {quote_identifier(spec.name)} "
-                f"({columns_sql}) VALUES ({placeholders})",
+                f"INSERT INTO {quote_identifier(spec.name)} "
+                f"({columns_sql}) VALUES ({placeholders}) {conflict_sql}",
                 values,
             )
             inserted = int(target.total_changes - before)
@@ -155,7 +163,7 @@ def _copy_batch(target: Any, spec: TableSpec, rows: Sequence[Any]) -> int:
         cursor = raw.execute(
             f"INSERT INTO {quote_identifier(spec.name)} ({columns_sql}) "
             f"SELECT {columns_sql} FROM {quote_identifier(staging)} WHERE TRUE "
-            "ON CONFLICT DO NOTHING"
+            f"{conflict_sql}"
         )
         inserted = int(cursor.rowcount)
         raw.commit()
@@ -163,6 +171,121 @@ def _copy_batch(target: Any, spec: TableSpec, rows: Sequence[Any]) -> int:
     except BaseException:
         raw.rollback()
         raise
+
+
+def _mutable_columns(spec: TableSpec) -> tuple[str, ...]:
+    return tuple(
+        column for column in spec.columns
+        if column not in spec.primary_key
+        and (spec.name, column) != ("sessions", "parent_session_id")
+    )
+
+
+def _conflict_clause(spec: TableSpec, *, reset_fts: bool = False) -> str:
+    primary_key = ", ".join(quote_identifier(column) for column in spec.primary_key)
+    prefix = f"ON CONFLICT ({primary_key})"
+    columns = _mutable_columns(spec)
+    if spec.name in IMMUTABLE_TABLES or not columns:
+        return f"{prefix} DO NOTHING"
+    assignments = ", ".join(
+        f"{quote_identifier(column)} = excluded.{quote_identifier(column)}"
+        for column in columns
+    )
+    if spec.name == "messages" and reset_fts:
+        assignments += ', "fts_content" = NULL'
+    return f"{prefix} DO UPDATE SET {assignments}"
+
+
+def _changed_rows(target: Any, spec: TableSpec, rows: Sequence[Any]) -> list[Any]:
+    """Bounded target-PK anti-join plus value comparison, not a timestamp filter."""
+    selected: list[Any] = []
+    columns_sql = ", ".join(quote_identifier(column) for column in spec.columns)
+    key_sql = ", ".join(quote_identifier(column) for column in spec.primary_key)
+    key_slots = "(" + ", ".join("?" for _ in spec.primary_key) + ")"
+    key_indexes = [spec.columns.index(column) for column in spec.primary_key]
+    value_indexes = [spec.columns.index(column) for column in _mutable_columns(spec)]
+    for offset in range(0, len(rows), LOOKUP_BATCH_ROWS):
+        chunk = rows[offset:offset + LOOKUP_BATCH_ROWS]
+        parameters = [value for row in chunk for value in primary_key_from_row(spec, row)]
+        existing = {
+            tuple(row[index] for index in key_indexes): row
+            for row in target.execute(
+                f"SELECT {columns_sql} FROM {quote_identifier(spec.name)} "
+                f"WHERE ({key_sql}) IN ({', '.join(key_slots for _ in chunk)})",
+                tuple(parameters),
+            ).fetchall()
+        }
+        for row in chunk:
+            previous = existing.get(tuple(primary_key_from_row(spec, row)))
+            values = _source_values(spec, row)
+            if previous is None or (
+                spec.name not in IMMUTABLE_TABLES
+                and any(values[index] != previous[index] for index in value_indexes)
+            ):
+                selected.append(row)
+    return selected
+
+
+def _update_session_parents(target: Any, rows: Sequence[Any]) -> None:
+    target.execute("BEGIN")
+    try:
+        target.executemany(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            [(row["parent_session_id"], row["id"]) for row in rows],
+        )
+        target.commit()
+    except BaseException:
+        target.rollback()
+        raise
+
+
+def _ensure_message_sessions(
+    source: sqlite3.Connection,
+    target: Any,
+    spec: Optional[TableSpec],
+    rows: Sequence[Any],
+    batch_rows: int,
+) -> None:
+    """Repair missing parents and their self-FK closure before copying children."""
+    pending = {row["session_id"] for row in rows}
+    pending.discard(None)
+    recovered: dict[str, Any] = {}
+    while pending:
+        identifiers = sorted(pending)[:LOOKUP_BATCH_ROWS]
+        pending.difference_update(identifiers)
+        placeholders = ", ".join("?" for _ in identifiers)
+        existing = {
+            row[0] for row in target.execute(
+                f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                tuple(identifiers),
+            ).fetchall()
+        }
+        missing = set(identifiers) - existing - recovered.keys()
+        if not missing:
+            continue
+        if spec is None:
+            raise MissingSessionError(f"missing source sessions table; session_ids={sorted(missing)!r}")
+        placeholders = ", ".join("?" for _ in missing)
+        parents = source.execute(
+            f"SELECT * FROM sessions WHERE id IN ({placeholders})", tuple(sorted(missing))
+        ).fetchall()
+        absent = missing - {row["id"] for row in parents}
+        if absent:
+            raise MissingSessionError(
+                f"session_ids={sorted(absent)!r} absent from source snapshot and target; "
+                f"message_ids={[row['id'] for row in rows]!r}"
+            )
+        for parent in parents:
+            recovered[parent["id"]] = parent
+            if "parent_session_id" in spec.columns and parent["parent_session_id"] is not None:
+                pending.add(parent["parent_session_id"])
+    if not recovered or spec is None:
+        return
+    parents = list(recovered.values())
+    for offset in range(0, len(parents), batch_rows):
+        _copy_batch(target, spec, parents[offset:offset + batch_rows])
+    if "parent_session_id" in spec.columns:
+        _update_session_parents(target, parents)
 
 
 def _restore_session_parents(
@@ -185,18 +308,7 @@ def _restore_session_parents(
         ).fetchall()
         if not rows:
             return
-        updates = [(row[1], row[0]) for row in rows if row[1] is not None]
-        if updates:
-            target.execute("BEGIN")
-            try:
-                target.executemany(
-                    "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
-                    updates,
-                )
-                target.commit()
-            except BaseException:
-                target.rollback()
-                raise
+        _update_session_parents(target, rows)
         last_id = str(rows[-1][0])
 
 
@@ -235,6 +347,7 @@ def _backfill_fts(
         ).fetchall()
         if not rows:
             state["complete"] = True
+            state["tc"] = checkpoint.get("pass_tc", time.time())
             save_checkpoint(checkpoint_path, checkpoint)
             return int(state.get("rows", 0))
 
@@ -322,6 +435,7 @@ def online_backfill(
     )
     fault_fraction = _parse_fault_fraction(fault_inject_at)
 
+    pass_tc = time.time()
     source = open_sqlite_snapshot(sqlite_path)
     target = None
     started = time.monotonic()
@@ -329,10 +443,7 @@ def online_backfill(
         specs = sqlite_table_specs(source)
         counts = table_counts(source, specs)
         total_rows = sum(counts.values())
-        processed = sum(
-            int((checkpoint["tables"].get(spec.name) or {}).get("rows", 0))
-            for spec in specs
-        )
+        processed = 0
         inserted_by_table: dict[str, int] = {spec.name: 0 for spec in specs}
 
         if _target_factory is None:
@@ -344,9 +455,8 @@ def online_backfill(
             import hermes_state_postgres as hsp
             from hermes_state import SCHEMA_VERSION
 
-            _initialize_target = lambda conn: hsp.init_postgres_schema(
-                conn, SCHEMA_VERSION, defer_indexes=True
-            )
+            def _initialize_target(conn: Any) -> None:
+                hsp.init_postgres_schema(conn, SCHEMA_VERSION, defer_indexes=True)
         _initialize_target(target)
         reconcile_transfer_columns(
             source,
@@ -358,21 +468,27 @@ def online_backfill(
         if not _is_sqlite_target(target):
             _target_raw(target).execute("SET SESSION synchronous_commit = off")
 
-        try:
-            _enforce_budget(target, budget_bytes, checkpoint_path)
-        except BackfillBudgetExceeded:
-            save_checkpoint(checkpoint_path, checkpoint)
-            raise
-
-        sessions_spec: Optional[TableSpec] = None
+        checkpoint["completed"] = False
+        checkpoint["parents_restored"] = False
+        checkpoint["pass_tc"] = pass_tc
         for spec in specs:
-            if spec.name == "sessions":
-                sessions_spec = spec
             table_state = checkpoint["tables"].setdefault(
-                spec.name, {"last_pk": None, "rows": 0, "complete": False}
+                spec.name, {"last_pk": None, "rows": 0}
             )
-            if table_state.get("complete"):
-                continue
+            table_state["tc_prev"] = table_state.get("tc")
+            table_state["complete"] = False
+            if spec.name != "messages":
+                table_state["last_pk"] = None
+                table_state["rows"] = 0
+        fts_state = checkpoint.get("fts")
+        if fts_state is not None:
+            fts_state.update(complete=False, last_pk=None, tc_prev=fts_state.get("tc"))
+        save_checkpoint(checkpoint_path, checkpoint)
+        _enforce_budget(target, budget_bytes, checkpoint_path)
+
+        sessions_spec = next((spec for spec in specs if spec.name == "sessions"), None)
+        for spec in specs:
+            table_state = checkpoint["tables"][spec.name]
             while True:
                 rows = fetch_sqlite_batch(
                     source,
@@ -381,10 +497,19 @@ def online_backfill(
                     batch_rows,
                 )
                 if not rows:
+                    if spec.name == "sessions":
+                        _restore_session_parents(source, target, spec, batch_rows)
+                        checkpoint["parents_restored"] = True
                     table_state["complete"] = True
+                    table_state["tc"] = pass_tc
                     save_checkpoint(checkpoint_path, checkpoint)
                     break
-                inserted_by_table[spec.name] += _copy_batch(target, spec, rows)
+                if spec.name == "messages" and "session_id" in spec.columns:
+                    _ensure_message_sessions(source, target, sessions_spec, rows, batch_rows)
+                    selected = rows
+                else:
+                    selected = _changed_rows(target, spec, rows)
+                inserted_by_table[spec.name] += _copy_batch(target, spec, selected)
                 table_state["last_pk"] = primary_key_from_row(spec, rows[-1])
                 table_state["rows"] = int(table_state.get("rows", 0)) + len(rows)
                 processed += len(rows)
@@ -400,11 +525,6 @@ def online_backfill(
                         f"fault injected after {processed}/{total_rows} rows; "
                         f"resume from {checkpoint_path}"
                     )
-
-        if sessions_spec is not None and not checkpoint.get("parents_restored"):
-            _restore_session_parents(source, target, sessions_spec, batch_rows)
-            checkpoint["parents_restored"] = True
-            save_checkpoint(checkpoint_path, checkpoint)
 
         fts_rows = _backfill_fts(
             target,
@@ -500,6 +620,9 @@ def main(argv: list[str] | None = None) -> int:
     except InjectedBackfillFault as exc:
         print(str(exc), file=sys.stderr)
         return 3
+    except MissingSessionError as exc:
+        print(f"MISSING_SESSION: {exc}", file=sys.stderr)
+        return 5
     elapsed = max(float(summary["elapsed_seconds"]), 1e-9)
     total = sum(summary["rows_by_table"].values())
     print(
