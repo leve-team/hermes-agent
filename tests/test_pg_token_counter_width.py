@@ -10,6 +10,7 @@ import hermes_state_postgres as postgres
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION
 from migrate_state_to_postgres import _copy_batch
 from state_transfer import TableSpec, sqlite_table_specs
+from tests.test_pg3_copy_contract import assert_copy_merge, pg_primary_keys
 from tests.test_pg_schema_parity import _assert_pg_integer_allowlist, _pg_ddl_tables
 
 
@@ -26,11 +27,25 @@ def migration_alters():
     return postgres._split_sql_statements(postgres._PG_TOKEN_COUNTER_MIGRATION_V18.sql)
 
 
+def counter_copy_row(table, column, value):
+    primary_key = pg_primary_keys(postgres.SCHEMA_SQL_POSTGRES)[table]
+    assert column not in primary_key
+    spec = TableSpec(table, (*primary_key, column), primary_key)
+    types = _pg_ddl_tables()[table]
+    row = {
+        key: 1 if types[key] == "BIGINT" else f"test-{key}"
+        for key in primary_key
+    }
+    row[column] = value
+    return spec, row
+
+
 class CatalogDriver:
     """Psycopg boundary fake: catalog types, LIKE inheritance and COPY ranges."""
 
     def __init__(self, *, legacy=False):
         self.tables = _pg_ddl_tables() if legacy else {}
+        self.primary_keys = pg_primary_keys(postgres.SCHEMA_SQL_POSTGRES)
         if legacy:
             for table, column in counter_columns():
                 if not column.endswith("_bytes"):
@@ -114,8 +129,17 @@ class CatalogDriver:
                 assert match, sql
                 table, column, data_type = match.groups()
                 self.tables[table].setdefault(column, data_type.upper())
-        elif sql.startswith('INSERT INTO "') and "ON CONFLICT DO NOTHING" in sql:
+        elif sql.startswith('INSERT INTO "'):
+            assert not params, params
+            assert_copy_merge(
+                sql, tables=self.tables, primary_keys=self.primary_keys,
+                copy_table=self.copy_table, copy_columns=self.copy_columns,
+            )
             self.rowcount = len(self.written)
+        elif re.fullmatch(r'SELECT (?:"\w+", )*"\w+" FROM "\w+" WHERE \((?:"\w+", )*"\w+"\) IN \((?:\(%s(?:, %s)*\)(?:, )?)+\)', sql):
+            # _changed_rows 의 대상 PK 안티조인 — 카탈로그 fake 엔 행이 없으므로 전부 신규.
+            assert params, "anti-join requires primary-key parameters"
+            self.rows = []
         elif sql != "BEGIN" and not sql.startswith("DROP TABLE IF EXISTS"):
             raise AssertionError(f"Unexpected SQL at driver boundary: {sql}")
         return self
@@ -276,20 +300,21 @@ def test_copy_like_inherits_bigint_and_preserves_large_values(table, column, val
     raw = CatalogDriver(legacy=True)
     adapter = postgres._PostgresConnection(raw)
     postgres.init_postgres_schema(adapter, SCHEMA_VERSION, defer_indexes=True)
-    spec = TableSpec(table, (column,), (column,))
-    assert _copy_batch(adapter, spec, [{column: value}]) == 1
+    spec, row = counter_copy_row(table, column, value)
+    assert _copy_batch(adapter, spec, [row]) == 1
+    assert raw.copy_columns == list(spec.columns)
     assert raw.staging[f"_hermes_backfill_{table}"][column] == "BIGINT"
-    assert raw.written == [(value,)]
+    assert raw.written == [tuple(row[name] for name in spec.columns)]
     assert raw.rollbacks == 0
 
 
 def test_copy_without_width_repair_reproduces_integer_overflow():
     raw = CatalogDriver(legacy=True)
-    spec = TableSpec("sessions", ("cache_read_tokens",), ("cache_read_tokens",))
+    spec, row = counter_copy_row("sessions", "cache_read_tokens", 2_690_975_463)
     with pytest.raises(
         OverflowError, match="COPY cache_read_tokens out of range for INTEGER"
     ):
-        _copy_batch(raw, spec, [{"cache_read_tokens": 2_690_975_463}])
+        _copy_batch(raw, spec, [row])
     assert raw.rollbacks == 1
     assert not raw.written
 
@@ -317,11 +342,13 @@ def test_real_sqlite_rows_preserve_reported_values_through_copy():
         adapter = postgres._PostgresConnection(raw)
         postgres.init_postgres_schema(adapter, SCHEMA_VERSION, defer_indexes=True)
         for spec in sqlite_table_specs(source):
+            assert spec.primary_key == raw.primary_keys[spec.name]
             if spec.name not in expected:
                 continue
             row = source.execute(f'SELECT * FROM "{spec.name}"').fetchone()
             raw.written.clear()
             assert _copy_batch(adapter, spec, [row]) == 1
+            assert raw.copy_columns == list(spec.columns)
             copied = dict(zip(spec.columns, raw.written[0], strict=True))
             assert copied["cache_read_tokens"] == expected[spec.name]
             assert (
