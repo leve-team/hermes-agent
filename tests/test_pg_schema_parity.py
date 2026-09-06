@@ -37,6 +37,7 @@ import pytest
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
 from hermes_state_dual import MIGRATED_TABLES
 from hermes_state_postgres import (
+    PG_INTEGER_COLUMNS,
     SCHEMA_SQL_POSTGRES,
     _PG_ONLY_MIGRATIONS,
     _pg_column_type,
@@ -70,8 +71,8 @@ def _sqlite_tables() -> dict:
         ref.close()
 
 
-def _pg_ddl_tables() -> dict:
-    """Table -> column names declared in the SCHEMA_SQL_POSTGRES literal.
+def _pg_ddl_tables(schema_sql=SCHEMA_SQL_POSTGRES) -> dict:
+    """Table -> column names/types declared in the PostgreSQL DDL.
 
     Hand-parsed rather than executed: the literal is PostgreSQL dialect, so
     SQLite cannot run it and no PG server is required.
@@ -83,7 +84,7 @@ def _pg_ddl_tables() -> dict:
     ``REFERENCES``/``PRIMARY KEY (...)`` clauses stay attached to their column.
     """
     # Strip -- line comments before any splitting; their prose contains commas.
-    schema = re.sub(r"--[^\n]*", "", SCHEMA_SQL_POSTGRES)
+    schema = re.sub(r"--[^\n]*", "", schema_sql)
 
     tables = {}
     for match in re.finditer(
@@ -103,7 +104,7 @@ def _pg_ddl_tables() -> dict:
                 current += ch
         parts.append(current)
 
-        columns = []
+        columns = {}
         for part in parts:
             part = part.strip()
             if not part:
@@ -111,7 +112,8 @@ def _pg_ddl_tables() -> dict:
             head = part.split()[0].upper()
             if head in {"PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"}:
                 continue
-            columns.append(part.split()[0])
+            fields = part.split()
+            columns[fields[0]] = fields[1].upper()
         tables[table] = columns
     return tables
 
@@ -211,6 +213,36 @@ def test_migrations_are_not_the_only_home_for_a_column():
     )
 
 
+def _assert_pg_integer_allowlist(schema_sql):
+    integers = {
+        (table, column)
+        for table, columns in _pg_ddl_tables(schema_sql).items()
+        for column, data_type in columns.items()
+        if data_type == "INTEGER"
+    }
+    assert integers == PG_INTEGER_COLUMNS, (
+        f"unreviewed INTEGER columns: {sorted(integers - PG_INTEGER_COLUMNS)}; "
+        f"stale INTEGER allowlist: {sorted(PG_INTEGER_COLUMNS - integers)}"
+    )
+
+
+def test_pg_integer_columns_require_explicit_allowlist():
+    _assert_pg_integer_allowlist(SCHEMA_SQL_POSTGRES)
+
+
+def test_sqlite_postgres_type_width_parity():
+    pg_tables = _pg_ddl_tables()
+    for table, columns in SessionDB._parse_schema_columns(SCHEMA_SQL).items():
+        if table in SQLITE_LOCAL_TABLES:
+            continue
+        for column, declared in columns.items():
+            mapped = _pg_column_type(declared, table=table, column=column)
+            assert mapped is not None, (table, column, declared)
+            assert pg_tables[table][column] == mapped.split()[0], (
+                table, column, declared, pg_tables[table][column]
+            )
+
+
 def test_every_declared_sqlite_type_maps_to_postgres():
     """Every type in SCHEMA_SQL must have a Postgres mapping.
 
@@ -240,7 +272,12 @@ def test_pg_type_mapping_preserves_constraints():
         "DOUBLE PRECISION NOT NULL DEFAULT 0"
     )
     assert _pg_column_type("INTEGER NOT NULL DEFAULT 1") == (
-        "INTEGER NOT NULL DEFAULT 1"
+        "BIGINT NOT NULL DEFAULT 1"
+    )
+    assert _pg_column_type(
+        "INTEGER NOT NULL DEFAULT 0", table="sessions", column="rewind_count"
+    ) == (
+        "INTEGER NOT NULL DEFAULT 0"
     )
     # A typeless SQLite column is a real possibility; TEXT is the safe analogue.
     assert _pg_column_type("") == "TEXT"
