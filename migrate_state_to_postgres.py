@@ -27,6 +27,7 @@ from state_transfer import (
     save_checkpoint,
     sqlite_table_specs,
     table_counts,
+    normalize_row_values,
 )
 
 
@@ -106,7 +107,7 @@ def _enforce_budget(target: Any, budget_bytes: int, checkpoint_path: Path) -> in
 
 
 def _source_values(spec: TableSpec, row: Any) -> tuple[Any, ...]:
-    values = [row[column] for column in spec.columns]
+    values = normalize_row_values(spec, [row[column] for column in spec.columns])
     # sessions has a self-reference.  PK-order loading cannot guarantee a
     # parent sorts before every child, so load the relation as NULL and restore
     # it in one idempotent pass after all session rows exist.
