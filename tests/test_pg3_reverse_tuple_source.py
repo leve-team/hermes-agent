@@ -62,6 +62,19 @@ class TuplePostgresSource:
         assert isinstance(self.connection.execute("SELECT 1").fetchone(), tuple)
 
     def execute(self, sql, params=()):
+        if "information_schema.columns" in sql:
+            assert "table_schema = current_schema()" in sql
+            return self.connection.execute(
+                "SELECT tables.name, columns.name, CASE"
+                " WHEN tables.name = 'messages' AND columns.name = 'fts_content'"
+                " THEN 'tsvector'"
+                " WHEN UPPER(columns.type) = 'REAL' THEN 'double precision'"
+                " WHEN UPPER(columns.type) = 'INTEGER' THEN 'bigint'"
+                " WHEN UPPER(columns.type) = 'BLOB' THEN 'bytea'"
+                " ELSE LOWER(columns.type) END"
+                " FROM sqlite_master AS tables, pragma_table_info(tables.name) AS columns"
+                " WHERE tables.type = 'table'"
+            )
         return self.cursor().execute(sql, params)
 
     def cursor(self):
