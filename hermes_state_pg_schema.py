@@ -53,11 +53,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_reason TEXT,
     message_count INTEGER DEFAULT 0,
     tool_call_count INTEGER DEFAULT 0,
-    input_tokens INTEGER DEFAULT 0,
-    output_tokens INTEGER DEFAULT 0,
-    cache_read_tokens INTEGER DEFAULT 0,
-    cache_write_tokens INTEGER DEFAULT 0,
-    reasoning_tokens INTEGER DEFAULT 0,
+    input_tokens BIGINT DEFAULT 0,
+    output_tokens BIGINT DEFAULT 0,
+    cache_read_tokens BIGINT DEFAULT 0,
+    cache_write_tokens BIGINT DEFAULT 0,
+    reasoning_tokens BIGINT DEFAULT 0,
     cwd TEXT,
     git_branch TEXT,
     git_repo_root TEXT,
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_name TEXT,
     effect_disposition TEXT,
     timestamp DOUBLE PRECISION NOT NULL,
-    token_count INTEGER,
+    token_count BIGINT,
     finish_reason TEXT,
     reasoning TEXT,
     reasoning_content TEXT,
@@ -157,11 +157,11 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     billing_mode TEXT NOT NULL DEFAULT '',
     task TEXT NOT NULL DEFAULT '',
     api_call_count INTEGER NOT NULL DEFAULT 0,
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+    reasoning_tokens BIGINT NOT NULL DEFAULT 0,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     actual_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     cost_status TEXT,
@@ -529,11 +529,11 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             "    billing_mode TEXT NOT NULL DEFAULT '',"
             "    task TEXT NOT NULL DEFAULT '',"
             "    api_call_count INTEGER NOT NULL DEFAULT 0,"
-            "    input_tokens INTEGER NOT NULL DEFAULT 0,"
-            "    output_tokens INTEGER NOT NULL DEFAULT 0,"
-            "    cache_read_tokens INTEGER NOT NULL DEFAULT 0,"
-            "    cache_write_tokens INTEGER NOT NULL DEFAULT 0,"
-            "    reasoning_tokens INTEGER NOT NULL DEFAULT 0,"
+            "    input_tokens BIGINT NOT NULL DEFAULT 0,"
+            "    output_tokens BIGINT NOT NULL DEFAULT 0,"
+            "    cache_read_tokens BIGINT NOT NULL DEFAULT 0,"
+            "    cache_write_tokens BIGINT NOT NULL DEFAULT 0,"
+            "    reasoning_tokens BIGINT NOT NULL DEFAULT 0,"
             "    estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,"
             "    actual_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,"
             "    cost_status TEXT,"
@@ -697,6 +697,61 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
         ),
     ),
 ]
+
+
+_PG_TOKEN_COUNTER_MIGRATION_V18 = PostgresMigration(
+    version=18,
+    sql="""
+ALTER TABLE sessions ALTER COLUMN input_tokens TYPE BIGINT;
+ALTER TABLE sessions ALTER COLUMN output_tokens TYPE BIGINT;
+ALTER TABLE sessions ALTER COLUMN cache_read_tokens TYPE BIGINT;
+ALTER TABLE sessions ALTER COLUMN cache_write_tokens TYPE BIGINT;
+ALTER TABLE sessions ALTER COLUMN reasoning_tokens TYPE BIGINT;
+ALTER TABLE session_model_usage ALTER COLUMN input_tokens TYPE BIGINT;
+ALTER TABLE session_model_usage ALTER COLUMN output_tokens TYPE BIGINT;
+ALTER TABLE session_model_usage ALTER COLUMN cache_read_tokens TYPE BIGINT;
+ALTER TABLE session_model_usage ALTER COLUMN cache_write_tokens TYPE BIGINT;
+ALTER TABLE session_model_usage ALTER COLUMN reasoning_tokens TYPE BIGINT;
+ALTER TABLE messages ALTER COLUMN token_count TYPE BIGINT;
+ALTER TABLE hermes_fts_truncations ALTER COLUMN source_bytes TYPE BIGINT;
+ALTER TABLE hermes_fts_truncations ALTER COLUMN indexed_bytes TYPE BIGINT;
+""",
+)
+
+
+def migrate_postgres_token_counters_v18(conn: Any) -> List[str]:
+    """Apply the required PG3 v18 width repair, including before deferred COPY.
+
+    The upstream pg-only ledger already uses v18 for optional trigram indexes.
+    Its presence must not suppress this repair, nor may an optional-extension
+    failure swallow an ALTER failure. Catalog types are the independent,
+    idempotent completion marker; the existing migration ledger is untouched.
+    Missing/unsupported types fail closed, and partially applied repairs retry
+    only remaining INTEGER columns on the next initialization.
+    """
+    raw = conn.raw if hasattr(conn, "raw") else conn
+    live_types = {
+        (table, column): data_type
+        for table, column, data_type in raw.execute(
+            "SELECT table_name, column_name, data_type"
+            " FROM information_schema.columns"
+            " WHERE table_schema = current_schema()"
+        ).fetchall()
+    }
+    altered = []
+    for statement in _split_sql_statements(_PG_TOKEN_COUNTER_MIGRATION_V18.sql):
+        words = statement.split()
+        table, column = words[2], words[5]
+        data_type = live_types.get((table, column))
+        if data_type == "bigint":
+            continue
+        if data_type != "integer":
+            raise RuntimeError(
+                f"PG3 v18 counter width: {table}.{column} has type {data_type!r}"
+            )
+        raw.execute(statement)
+        altered.append(f"{table}.{column}")
+    return altered
 
 
 def plan_postgres_migrations(
@@ -963,6 +1018,7 @@ def init_postgres_schema(
     for statement in _schema_statements(_POSTGRES_TABLE_SQL):
         raw.execute(statement)
     reconcile_postgres_columns(conn, SCHEMA_SQL)
+    migrate_postgres_token_counters_v18(conn)
     if not defer_indexes:
         apply_postgres_migrations(conn)
         for statement in _schema_statements(_POSTGRES_INDEX_SQL):
@@ -980,6 +1036,7 @@ def finalize_postgres_schema(conn: Any) -> None:
     """Build deferred base/GIN indexes after a bulk COPY has completed."""
     raw = conn.raw if hasattr(conn, "raw") else conn
     reconcile_postgres_columns(conn, SCHEMA_SQL)
+    migrate_postgres_token_counters_v18(conn)
     apply_postgres_migrations(conn)
     for statement in _schema_statements(_POSTGRES_INDEX_SQL):
         raw.execute(statement)
@@ -1077,14 +1134,57 @@ def postgres_migration_version(conn: Any) -> int:
 # SCHEMA_SQL uses today. Anything else fails reconciliation (see above).
 _PG_TYPE_MAP = {
     "TEXT": "TEXT",
-    "INTEGER": "INTEGER",
+    "INTEGER": "BIGINT",
     "REAL": "DOUBLE PRECISION",
     "BLOB": "BYTEA",
     "": "TEXT",  # SQLite allows a typeless column; TEXT is the safe analogue
 }
 
 
-def _pg_column_type(declared: str) -> Optional[str]:
+# Counters that are genuinely narrow (flags, small counts, pids, versions) and
+# stay INTEGER on PostgreSQL. Every other SQLite INTEGER maps to BIGINT so token
+# counters cannot overflow; the parity test requires this allowlist to be
+# reviewed explicitly whenever an INTEGER column is declared.
+PG_INTEGER_COLUMNS = frozenset({
+    ("async_delegations", "delivery_attempts"),
+    ("async_delegations", "owner_pid"),
+    ("async_delegations", "owner_started_at"),
+    ("conversation_generations", "generation"),
+    ("delivery_obligations", "attempts"),
+    ("delivery_obligations", "owner_pid"),
+    ("delivery_obligations", "owner_started_at"),
+    ("gateway_heartbeats", "pid"),
+    ("gateway_hygiene_state", "failure_streak"),
+    ("levos_control_tower_delivery", "attempt_no"),
+    ("levos_control_tower_delivery", "inject_ok"),
+    ("levos_control_tower_event", "interval_open"),
+    ("messages", "_compressed_summary"),
+    ("messages", "active"),
+    ("messages", "compacted"),
+    ("messages", "display_only"),
+    ("messages", "display_order"),
+    ("messages", "observed"),
+    ("pg_migration_version", "version"),
+    ("schema_version", "version"),
+    ("session_model_usage", "api_call_count"),
+    ("session_turn_leases", "lease_epoch"),
+    ("sessions", "api_call_count"),
+    ("sessions", "archived"),
+    ("sessions", "compression_fallback_streak"),
+    ("sessions", "compression_ineffective_count"),
+    ("sessions", "expiry_finalized"),
+    ("sessions", "git_metadata_generation"),
+    ("sessions", "hidden"),
+    ("sessions", "message_count"),
+    ("sessions", "pinned"),
+    ("sessions", "rewind_count"),
+    ("sessions", "tool_call_count"),
+})
+
+
+def _pg_column_type(
+    declared: str, *, table: str = "", column: str = ""
+) -> Optional[str]:
     """Map a SQLite column declaration to its Postgres equivalent.
 
     *declared* is what ``_parse_schema_columns`` reconstructs — a base type
@@ -1105,6 +1205,8 @@ def _pg_column_type(declared: str) -> Optional[str]:
     mapped = _PG_TYPE_MAP.get(base)
     if mapped is None:
         return None
+    if base == "INTEGER" and (table, column) in PG_INTEGER_COLUMNS:
+        mapped = "INTEGER"
     return " ".join([mapped, *tail]) if tail else mapped
 
 
@@ -1149,7 +1251,9 @@ def reconcile_postgres_columns(conn: Any, schema_sql: str) -> List[str]:
         for column_name, declared_type in columns.items():
             if column_name in live_cols:
                 continue
-            pg_type = _pg_column_type(declared_type)
+            pg_type = _pg_column_type(
+                declared_type, table=table_name, column=column_name
+            )
             if pg_type is None:
                 raise RuntimeError(
                     f"PostgreSQL schema cannot represent {table_name}.{column_name} "
