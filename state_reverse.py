@@ -14,10 +14,12 @@ from typing import Any, Callable, Optional, Sequence
 
 from state_diff import state_diff_connections
 from state_transfer import (
+    POSTGRES_DERIVED_COLUMNS,
     TableSpec,
     load_checkpoint,
     primary_key_from_row,
     quote_identifier,
+    reconcile_transfer_columns,
     save_checkpoint,
     sqlite_table_specs,
 )
@@ -230,6 +232,15 @@ def reverse_backfill(
     started = time.monotonic()
     try:
         specs = sqlite_table_specs(target)
+        reconcile_transfer_columns(
+            source,
+            target,
+            specs,
+            source_dialect=source_dialect,
+            target_dialect="sqlite",
+            excluded_columns=POSTGRES_DERIVED_COLUMNS,
+        )
+        specs = sqlite_table_specs(target, excluded_columns=POSTGRES_DERIVED_COLUMNS)
         counts = {
             spec.name: int(
                 _row_value(

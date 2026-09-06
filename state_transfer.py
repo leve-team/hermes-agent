@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -15,6 +16,17 @@ from hermes_state_dual import MIGRATED_TABLES
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+logger = logging.getLogger("levos.state_transfer")
+POSTGRES_DERIVED_COLUMNS = frozenset({("messages", "fts_content")})
+_SQLITE_TO_POSTGRES_TYPES = {
+    "REAL": "DOUBLE PRECISION",
+    "INTEGER": "BIGINT",
+    "TEXT": "TEXT",
+    "BLOB": "BYTEA",
+}
+_POSTGRES_TO_SQLITE_TYPES = {
+    postgres: sqlite for sqlite, postgres in _SQLITE_TO_POSTGRES_TYPES.items()
+}
 
 
 @dataclass(frozen=True)
@@ -43,7 +55,11 @@ def open_sqlite_snapshot(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def sqlite_table_specs(conn: sqlite3.Connection) -> list[TableSpec]:
+def sqlite_table_specs(
+    conn: sqlite3.Connection,
+    *,
+    excluded_columns: Iterable[tuple[str, str]] = (),
+) -> list[TableSpec]:
     """Return PG3-migrated tables in dependency-safe load order."""
     available = {
         str(row[0])
@@ -51,22 +67,105 @@ def sqlite_table_specs(conn: sqlite3.Connection) -> list[TableSpec]:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
     }
+    excluded = set(excluded_columns)
     specs: list[TableSpec] = []
     for table in MIGRATED_TABLES:
         if table not in available:
             continue
         info = conn.execute(f"PRAGMA table_info({quote_identifier(table)})").fetchall()
-        columns = tuple(str(row[1]) for row in info)
+        columns = tuple(
+            str(row[1]) for row in info if (table, str(row[1])) not in excluded
+        )
         primary_key = tuple(
             str(row[1])
             for row in sorted(
                 (row for row in info if int(row[5]) > 0), key=lambda row: int(row[5])
             )
         )
-        if not primary_key:
+        if not primary_key or not set(primary_key).issubset(columns):
             raise RuntimeError(f"migrated state table {table!r} has no primary key")
         specs.append(TableSpec(table, columns, primary_key))
     return specs
+
+
+def _transfer_column_types(
+    conn: Any, dialect: str, specs: Sequence[TableSpec]
+) -> dict[str, dict[str, str]]:
+    raw = getattr(conn, "raw", conn)
+    tables: dict[str, dict[str, str]] = {spec.name: {} for spec in specs}
+    if dialect == "sqlite":
+        for table in tables:
+            tables[table] = {
+                str(row[1]): str(row[2]).strip().upper()
+                for row in raw.execute(
+                    f"PRAGMA table_info({quote_identifier(table)})"
+                ).fetchall()
+            }
+    elif dialect == "postgres":
+        for table, column, data_type in raw.execute(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns"
+            " WHERE table_schema = current_schema()"
+        ).fetchall():
+            if table in tables:
+                tables[table][column] = data_type.upper()
+    else:
+        raise ValueError(f"unsupported transfer dialect: {dialect!r}")
+    return tables
+
+
+def reconcile_transfer_columns(
+    source: Any,
+    target: Any,
+    specs: Sequence[TableSpec],
+    *,
+    source_dialect: str,
+    target_dialect: str,
+    excluded_columns: Iterable[tuple[str, str]] = (),
+) -> list[str]:
+    """Preserve source-only columns as nullable columns before transferring rows.
+
+    Inspect the pinned source snapshot, never the core DDL. Unsupported extra
+    types, absent tables and DDL errors fail closed before COPY or watermarks.
+    Defaults and constraints are deliberately not imported across dialects.
+    """
+    source_types = _transfer_column_types(source, source_dialect, specs)
+    target_types = _transfer_column_types(target, target_dialect, specs)
+    excluded = set(excluded_columns)
+    pending: list[tuple[str, str]] = []
+    for table, columns in source_types.items():
+        if not columns or not target_types[table]:
+            raise RuntimeError(
+                f"transfer schema: missing source/target table {table!r}"
+            )
+        for column, declared_type in columns.items():
+            if column in target_types[table] or (table, column) in excluded:
+                continue
+            sqlite_type = (
+                declared_type
+                if source_dialect == "sqlite"
+                else _POSTGRES_TO_SQLITE_TYPES.get(declared_type)
+            )
+            if sqlite_type not in _SQLITE_TO_POSTGRES_TYPES:
+                raise RuntimeError(
+                    f"transfer schema: unsupported {source_dialect} type"
+                    f" {declared_type!r} for {table}.{column}"
+                )
+            target_type = (
+                sqlite_type
+                if target_dialect == "sqlite"
+                else _SQLITE_TO_POSTGRES_TYPES[sqlite_type]
+            )
+            guard = " IF NOT EXISTS" if target_dialect == "postgres" else ""
+            pending.append((
+                f"{table}.{column}",
+                f"ALTER TABLE {quote_identifier(table)} ADD COLUMN{guard}"
+                f" {quote_identifier(column)} {target_type}",
+            ))
+    raw = getattr(target, "raw", target)
+    for name, statement in pending:
+        raw.execute(statement)
+        logger.info("transfer schema: accepted extra column %s (%s)", name, statement)
+    return [name for name, _statement in pending]
 
 
 def fetch_sqlite_batch(

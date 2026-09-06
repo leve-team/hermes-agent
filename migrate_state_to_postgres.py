@@ -23,6 +23,7 @@ from state_transfer import (
     open_sqlite_snapshot,
     primary_key_from_row,
     quote_identifier,
+    reconcile_transfer_columns,
     save_checkpoint,
     sqlite_table_specs,
     table_counts,
@@ -346,6 +347,13 @@ def online_backfill(
                 conn, SCHEMA_VERSION, defer_indexes=True
             )
         _initialize_target(target)
+        reconcile_transfer_columns(
+            source,
+            target,
+            specs,
+            source_dialect="sqlite",
+            target_dialect="sqlite" if _is_sqlite_target(target) else "postgres",
+        )
         if not _is_sqlite_target(target):
             _target_raw(target).execute("SET SESSION synchronous_commit = off")
 
