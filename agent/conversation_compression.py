@@ -1724,7 +1724,9 @@ def _lower_threshold_to_aux_context(
     recomputed_threshold = None
     if main_ctx and isinstance(compressor, _CC):
         recomputed_threshold = _CC._compute_threshold_tokens(
-            main_ctx, _CC._effective_threshold_percent(main_ctx, safe_pct / 100),
+            main_ctx, _CC._effective_threshold_percent(
+                main_ctx, safe_pct / 100, getattr(compressor, "model", None), getattr(compressor, "provider", None),
+            ),
             getattr(compressor, "max_tokens", None),
         )
     threshold_suggestion_viable = recomputed_threshold is None or recomputed_threshold <= aux_context

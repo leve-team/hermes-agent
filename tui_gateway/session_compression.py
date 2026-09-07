@@ -131,7 +131,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         getattr(agent, "model", "") or "", cc.model_thresholds, pct, getattr(agent, "provider", "") or "",
     )
     try:
-        cc.threshold_percent = cc._effective_threshold_percent(cc.context_length, base)
+        cc.threshold_percent = cc._effective_threshold_percent(cc.context_length, base, cc.model, cc.provider)
     except Exception:
         cc.threshold_percent = pct
     raw_ctx = model_cfg.get("context_length")

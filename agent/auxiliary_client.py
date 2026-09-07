@@ -624,6 +624,19 @@ def _fixed_temperature_for_model(
     return 0.5 if _is_arcee_trinity_thinking(model) else None
 
 
+def _levos_codex_compression_threshold(
+    model: Optional[str], provider: Optional[str] = None,
+) -> Optional[float]:
+    if (provider or "").strip().lower() != "openai-codex":
+        return None
+    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if bare_model.startswith("gpt-6-astra"):
+        return 0.60
+    if bare_model.startswith("gpt-5.6-sol"):
+        return 0.30
+    return None
+
+
 def _compression_threshold_for_model(
     model: Optional[str], provider: Optional[str] = None, *,
     allow_codex_gpt55_autoraise: bool = True,
@@ -632,13 +645,11 @@ def _compression_threshold_for_model(
 
     Arcee Trinity Large Thinking → 0.75 (preserve reasoning context); Codex-route gpt-5.4/5.5/5.6/Astra
     → 0.85, gated by ``allow_codex_gpt55_autoraise``; Codex-route gpt-5.3-codex-spark → 0.70, ungated.
+    Levos Astra / Sol on the openai-codex route → fixed 0.60 / 0.30 (checked first, ungated).
     """
-    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
-    if (
-        (provider or "").strip().lower() == "openai-codex"
-        and bare_model.startswith("gpt-5.6-sol")
-    ):
-        return 0.3
+    route_threshold = _levos_codex_compression_threshold(model, provider)
+    if route_threshold is not None:
+        return route_threshold
     if _is_arcee_trinity_thinking(model):
         return 0.75
     if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):

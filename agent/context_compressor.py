@@ -1785,7 +1785,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 custom_providers=self.custom_providers,
             )
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
-            self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
+            self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent, self.model, self.provider)
             self._emit_init_summary_once()
         return self._resolved_context_length
 
@@ -1802,7 +1802,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Re-apply the raise-only floor so percent and tokens derive from the same window.
         _base = getattr(self, "_base_threshold_percent", None)
         if _base is not None:
-            self.threshold_percent = self._effective_threshold_percent(value, _base)
+            self.threshold_percent = self._effective_threshold_percent(value, _base, self.model, self.provider)
         self._threshold_tokens = self._tail_token_budget = self._max_summary_tokens = None
         self._emit_init_summary_once()
 
@@ -2188,7 +2188,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Re-resolve from the raw config value so a switch away from an overridden model falls back correctly.
         _config_pct = getattr(self, "_config_threshold_percent", self.threshold_percent)
         self._base_threshold_percent = resolve_model_threshold(model, self.model_thresholds, _config_pct, provider)
-        self.threshold_percent = self._effective_threshold_percent(context_length, self._base_threshold_percent)
+        self.threshold_percent = self._effective_threshold_percent(context_length, self._base_threshold_percent, self.model, self.provider)
         # max_tokens=None means "unspecified": keep the existing output reservation.
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
@@ -2250,8 +2250,20 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                 self.threshold_tokens = _effective_cap
 
     @staticmethod
-    def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
-        """Raise-only small-context threshold floor: models under 512K trigger at >= 75%."""
+    def _effective_threshold_percent(
+        context_length: int, threshold_percent: float,
+        model: Optional[str] = None, provider: Optional[str] = None,
+    ) -> float:
+        """Honor fixed Levos Codex routes, otherwise the raise-only small-context floor.
+
+        Models under 512K trigger at >= 75%; an explicitly higher threshold always
+        wins. Levos Astra/Sol on openai-codex return their fixed route threshold.
+        """
+        from agent.auxiliary_client import _levos_codex_compression_threshold
+
+        route_threshold = _levos_codex_compression_threshold(model, provider)
+        if route_threshold is not None:
+            return route_threshold
         if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
             return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent
