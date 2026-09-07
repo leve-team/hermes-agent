@@ -2743,6 +2743,11 @@ def get_model_context_length(
     sol_route_model = _strip_provider_prefix(model).strip().lower().rsplit("/", 1)[-1]
     if (
         (provider or "").strip().lower() == "openai-codex"
+        and sol_route_model.startswith("gpt-6-astra")
+    ):
+        return 900000
+    if (
+        (provider or "").strip().lower() == "openai-codex"
         and sol_route_model.startswith("gpt-5.6-sol")
     ):
         return 272000

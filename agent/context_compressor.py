@@ -2915,11 +2915,10 @@ class ContextCompressor(ContextEngine):
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
 
-    @staticmethod
     def _effective_threshold_percent(
-        context_length: int, threshold_percent: float,
+        self, context_length: int, threshold_percent: float,
     ) -> float:
-        """Apply the small-context threshold floor (raise-only).
+        """Honor fixed Levos Codex routes, otherwise apply the raise-only floor.
 
         Models under ``_SMALL_CTX_WINDOW_LIMIT`` (512K) trigger at no less
         than ``_SMALL_CTX_THRESHOLD_PERCENT`` (75%) of the window.  An
@@ -2928,6 +2927,11 @@ class ContextCompressor(ContextEngine):
         Large-context models keep the configured value — at 512K+ the default
         50% trigger already leaves ample post-compaction headroom.
         """
+        from agent.auxiliary_client import _levos_codex_compression_threshold
+
+        route_threshold = _levos_codex_compression_threshold(self.model, self.provider)
+        if route_threshold is not None:
+            return route_threshold
         if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
             return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent

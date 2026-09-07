@@ -727,6 +727,19 @@ def _fixed_temperature_for_model(
     return None
 
 
+def _levos_codex_compression_threshold(
+    model: Optional[str], provider: Optional[str] = None,
+) -> Optional[float]:
+    if (provider or "").strip().lower() != "openai-codex":
+        return None
+    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if bare_model.startswith("gpt-6-astra"):
+        return 0.60
+    if bare_model.startswith("gpt-5.6-sol"):
+        return 0.30
+    return None
+
+
 def _compression_threshold_for_model(
     model: Optional[str],
     provider: Optional[str] = None,
@@ -740,6 +753,7 @@ def _compression_threshold_for_model(
     compression and preserve more raw context.
 
     Per-model/route overrides:
+      - Levos Astra / Sol on openai-codex → fixed 0.60 / 0.30.
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
       - gpt-5.4 / gpt-5.5 / gpt-5.6 on the Codex OAuth route → 0.85, because
         Codex caps all three families at 272K and the default 50% trigger
@@ -756,12 +770,9 @@ def _compression_threshold_for_model(
     Returns a float in (0, 1] to override the global ``compression.threshold``
     config value, or ``None`` to leave the user's config value unchanged.
     """
-    bare_model = (model or "").strip().lower().rsplit("/", 1)[-1]
-    if (
-        (provider or "").strip().lower() == "openai-codex"
-        and bare_model.startswith("gpt-5.6-sol")
-    ):
-        return 0.3
+    route_threshold = _levos_codex_compression_threshold(model, provider)
+    if route_threshold is not None:
+        return route_threshold
     if _is_arcee_trinity_thinking(model):
         return 0.75
     if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
