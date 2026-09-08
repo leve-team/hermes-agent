@@ -118,7 +118,16 @@ def _iter_table(
         clauses.append(f"{quote_identifier('updated_at')} <= ?")
         params.append(cutoff)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    cursor = conn.cursor()
+    # Postgres: a plain client-side cursor materialises the whole result set in
+    # process memory before the first fetchmany() (psycopg3 default), which OOM-
+    # killed the 1Gi broker on a 553k-row messages full diff (X1-p, 2026-09-08).
+    # A named (server-side) cursor streams `itersize` rows per round-trip. It
+    # needs a transaction, so autocommit connections are wrapped explicitly.
+    if dialect == "postgres":
+        cursor = conn.cursor(name=f"hermes_diff_{spec.name}_{id(spec) & 0xFFFF:x}")
+        cursor.itersize = batch_rows
+    else:
+        cursor = conn.cursor()
     try:
         cursor.execute(
             _pg_sql(
