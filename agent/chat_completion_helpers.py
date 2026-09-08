@@ -622,6 +622,39 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     return anthropic_kwargs
 
 
+def _merge_attribution_metadata(agent, anthropic_kwargs: dict) -> dict:
+    """Send ``levos:<profile>:<session_id>:<user_id>:<task_id>`` on Messages.
+
+    ``_user_id`` is the explicit AIAgent gateway identity; the TUI does not
+    supply it. Do not infer an operator from message text or ambient session
+    env. Only the dispatcher's process-scoped HERMES_KANBAN_TASK is a card ID;
+    ``_current_task_id`` is regenerated per turn and must never route requests.
+    Freeze all axes on the agent for each session so later context changes
+    cannot change the load balancer's metadata.user_id sticky hash.
+    """
+    try:
+        session_id = getattr(agent, "session_id", None)
+        cached = getattr(agent, "_attribution_metadata", None)
+        if cached is None or cached[0] != session_id:
+            axes = (
+                os.environ.get("HERMES_PROFILE"),
+                session_id,
+                getattr(agent, "_user_id", None),
+                os.environ.get("HERMES_KANBAN_TASK"),
+            )
+            value = "levos:" + ":".join(
+                str(axis).replace(":", "_") if axis is not None else ""
+                for axis in axes
+            )
+            agent._attribution_metadata = (session_id, value)
+        else:
+            value = cached[1]
+        anthropic_kwargs.setdefault("metadata", {})["user_id"] = value
+    except Exception as exc:
+        logger.debug("attribution metadata merge failed: %s", exc)
+    return anthropic_kwargs
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -1848,6 +1881,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
+        anthropic_kwargs = _merge_attribution_metadata(agent, anthropic_kwargs)
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
         # on its Messages route the same way it does on /chat/completions, but
         # the profile hook that produces them is only consulted by the
