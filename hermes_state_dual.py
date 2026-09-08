@@ -24,6 +24,31 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 
 DUAL_TIMEOUT_SECONDS = 2.0
+# 한 배치가 이 예산 안에 못 들어갈 것으로 보이면 동기 복제를 시도하지 않고 곧바로
+# 저널에 넣는다(fail-open 의 취지 — primary 는 절대 붙잡지 않는다).
+#
+# 2026-09-09 X1-p-18b 실측: `archive_and_compact` 는 세션 하나를 통째로 비활성화하며
+# mutation 383~463 건 + `UPDATE messages SET active=0 … WHERE session_id=? AND active=1`
+# 이 1,351 행 1.46 초였다. 여기에 INSERT 400 건이 같은 배치에 붙어 2 초를 넘겼고,
+# 그 실패가 뒤따르는 작은 배치(단독 재현 시 0.02 초)까지 연쇄로 무너뜨렸다.
+# 임계값은 그 실측의 하한 쪽에 둔다: mutation 수는 100 (관측된 대량 배치의 1/4),
+# rowcount 합은 200 (1,351 의 1/6). 통상 배치는 mutation 2 · rowcount 1 이라
+# 임계에 한참 못 미친다 — 일상 경로는 종전과 동일하게 동기 복제된다.
+DUAL_BATCH_MUTATION_LIMIT = 100
+DUAL_BATCH_ROWCOUNT_LIMIT = 200
+
+
+def batch_exceeds_budget(mutations: "Sequence[Mutation]") -> bool:
+    """동기 복제를 시도하지 않고 저널로 보낼 배치인지."""
+    if len(mutations) > DUAL_BATCH_MUTATION_LIMIT:
+        return True
+    total = sum(max(0, m.expected_rowcount) for m in mutations)
+    return total > DUAL_BATCH_ROWCOUNT_LIMIT
+
+
+class DualBatchDeferred(RuntimeError):
+    """예산 초과로 동기 복제를 건너뛰고 저널에 맡긴 배치."""
+
 
 # Core tables that have a PostgreSQL counterpart.  Keep this tuple stable: the
 # extra ledgers below are owned by writers outside SessionDB and have a
@@ -415,6 +440,14 @@ class DualWriteReplicator:
     ) -> str:
         if not mutations:
             return "empty"
+        if not replay and batch_exceeds_budget(mutations):
+            # 동기 경로에서만 미룬다. replay 는 백그라운드라 예산 밖이며, 미루면
+            # 저널이 영원히 안 비므로 반드시 시도한다.
+            raise DualBatchDeferred(
+                f"batch of {len(mutations)} mutation(s) / "
+                f"{sum(max(0, m.expected_rowcount) for m in mutations)} row(s) "
+                "exceeds the synchronous dual-write budget"
+            )
         self.inject("during_replay" if replay else "before_pg_apply")
         target = self.connection_factory(self.dsn, self.timeout_s)
         timer: Optional[threading.Timer] = None
@@ -438,9 +471,19 @@ class DualWriteReplicator:
                 return "already_applied"
             for mutation in mutations:
                 cursor = target.execute(mutation.sql, mutation.params)
+                # replay 는 저널 기록 시점보다 늦게 돈다. 조건부 UPDATE/DELETE
+                # (`WHERE … AND active = 1` 류)는 "그 시점에 참인 행"을 대상으로
+                # 하므로 늦은 replay 에서 rowcount 가 줄어드는 것이 정상이다
+                # (2026-09-09 저널 #4: expected 871 vs 실제 다름 → 영구 복구 불가).
+                # 그래서 replay 에서는 초과만 이상으로 본다. 동기 경로의 엄격한
+                # 등가 계약은 그대로다.
+                mismatch = (
+                    cursor.rowcount > mutation.expected_rowcount
+                    if replay
+                    else cursor.rowcount != mutation.expected_rowcount
+                )
                 if mutation.operation in {"update", "delete"} and (
-                    mutation.expected_rowcount >= 0
-                    and cursor.rowcount != mutation.expected_rowcount
+                    mutation.expected_rowcount >= 0 and mismatch
                 ):
                     raise DualApplyMismatch(
                         f"{mutation.table} {mutation.operation} affected "
