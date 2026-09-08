@@ -76,6 +76,36 @@ def row_hash(columns: Sequence[str], row: Any) -> str:
     return hashlib.sha256(canonical_row_json(columns, row).encode("utf-8")).hexdigest()
 
 
+def normalized_row(
+    columns: Sequence[str], row: Any, *, ignored_columns: Iterable[str] = ()
+) -> tuple[Any, ...]:
+    """Comparison-only projection of a row, in ``columns`` order.
+
+    ``row_hash`` costs a JSON dump plus a SHA-256 (and a UTF-8 encode) per row
+    on BOTH sides; on the 553k-row ``messages`` table that CPU dominated the
+    X1-p bootstrap window (2026-09-08: full diff 44.9s > 44.85s budget while
+    RSS stayed at 290MiB and I/O was idle). Equality of these tuples is exactly
+    equality of ``canonical_row_json`` — same ``_normalize_value`` (bool→int,
+    int/float kept distinct, float via repr so -0.0 != 0.0, memoryview/bytes,
+    datetime.isoformat) and the same legacy-prefix pass, so the malformed-NUL
+    SourceValueError still fires. The type tag keeps values that normalise to
+    equal-looking scalars (e.g. 1 vs 1.0) apart the way the JSON keys did.
+
+    Every column is normalised before any comparison happens — no short circuit
+    — so a bad NUL in a late column stays a tool error instead of degrading
+    into a plain ``differ``.
+    """
+    ignored = frozenset(ignored_columns)
+    return tuple(
+        (type(value).__name__, value)
+        for index, column in enumerate(columns)
+        if column not in ignored
+        for value in (
+            _normalize_value(normalize_legacy_content_prefix(_row_value(row, column, index))),
+        )
+    )
+
+
 def _row_value(row: Any, column: str, index: int) -> Any:
     try:
         return row[column]
@@ -346,7 +376,11 @@ def _compare_table(
             right = _next(target_rows)
             continue
         if not repair_extra_only:
-            if row_hash(spec.columns, left) == row_hash(spec.columns, right):
+            # 해시가 아니라 정규화 행 튜플을 직접 비교한다 — 판정은 동일하고
+            # (report/samples 는 kind·table·pk 만 쓴다) 행당 SHA-256+UTF-8
+            # 인코딩이 사라진다. 공개 canonical_row_json/row_hash 는 그대로다
+            # (hermes_state_read.py 의 primary/shadow 읽기 비교가 쓴다).
+            if normalized_row(spec.columns, left) == normalized_row(spec.columns, right):
                 table_report["matched"] += 1
             else:
                 table_report["differ"] += 1
