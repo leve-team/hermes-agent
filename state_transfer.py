@@ -18,6 +18,7 @@ from hermes_state_dual import MIGRATED_TABLES
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 logger = logging.getLogger("levos.state_transfer")
 POSTGRES_DERIVED_COLUMNS = frozenset({("messages", "fts_content")})
+MESSAGE_MUTABLE_COLUMNS = ("observed", "display_only", "active", "compacted")
 _SQLITE_TO_POSTGRES_TYPES = {
     "REAL": "DOUBLE PRECISION",
     "INTEGER": "BIGINT",
