@@ -8526,7 +8526,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # and here loses instead of being silently overwritten.
             cursor = conn.execute(
                 "UPDATE sessions SET title = ?, title_source = ? "
-                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                "WHERE id = ? AND title IS NOT DISTINCT FROM ? AND title_source IS NOT DISTINCT FROM ?",
                 (
                     title,
                     source if title else None,
@@ -10547,7 +10547,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND role = 'user' AND active = 1 "
                 "ORDER BY id DESC LIMIT 1"
-                ") AND content IS ?",
+                ") AND content IS NOT DISTINCT FROM ?",
                 (_scrub_surrogates(api_content), session_id, encoded),
             )
             return cursor.rowcount
