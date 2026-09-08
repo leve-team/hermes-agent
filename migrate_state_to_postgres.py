@@ -10,14 +10,19 @@ The source is read-only; checkpoints advance only after committed batches.
 from __future__ import annotations
 
 import argparse
+import base64
+import datetime as dt
+import json
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Iterator, Optional, Sequence
 
 from state_transfer import (
+    MESSAGE_MUTABLE_COLUMNS,
     TableSpec,
     fetch_sqlite_batch,
     load_checkpoint,
@@ -34,6 +39,7 @@ from state_transfer import (
 
 DEFAULT_BATCH_ROWS = 5_000
 DEFAULT_BUDGET_BYTES = 41 * 1024 * 1024 * 1024
+DEFAULT_RECONCILE_RATIO = 0.05
 IMMUTABLE_TABLES = frozenset({"system_prompts"})
 LOOKUP_BATCH_ROWS = 100
 
@@ -55,6 +61,15 @@ class InjectedBackfillFault(RuntimeError):
 
 class MissingSessionError(RuntimeError):
     """A message's parent or ancestor is absent from target and source snapshot."""
+
+
+class ReconcileRatioExceeded(RuntimeError):
+    """Target-only rows exceeded the operator-approved deletion ratio."""
+
+    def __init__(self, report: dict[str, Any]):
+        self.report = report
+        tables = ", ".join(item["table"] for item in report["violations"])
+        super().__init__(f"reconcile delete ratio exceeded for: {tables}")
 
 
 def _resolve_sqlite_path(explicit: str | None) -> Path:
@@ -224,6 +239,481 @@ def _changed_rows(target: Any, spec: TableSpec, rows: Sequence[Any]) -> list[Any
             ):
                 selected.append(row)
     return selected
+
+
+def _projected_value(row: Any, columns: Sequence[str], column: str) -> Any:
+    try:
+        return row[column]
+    except (KeyError, TypeError, IndexError):
+        return row[columns.index(column)]
+
+
+def _projected_key(
+    spec: TableSpec, columns: Sequence[str], row: Any
+) -> tuple[Any, ...]:
+    return tuple(_projected_value(row, columns, column) for column in spec.primary_key)
+
+
+def _keyset_rows(
+    conn: Any,
+    spec: TableSpec,
+    columns: Sequence[str],
+    batch_rows: int,
+) -> Iterator[Any]:
+    """Stream a projection without a client-side or server-side full result set."""
+    columns_sql = ", ".join(quote_identifier(column) for column in columns)
+    primary_key_sql = ", ".join(
+        quote_identifier(column) for column in spec.primary_key
+    )
+    last_key: Optional[tuple[Any, ...]] = None
+    while True:
+        params: tuple[Any, ...]
+        if last_key is None:
+            where = ""
+            params = (batch_rows,)
+        elif len(spec.primary_key) == 1:
+            where = f" WHERE {quote_identifier(spec.primary_key[0])} > ?"
+            params = (*last_key, batch_rows)
+        else:
+            placeholders = ", ".join("?" for _ in spec.primary_key)
+            where = f" WHERE ({primary_key_sql}) > ({placeholders})"
+            params = (*last_key, batch_rows)
+        rows = conn.execute(
+            f"SELECT {columns_sql} FROM {quote_identifier(spec.name)}"
+            f"{where} ORDER BY {primary_key_sql} LIMIT ?",
+            params,
+        ).fetchall()
+        if not rows:
+            return
+        yield from rows
+        last_key = _projected_key(spec, columns, rows[-1])
+
+
+def _next_row(rows: Iterator[Any]) -> Any:
+    try:
+        return next(rows)
+    except StopIteration:
+        return None
+
+
+def _message_update_columns(spec: TableSpec) -> tuple[str, ...]:
+    """Columns updated in place by SessionDB after a message INSERT."""
+    return tuple(column for column in MESSAGE_MUTABLE_COLUMNS if column in spec.columns)
+
+
+def _write_message_updates(
+    target: Any,
+    spec: TableSpec,
+    columns: Sequence[str],
+    rows: Sequence[Any],
+) -> int:
+    if not rows:
+        return 0
+    assignments = ", ".join(
+        f"{quote_identifier(column)} = ?" for column in columns
+    )
+    where = " AND ".join(
+        f"{quote_identifier(column)} = ?" for column in spec.primary_key
+    )
+    parameters = [
+        tuple(_projected_value(row, (*spec.primary_key, *columns), column) for column in columns)
+        + _projected_key(spec, (*spec.primary_key, *columns), row)
+        for row in rows
+    ]
+    target.execute("BEGIN")
+    try:
+        target.executemany(
+            f"UPDATE {quote_identifier(spec.name)} SET {assignments} WHERE {where}",
+            parameters,
+        )
+        target.commit()
+    except BaseException:
+        target.rollback()
+        raise
+    return len(rows)
+
+
+def _rescan_message_updates(
+    source: sqlite3.Connection,
+    target: Any,
+    spec: TableSpec,
+    *,
+    batch_rows: int,
+    checkpoint_path: Path,
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair pre-watermark message flags by a full, narrow PK-ordered scan."""
+    mutable = _message_update_columns(spec)
+    state = checkpoint.setdefault("message_update_rescan", {})
+    state.update(
+        complete=False,
+        columns=list(mutable),
+        last_pk=None,
+        rows=0,
+        updated=0,
+        tc_prev=state.get("tc"),
+    )
+    save_checkpoint(checkpoint_path, checkpoint)
+    started = time.monotonic()
+    if not mutable:
+        state.update(complete=True, tc=checkpoint["pass_tc"], elapsed_seconds=0.0)
+        save_checkpoint(checkpoint_path, checkpoint)
+        return dict(state)
+
+    columns = (*spec.primary_key, *mutable)
+    source_rows = _keyset_rows(source, spec, columns, batch_rows)
+    target_rows = _keyset_rows(target, spec, columns, batch_rows)
+    left = _next_row(source_rows)
+    right = _next_row(target_rows)
+    pending: list[Any] = []
+    while left is not None:
+        left_key = _projected_key(spec, columns, left)
+        while right is not None and _projected_key(spec, columns, right) < left_key:
+            right = _next_row(target_rows)
+        if right is not None and _projected_key(spec, columns, right) == left_key:
+            if any(
+                _projected_value(left, columns, column)
+                != _projected_value(right, columns, column)
+                for column in mutable
+            ):
+                pending.append(left)
+        state["rows"] = int(state["rows"]) + 1
+        state["last_pk"] = list(left_key)
+        if len(pending) >= batch_rows:
+            state["updated"] = int(state["updated"]) + _write_message_updates(
+                target, spec, mutable, pending
+            )
+            pending.clear()
+            save_checkpoint(checkpoint_path, checkpoint)
+        left = _next_row(source_rows)
+
+    state["updated"] = int(state["updated"]) + _write_message_updates(
+        target, spec, mutable, pending
+    )
+    state.update(
+        complete=True,
+        tc=checkpoint["pass_tc"],
+        elapsed_seconds=time.monotonic() - started,
+    )
+    save_checkpoint(checkpoint_path, checkpoint)
+    return dict(state)
+
+
+def _extra_primary_keys(
+    source: sqlite3.Connection,
+    target: Any,
+    spec: TableSpec,
+    batch_rows: int,
+) -> Iterator[tuple[Any, ...]]:
+    """Yield target PKs absent from the authoritative source in sorted order."""
+    columns = spec.primary_key
+    source_rows = _keyset_rows(source, spec, columns, batch_rows)
+    target_rows = _keyset_rows(target, spec, columns, batch_rows)
+    left = _next_row(source_rows)
+    right = _next_row(target_rows)
+    while right is not None:
+        right_key = _projected_key(spec, columns, right)
+        while left is not None and _projected_key(spec, columns, left) < right_key:
+            left = _next_row(source_rows)
+        if left is None or right_key < _projected_key(spec, columns, left):
+            yield right_key
+        right = _next_row(target_rows)
+
+
+def _target_columns(target: Any, spec: TableSpec) -> tuple[str, ...]:
+    if _is_sqlite_target(target):
+        return tuple(
+            str(row[1])
+            for row in target.execute(
+                f"PRAGMA table_info({quote_identifier(spec.name)})"
+            ).fetchall()
+        )
+    return tuple(
+        str(row[0])
+        for row in target.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ? "
+            "ORDER BY ordinal_position",
+            (spec.name,),
+        ).fetchall()
+    )
+
+
+def _target_rows_for_keys(
+    target: Any,
+    spec: TableSpec,
+    columns: Sequence[str],
+    keys: Sequence[tuple[Any, ...]],
+) -> list[Any]:
+    if not keys:
+        return []
+    columns_sql = ", ".join(quote_identifier(column) for column in columns)
+    key_sql = ", ".join(quote_identifier(column) for column in spec.primary_key)
+    slots = "(" + ", ".join("?" for _ in spec.primary_key) + ")"
+    parameters = tuple(value for key in keys for value in key)
+    rows = target.execute(
+        f"SELECT {columns_sql} FROM {quote_identifier(spec.name)} "
+        f"WHERE ({key_sql}) IN ({', '.join(slots for _ in keys)}) "
+        f"ORDER BY {key_sql}",
+        parameters,
+    ).fetchall()
+    observed = [_projected_key(spec, columns, row) for row in rows]
+    if observed != list(keys):
+        raise RuntimeError(
+            f"target changed while backing up {spec.name}; "
+            f"expected {len(keys)} rows, found {len(rows)}"
+        )
+    return rows
+
+
+def _backup_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return {
+            "type": "bytes",
+            "base64": base64.b64encode(bytes(value)).decode("ascii"),
+        }
+    if isinstance(value, (dt.date, dt.time, dt.datetime)):
+        return {"type": type(value).__name__, "isoformat": value.isoformat()}
+    return {"type": type(value).__name__, "text": str(value)}
+
+
+def _backup_extra_rows(
+    source: sqlite3.Connection,
+    target: Any,
+    spec: TableSpec,
+    *,
+    extra_count: int,
+    batch_rows: int,
+    path: Path,
+) -> None:
+    """Atomically stream complete target rows to a private JSON backup."""
+    columns = _target_columns(target, spec)
+    if not columns or not set(spec.primary_key).issubset(columns):
+        raise RuntimeError(f"cannot determine complete target shape for {spec.name}")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temp_path = Path(handle.name)
+    written = 0
+    try:
+        with handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "table": spec.name,
+                        "primary_key": list(spec.primary_key),
+                        "columns": list(columns),
+                        "row_count": extra_count,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )[:-1]
+            )
+            handle.write(',"rows":[')
+            pending: list[tuple[Any, ...]] = []
+            for key in _extra_primary_keys(source, target, spec, batch_rows):
+                pending.append(key)
+                if len(pending) < LOOKUP_BATCH_ROWS:
+                    continue
+                written += _write_backup_batch(
+                    handle, target, spec, columns, pending, written
+                )
+                pending.clear()
+            written += _write_backup_batch(
+                handle, target, spec, columns, pending, written
+            )
+            if written != extra_count:
+                raise RuntimeError(
+                    f"target changed while backing up {spec.name}; "
+                    f"expected {extra_count} rows, wrote {written}"
+                )
+            handle.write("]}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_backup_batch(
+    handle: Any,
+    target: Any,
+    spec: TableSpec,
+    columns: Sequence[str],
+    keys: Sequence[tuple[Any, ...]],
+    already_written: int,
+) -> int:
+    rows = _target_rows_for_keys(target, spec, columns, keys)
+    for offset, row in enumerate(rows):
+        if already_written + offset:
+            handle.write(",")
+        payload = {
+            "pk": [_backup_json_value(value) for value in keys[offset]],
+            "row": {
+                column: _backup_json_value(_projected_value(row, columns, column))
+                for column in columns
+            },
+        }
+        json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    return len(rows)
+
+
+def _delete_key_batch(
+    target: Any,
+    spec: TableSpec,
+    keys: Sequence[tuple[Any, ...]],
+) -> int:
+    if not keys:
+        return 0
+    if spec.name == "sessions":
+        target.executemany(
+            "UPDATE sessions SET parent_session_id = NULL "
+            "WHERE parent_session_id = ?",
+            [(key[0],) for key in keys],
+        )
+    where = " AND ".join(
+        f"{quote_identifier(column)} = ?" for column in spec.primary_key
+    )
+    target.executemany(
+        f"DELETE FROM {quote_identifier(spec.name)} WHERE {where}", keys
+    )
+    return len(keys)
+
+
+def reconcile_deletes(
+    source: sqlite3.Connection,
+    target: Any,
+    specs: Sequence[TableSpec],
+    *,
+    ratio_limit: float,
+    batch_rows: int,
+    backup_dir: Path,
+    checkpoint_path: Path,
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    """Back up and remove PG-only rows after a global ratio preflight."""
+    if not 0 < ratio_limit <= 1:
+        raise ValueError("reconcile ratio must be in (0, 1]")
+    started = time.monotonic()
+    table_reports: dict[str, dict[str, Any]] = {}
+    violations: list[dict[str, Any]] = []
+    for spec in specs:
+        table_started = time.monotonic()
+        target_rows = int(
+            target.execute(
+                f"SELECT COUNT(*) FROM {quote_identifier(spec.name)}"
+            ).fetchone()[0]
+        )
+        extra = sum(
+            1 for _key in _extra_primary_keys(source, target, spec, batch_rows)
+        )
+        ratio = extra / target_rows if target_rows else 0.0
+        table_reports[spec.name] = {
+            "target_rows": target_rows,
+            "extra": extra,
+            "extra_ratio": ratio,
+            "deleted": 0,
+            "backup_path": None,
+            "elapsed_seconds": time.monotonic() - table_started,
+        }
+        if extra and ratio > ratio_limit:
+            violations.append(
+                {
+                    "table": spec.name,
+                    "extra": extra,
+                    "target_rows": target_rows,
+                    "extra_ratio": ratio,
+                    "ratio_limit": ratio_limit,
+                }
+            )
+
+    reconcile_tc = time.time()
+    report: dict[str, Any] = {
+        "reconcile_tc": reconcile_tc,
+        "ratio_limit": ratio_limit,
+        "complete": False,
+        "tables": table_reports,
+        "violations": violations,
+        "elapsed_seconds": time.monotonic() - started,
+    }
+    checkpoint["reconcile_tc"] = reconcile_tc
+    checkpoint["reconcile"] = report
+    save_checkpoint(checkpoint_path, checkpoint)
+    if violations:
+        raise ReconcileRatioExceeded(report)
+
+    for spec in specs:
+        extra = int(table_reports[spec.name]["extra"])
+        if not extra:
+            continue
+        backup_path = backup_dir / f"{spec.name}.json"
+        backup_started = time.monotonic()
+        _backup_extra_rows(
+            source,
+            target,
+            spec,
+            extra_count=extra,
+            batch_rows=batch_rows,
+            path=backup_path,
+        )
+        table_reports[spec.name]["backup_path"] = str(backup_path)
+        table_reports[spec.name]["elapsed_seconds"] += (
+            time.monotonic() - backup_started
+        )
+
+    target.execute("BEGIN")
+    try:
+        for spec in reversed(specs):
+            expected = int(table_reports[spec.name]["extra"])
+            if not expected:
+                continue
+            delete_started = time.monotonic()
+            deleted = 0
+            pending: list[tuple[Any, ...]] = []
+            for key in _extra_primary_keys(source, target, spec, batch_rows):
+                pending.append(key)
+                if len(pending) < batch_rows:
+                    continue
+                deleted += _delete_key_batch(target, spec, pending)
+                pending.clear()
+            deleted += _delete_key_batch(target, spec, pending)
+            if deleted != expected:
+                raise RuntimeError(
+                    f"target changed while deleting {spec.name}; "
+                    f"expected {expected} rows, deleted {deleted}"
+                )
+            table_reports[spec.name]["deleted"] = deleted
+            table_reports[spec.name]["elapsed_seconds"] += (
+                time.monotonic() - delete_started
+            )
+        target.commit()
+    except BaseException:
+        target.rollback()
+        raise
+
+    report.update(
+        complete=True,
+        elapsed_seconds=time.monotonic() - started,
+    )
+    checkpoint["reconcile"] = report
+    save_checkpoint(checkpoint_path, checkpoint)
+    return report
 
 
 def _update_session_parents(target: Any, rows: Sequence[Any]) -> None:
@@ -417,6 +907,9 @@ def online_backfill(
     batch_rows: int = DEFAULT_BATCH_ROWS,
     budget_bytes: int = DEFAULT_BUDGET_BYTES,
     fault_inject_at: str | float | None = None,
+    reconcile_deletes_enabled: bool = False,
+    reconcile_ratio: float = DEFAULT_RECONCILE_RATIO,
+    reconcile_backup_dir: Optional[Path] = None,
     _target_factory: Optional[Callable[[str], Any]] = None,
     _initialize_target: Optional[Callable[[Any], None]] = None,
     _finalize_target: Optional[Callable[[Any], None]] = None,
@@ -425,6 +918,8 @@ def online_backfill(
         raise ValueError("batch_rows must be greater than zero")
     if budget_bytes <= 0:
         raise ValueError("budget_bytes must be greater than zero")
+    if not 0 < reconcile_ratio <= 1:
+        raise ValueError("reconcile ratio must be in (0, 1]")
     sqlite_path = Path(sqlite_path)
     checkpoint_path = checkpoint_path or default_checkpoint_path(sqlite_path)
     checkpoint = load_checkpoint(
@@ -487,6 +982,7 @@ def online_backfill(
         _enforce_budget(target, budget_bytes, checkpoint_path)
 
         sessions_spec = next((spec for spec in specs if spec.name == "sessions"), None)
+        messages_spec = next((spec for spec in specs if spec.name == "messages"), None)
         for spec in specs:
             table_state = checkpoint["tables"][spec.name]
             while True:
@@ -525,6 +1021,34 @@ def online_backfill(
                         f"fault injected after {processed}/{total_rows} rows; "
                         f"resume from {checkpoint_path}"
                     )
+
+        message_update_rescan = None
+        if resume and messages_spec is not None:
+            message_update_rescan = _rescan_message_updates(
+                source,
+                target,
+                messages_spec,
+                batch_rows=batch_rows,
+                checkpoint_path=checkpoint_path,
+                checkpoint=checkpoint,
+            )
+
+        reconcile_report = None
+        if reconcile_deletes_enabled:
+            backup_dir = reconcile_backup_dir or (
+                checkpoint_path.parent
+                / f"{checkpoint_path.name}.reconcile-{int(pass_tc * 1_000_000)}"
+            )
+            reconcile_report = reconcile_deletes(
+                source,
+                target,
+                specs,
+                ratio_limit=reconcile_ratio,
+                batch_rows=batch_rows,
+                backup_dir=backup_dir,
+                checkpoint_path=checkpoint_path,
+                checkpoint=checkpoint,
+            )
 
         fts_rows = _backfill_fts(
             target,
@@ -566,6 +1090,8 @@ def online_backfill(
             "fts_truncated_rows": int(
                 (checkpoint.get("fts") or {}).get("truncated_rows", 0)
             ),
+            "message_update_rescan": message_update_rescan,
+            "reconcile": reconcile_report,
             "nul_rows": 0,
             "field_check": {
                 "sessions_checked": source_sessions,
@@ -602,7 +1128,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-rows", type=int, default=DEFAULT_BATCH_ROWS)
     parser.add_argument("--budget-bytes", type=int, default=DEFAULT_BUDGET_BYTES)
     parser.add_argument("--fault-inject-at")
+    parser.add_argument(
+        "--reconcile-deletes",
+        action="store_true",
+        help="back up and delete target-only rows after the incremental pass",
+    )
+    parser.add_argument(
+        "--force-reconcile-ratio",
+        type=float,
+        default=DEFAULT_RECONCILE_RATIO,
+        help="maximum target-only row ratio (default: 0.05)",
+    )
+    parser.add_argument("--reconcile-backup-dir")
     args = parser.parse_args(argv)
+    if not DEFAULT_RECONCILE_RATIO <= args.force_reconcile_ratio <= 1:
+        parser.error(
+            "--force-reconcile-ratio must be between the default 0.05 and 1"
+        )
     sqlite_path = _resolve_sqlite_path(args.sqlite_path)
     try:
         summary = migrate(
@@ -613,6 +1155,13 @@ def main(argv: list[str] | None = None) -> int:
             batch_rows=args.batch_rows,
             budget_bytes=args.budget_bytes,
             fault_inject_at=args.fault_inject_at,
+            reconcile_deletes_enabled=args.reconcile_deletes,
+            reconcile_ratio=args.force_reconcile_ratio,
+            reconcile_backup_dir=(
+                Path(args.reconcile_backup_dir)
+                if args.reconcile_backup_dir
+                else None
+            ),
         )
     except BackfillBudgetExceeded as exc:
         print(f"DISK_GUARD: {exc}", file=sys.stderr)
@@ -623,12 +1172,22 @@ def main(argv: list[str] | None = None) -> int:
     except MissingSessionError as exc:
         print(f"MISSING_SESSION: {exc}", file=sys.stderr)
         return 5
+    except ReconcileRatioExceeded as exc:
+        print(
+            json.dumps(
+                {"error": "RECONCILE_RATIO", **exc.report}, sort_keys=True
+            ),
+            file=sys.stderr,
+        )
+        return 2
     elapsed = max(float(summary["elapsed_seconds"]), 1e-9)
     total = sum(summary["rows_by_table"].values())
     print(
         f"OK backfilled {total} rows in {elapsed:.3f}s "
         f"({total / elapsed:.1f} rows/s); checkpoint={summary['checkpoint_path']}"
     )
+    if summary["reconcile"] is not None:
+        print(json.dumps({"reconcile": summary["reconcile"]}, sort_keys=True))
     return 0
 
 

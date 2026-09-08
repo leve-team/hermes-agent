@@ -7,7 +7,9 @@ import datetime as dt
 import hashlib
 import json
 import sqlite3
+import struct
 import sys
+import tempfile
 import time
 from contextlib import closing
 from pathlib import Path
@@ -20,6 +22,7 @@ from hermes_state_dual import (
     load_coverage,
 )
 from state_transfer import (
+    MESSAGE_MUTABLE_COLUMNS,
     TableSpec,
     open_sqlite_snapshot,
     quote_identifier,
@@ -34,6 +37,7 @@ RC_UNREACHABLE = 2
 RECENT_WATERMARK_SECONDS = 300.0
 DEFAULT_BATCH_ROWS = 2_000
 SAMPLE_LIMIT = 20
+_BIGINT_BYTES = struct.calcsize("<q")
 
 
 def _normalize_value(value: Any) -> dict[str, Any]:
@@ -313,6 +317,7 @@ def _compare_table(
     report: dict[str, Any],
     writer: Optional[RepairWriter],
     repair_extra_only: bool = False,
+    matched_keys: Optional[Any] = None,
 ) -> None:
     source_rows = _iter_table(
         source,
@@ -382,6 +387,12 @@ def _compare_table(
             # (hermes_state_read.py 의 primary/shadow 읽기 비교가 쓴다).
             if normalized_row(spec.columns, left) == normalized_row(spec.columns, right):
                 table_report["matched"] += 1
+                if matched_keys is not None:
+                    if len(left_key) != 1 or not isinstance(left_key[0], int):
+                        raise RuntimeError(
+                            f"two-pass key spool requires one integer PK: {spec.name}"
+                        )
+                    matched_keys.write(struct.pack("<q", left_key[0]))
             else:
                 table_report["differ"] += 1
                 _append_sample(report["samples"], "differ", spec, left_key)
@@ -389,6 +400,88 @@ def _compare_table(
                     writer.upsert(spec, left)
         left = _next(source_rows)
         right = _next(target_rows)
+
+
+def _message_pass_specs(spec: TableSpec) -> tuple[TableSpec, TableSpec]:
+    fast = tuple(
+        dict.fromkeys(
+            (*spec.primary_key, *(column for column in MESSAGE_MUTABLE_COLUMNS if column in spec.columns))
+        )
+    )
+    deferred = tuple(
+        (*spec.primary_key, *(column for column in spec.columns if column not in fast))
+    )
+    return (
+        TableSpec(spec.name, fast, spec.primary_key),
+        TableSpec(spec.name, deferred, spec.primary_key),
+    )
+
+
+def _matched_key_batches(spool: Any, batch_rows: int) -> Iterator[list[tuple[int]]]:
+    spool.seek(0)
+    while True:
+        block = spool.read(_BIGINT_BYTES * batch_rows)
+        if not block:
+            return
+        if len(block) % _BIGINT_BYTES:
+            raise RuntimeError("corrupt two-pass matched-key spool")
+        yield [
+            (value,)
+            for (value,) in struct.iter_unpack("<q", block)
+        ]
+
+
+def _rows_for_keys(
+    conn: Any,
+    spec: TableSpec,
+    keys: Sequence[tuple[Any, ...]],
+    *,
+    dialect: str,
+) -> list[Any]:
+    columns_sql = ", ".join(quote_identifier(column) for column in spec.columns)
+    key_sql = ", ".join(quote_identifier(column) for column in spec.primary_key)
+    slots = "(" + ", ".join("?" for _ in spec.primary_key) + ")"
+    rows = conn.execute(
+        _pg_sql(
+            f"SELECT {columns_sql} FROM {quote_identifier(spec.name)} "
+            f"WHERE ({key_sql}) IN ({', '.join(slots for _ in keys)}) "
+            f"ORDER BY {key_sql}",
+            dialect,
+        ),
+        tuple(value for key in keys for value in key),
+    ).fetchall()
+    if [_key(spec, row) for row in rows] != list(keys):
+        raise RuntimeError(
+            f"{spec.name} snapshot changed between full-diff passes"
+        )
+    return rows
+
+
+def _compare_matched_payloads(
+    source: Any,
+    target: Any,
+    spec: TableSpec,
+    matched_keys: Any,
+    *,
+    source_dialect: str,
+    target_dialect: str,
+    batch_rows: int,
+    report: dict[str, Any],
+) -> None:
+    """Compare every deferred column for keys equal in the narrow first pass."""
+    table_report = report["tables"][spec.name]
+    for keys in _matched_key_batches(matched_keys, batch_rows):
+        source_rows = _rows_for_keys(
+            source, spec, keys, dialect=source_dialect
+        )
+        target_rows = _rows_for_keys(
+            target, spec, keys, dialect=target_dialect
+        )
+        for key, left, right in zip(keys, source_rows, target_rows):
+            if normalized_row(spec.columns, left) != normalized_row(spec.columns, right):
+                table_report["matched"] -= 1
+                table_report["differ"] += 1
+                _append_sample(report["samples"], "differ", spec, key)
 
 
 def state_diff_connections(
@@ -402,6 +495,7 @@ def state_diff_connections(
     cutoff: Optional[float] = None,
     repair_writer: Optional[RepairWriter] = None,
     batch_rows: int = DEFAULT_BATCH_ROWS,
+    two_pass_full: bool = True,
 ) -> dict[str, Any]:
     if specs is None:
         if source_dialect != "sqlite":
@@ -424,18 +518,50 @@ def state_diff_connections(
     }
     try:
         for spec in selected:
-            _compare_table(
-                source,
-                target,
-                spec,
-                source_dialect=source_dialect,
-                target_dialect=target_dialect,
-                since=since,
-                cutoff=cutoff,
-                batch_rows=batch_rows,
-                report=report,
-                writer=repair_writer,
-            )
+            if (
+                two_pass_full
+                and since is None
+                and repair_writer is None
+                and spec.name == "messages"
+            ):
+                fast_spec, deferred_spec = _message_pass_specs(spec)
+                with tempfile.TemporaryFile(mode="w+b") as matched_keys:
+                    _compare_table(
+                        source,
+                        target,
+                        fast_spec,
+                        source_dialect=source_dialect,
+                        target_dialect=target_dialect,
+                        since=None,
+                        cutoff=None,
+                        batch_rows=batch_rows,
+                        report=report,
+                        writer=None,
+                        matched_keys=matched_keys,
+                    )
+                    _compare_matched_payloads(
+                        source,
+                        target,
+                        deferred_spec,
+                        matched_keys,
+                        source_dialect=source_dialect,
+                        target_dialect=target_dialect,
+                        batch_rows=batch_rows,
+                        report=report,
+                    )
+            else:
+                _compare_table(
+                    source,
+                    target,
+                    spec,
+                    source_dialect=source_dialect,
+                    target_dialect=target_dialect,
+                    since=since,
+                    cutoff=cutoff,
+                    batch_rows=batch_rows,
+                    report=report,
+                    writer=repair_writer,
+                )
         if repair_writer is not None:
             repair_writer.flush()
             # Delete target-only rows in reverse dependency order so messages

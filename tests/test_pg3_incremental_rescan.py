@@ -19,7 +19,8 @@ CREATE TABLE sessions (
 );
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES sessions(id),
-    content TEXT NOT NULL
+    content TEXT NOT NULL, observed INTEGER DEFAULT 0, display_only INTEGER DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1, compacted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE session_model_usage (
     session_id TEXT REFERENCES sessions(id), model TEXT, input_tokens INTEGER,
@@ -124,7 +125,8 @@ class TransferHarness:
             )
             if message_id is not None:
                 connection.execute(
-                    "INSERT INTO messages VALUES (?, ?, ?)", (message_id, session_id, "hello")
+                    "INSERT INTO messages (id, session_id, content) VALUES (?, ?, ?)",
+                    (message_id, session_id, "hello"),
                 )
 
     def saved(self):
@@ -192,7 +194,8 @@ def test_partial_messages_resume_after_completed_sessions(transfer):
     transfer.add_session("middle", message_id=1)
     with sqlite3.connect(transfer.source) as source:
         source.executemany(
-            "INSERT INTO messages VALUES (?, 'middle', 'hello')", [(index,) for index in range(2, 6)]
+            "INSERT INTO messages (id, session_id, content) VALUES (?, 'middle', 'hello')",
+            [(index,) for index in range(2, 6)],
         )
     with pytest.raises(migration.InjectedBackfillFault):
         transfer.run(fault_inject_at="50%")
@@ -280,6 +283,64 @@ def test_updates_backdated_keys_parent_clear_and_two_idempotent_resumes(transfer
         transfer.assert_same()
 
 
+def test_pre_watermark_message_flags_are_repaired_by_narrow_rescan(transfer):
+    transfer.add_session("middle", message_id=1)
+    with sqlite3.connect(transfer.source) as source:
+        source.execute(
+            "INSERT INTO messages (id, session_id, content) VALUES (2, 'middle', 'newer')"
+        )
+    transfer.run()
+    with sqlite3.connect(transfer.source) as source:
+        source.execute(
+            "UPDATE messages SET observed=1, display_only=1, active=0, compacted=1 "
+            "WHERE id=1"
+        )
+
+    summary = transfer.run(resume=True)
+
+    assert transfer.target_rows(
+        "SELECT observed, display_only, active, compacted FROM messages WHERE id=1"
+    ) == [(1, 1, 0, 1)]
+    saved = transfer.saved()
+    assert saved["tables"]["messages"]["last_pk"] == [2]
+    assert saved["message_update_rescan"]["last_pk"] == [2]
+    assert saved["message_update_rescan"]["columns"] == [
+        "observed", "display_only", "active", "compacted"
+    ]
+    assert saved["message_update_rescan"]["updated"] == 1
+    assert summary["message_update_rescan"]["complete"] is True
+
+
+def test_message_rescan_excludes_content_but_watermark_inserts_new_rows(transfer):
+    transfer.add_session("middle", message_id=1)
+    transfer.run()
+    with sqlite3.connect(transfer.source) as source:
+        source.execute("UPDATE messages SET content='historical edit' WHERE id=1")
+        source.execute(
+            "INSERT INTO messages (id, session_id, content) VALUES (2, 'middle', 'new row')"
+        )
+
+    transfer.run(resume=True)
+
+    assert transfer.target_rows(
+        "SELECT id, content FROM messages ORDER BY id"
+    ) == [(1, "hello"), (2, "new row")]
+
+
+def test_message_merge_mutable_columns_include_flags(transfer):
+    source = open_sqlite_snapshot(transfer.source)
+    try:
+        spec = next(spec for spec in sqlite_table_specs(source) if spec.name == "messages")
+        assert migration._mutable_columns(spec) == (
+            "session_id", "content", "observed", "display_only", "active", "compacted"
+        )
+        assert migration._message_update_columns(spec) == (
+            "observed", "display_only", "active", "compacted"
+        )
+    finally:
+        source.close()
+
+
 def test_foreign_key_repair_copies_parent_and_ancestor_first(transfer):
     transfer.add_session("middle", message_id=1)
     transfer.run()
@@ -305,7 +366,10 @@ def test_source_orphan_fails_without_advancing_message_checkpoint(transfer):
     transfer.add_session("middle", message_id=1)
     transfer.run()
     with sqlite3.connect(transfer.source) as source:
-        source.execute("INSERT INTO messages VALUES (2, 'deleted-parent', 'orphan')")
+        source.execute(
+            "INSERT INTO messages (id, session_id, content) "
+            "VALUES (2, 'deleted-parent', 'orphan')"
+        )
 
     with pytest.raises(migration.MissingSessionError, match="deleted-parent.*message_ids=\\[2\\]"):
         transfer.run(resume=True)
@@ -416,7 +480,10 @@ def test_pk_conflict_policies_and_constraint_rollback(transfer, postgres_protoco
         session["title"] = "changed"
         assert migration._copy_batch(target, specs["sessions"], [session]) == 1
         assert connection.execute("SELECT title FROM sessions").fetchone() == ("changed",)
-        message = {"id": 1, "session_id": "middle", "content": "changed"}
+        message = {
+            "id": 1, "session_id": "middle", "content": "changed",
+            "observed": 0, "display_only": 0, "active": 1, "compacted": 0,
+        }
         assert migration._copy_batch(target, specs["messages"], [message]) == 1
         assert connection.execute("SELECT content FROM messages").fetchone() == ("changed",)
         prompt = {"hash": "immutable", "prompt": "original"}
@@ -425,8 +492,8 @@ def test_pk_conflict_policies_and_constraint_rollback(transfer, postgres_protoco
         assert connection.execute("SELECT prompt FROM system_prompts").fetchone() == ("original",)
         with pytest.raises(sqlite3.IntegrityError):
             migration._copy_batch(target, specs["messages"], [
-                {"id": 2, "session_id": "middle", "content": "valid"},
-                {"id": 3, "session_id": "middle", "content": None},
+                dict(message, id=2, content="valid"),
+                dict(message, id=3, content=None),
             ])
         assert connection.execute("SELECT COUNT(*) FROM messages").fetchone() == (1,)
         connection.execute("CREATE UNIQUE INDEX unique_title ON sessions(title)")
