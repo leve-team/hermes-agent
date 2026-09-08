@@ -458,6 +458,46 @@ def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dic
     return anthropic_kwargs
 
 
+def _merge_attribution_metadata(agent, anthropic_kwargs: dict) -> dict:
+    """Send ``levos:<profile>:<session_id>:<user_id>:<task_id>`` on Messages.
+
+    ``_user_id`` is the explicit AIAgent gateway identity; the TUI does not
+    supply it. Do not infer an operator from message text or ambient session
+    env. Only the dispatcher's process-scoped HERMES_KANBAN_TASK is a card ID;
+    ``_current_task_id`` is regenerated per turn and must never route requests.
+    Freeze all axes on the agent for each session so later context changes
+    cannot change the load balancer's metadata.user_id sticky hash.
+    """
+    try:
+        session_id = getattr(agent, "session_id", None)
+        cached = getattr(agent, "_attribution_metadata", None)
+        if cached is None or cached[0] != session_id:
+            axes = (
+                os.environ.get("HERMES_PROFILE"),
+                session_id,
+                getattr(agent, "_user_id", None),
+                os.environ.get("HERMES_KANBAN_TASK"),
+            )
+            value = "levos:" + ":".join(
+                str(axis).replace(":", "_") if axis is not None else ""
+                for axis in axes
+            )
+            agent._attribution_metadata = (session_id, value)
+        else:
+            value = cached[1]
+        anthropic_kwargs.setdefault("metadata", {})["user_id"] = value
+    except Exception as exc:
+        logger.debug("attribution metadata merge failed: %s", exc)
+    return anthropic_kwargs
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters: delta
     string lengths plus a framing floor (~3x cheaper than ``len(repr(chunk))``
@@ -1248,6 +1288,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         base_url=getattr(agent, "_anthropic_base_url", None),
         fast_mode=request_overrides.get("speed") == "fast",
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
+    anthropic_kwargs = _merge_attribution_metadata(agent, anthropic_kwargs)
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
     return _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs)
