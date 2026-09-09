@@ -115,3 +115,37 @@ def test_api_server_cache_is_wired_to_the_helper_not_a_pinned_path():
     assert 'SessionDB(db_path=home / "state.db")' not in window, (
         "프로필별 세션 DB 캐시가 여전히 db_path 를 고정해 SQLite 를 연다"
     )
+
+
+def test_seam_uses_process_env_dsn_only_for_the_active_profile(monkeypatch, tmp_path):
+    """활성 프로필 == 대상 프로필일 때만 이 프로세스의 HERMES_STATE_* DSN 을 쓴다."""
+    import importlib
+    hsp = importlib.import_module("hermes_state_postgres")
+    monkeypatch.setattr(hsp, "_is_active_profile", lambda canon: canon == "dave")
+    monkeypatch.setenv("HERMES_STATE_POSTGRES_DSN", "postgresql://env/dsn")
+    seen = {}
+
+    class _FakeDB:
+        _is_postgres = True
+
+        def __init__(self, postgres_dsn=None, read_only=False, **kw):
+            seen["dsn"] = postgres_dsn
+
+        def close(self):
+            pass
+
+    hs = importlib.import_module("hermes_state")
+    monkeypatch.setattr(hs, "SessionDB", _FakeDB)
+    # profile_dir 준비: config.yaml 만 authority, .env 없음
+    profiles = tmp_path / "profiles"
+    for name in ("dave", "opsi"):
+        d = profiles / name
+        d.mkdir(parents=True)
+        (d / "config.yaml").write_text("sessions:\n  state_backend: authority\n")
+    from hermes_cli import profiles as profiles_mod
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda c: c in ("dave", "opsi"))
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda c: profiles / c)
+    hsp.open_store_for_profile("dave")
+    assert seen.get("dsn") == "postgresql://env/dsn"
+    with pytest.raises(RuntimeError, match="no DSN"):
+        hsp.open_store_for_profile("opsi")

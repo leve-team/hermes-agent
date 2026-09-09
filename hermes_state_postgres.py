@@ -2702,6 +2702,21 @@ def open_store_for_profile(
         dsn = _dsn_from_profile_env(profile_dir, include_core=backend == "probe")
         if not dsn:
             dsn = (sessions_cfg.get("postgres_dsn") or "").strip()
+        if not dsn and _is_active_profile(canon):
+            # The target IS this process's profile, so this process's own
+            # HERMES_STATE_* env names exactly the store the profile selected —
+            # there is no "wrong physical store" to guard against. Deployments
+            # inject the credential-bearing DSN as a container env from a
+            # Secret (never a file in the PVC), so a profile in the recommended
+            # shape — backend in config.yaml, DSN only in env — was unreadable
+            # by its own gateway's per-profile readers (2026-09-09 Y3 #4:
+            # api_server's cache went through this seam, found no DSN, and the
+            # profile fell back to SQLite while authority ran on Postgres).
+            # Peer profiles still never see the active process's env.
+            for key in _ENV_DSN_KEYS:
+                dsn = (os.environ.get(key) or "").strip()
+                if dsn:
+                    break
         if not dsn:
             raise RuntimeError(
                 f"profile '{canon}' has sessions.state_backend = {backend!r} "
@@ -2752,6 +2767,18 @@ def open_store_for_profile(
     from hermes_state import SessionDB
 
     return SessionDB(db_path=db_path, read_only=read_only)
+
+
+def _is_active_profile(canon: str) -> bool:
+    """True when *canon* names the profile this process runs as."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        active = (get_active_profile_name() or "").strip()
+    except Exception:
+        active = ""
+    if not active:
+        active = (os.environ.get("HERMES_PROFILE") or "").strip()
+    return bool(active) and active == canon
 
 
 def profile_selects_postgres(profile_name: str) -> bool:
