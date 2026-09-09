@@ -1144,8 +1144,22 @@ def home_selects_postgres(profile_home: Any) -> bool:
     return backend in {"authority", "probe"}
 
 
-def open_store_for_home(profile_home: Any, read_only: bool = False) -> Any:
-    """Open an explicit home's configured store without changing process-wide state."""
+def open_store_for_home(
+    profile_home: Any, read_only: bool = False, *, allow_process_env: bool = False
+) -> Any:
+    """Open an explicit home's configured store without changing process-wide state.
+
+    ``allow_process_env`` is set only by ``open_store_for_profile`` when the
+    target IS this process's own profile: then this process's ``HERMES_STATE_*``
+    env names exactly the store the profile selected, so it may serve as the
+    last-resort DSN. Deployments inject the credential-bearing DSN as a
+    container env from a Secret (never a file in the PVC), so a profile in the
+    recommended shape — backend in config.yaml, DSN only in env — was otherwise
+    unreadable by its own gateway's per-profile readers (2026-09-09 Y3 #4:
+    api_server's cache went through this seam, found no DSN, and the profile
+    fell back to SQLite while authority ran on Postgres). Peer profiles never
+    see the active process's env.
+    """
     from pathlib import Path
     from hermes_state import SessionDB
 
@@ -1160,6 +1174,11 @@ def open_store_for_home(profile_home: Any, read_only: bool = False) -> Any:
     dsn = _dsn_from_profile_env(home, include_core=backend == "probe") or (
         sessions.get("postgres_dsn") or ""
     ).strip()
+    if not dsn and allow_process_env:
+        for key in _ENV_DSN_KEYS:
+            dsn = (os.environ.get(key) or "").strip()
+            if dsn:
+                break
     if not dsn:
         raise RuntimeError(
             f"profile at {home} has sessions.state_backend = {backend!r} but no DSN was found "
@@ -1185,7 +1204,23 @@ def open_store_for_profile(profile_name: str, read_only: bool = False) -> Any:
     profiles_mod.validate_profile_name(canon)
     if not profiles_mod.profile_exists(canon):
         raise ValueError(f"profile '{canon}' does not exist")
-    return open_store_for_home(profiles_mod.get_profile_dir(canon), read_only=read_only)
+    return open_store_for_home(
+        profiles_mod.get_profile_dir(canon),
+        read_only=read_only,
+        allow_process_env=_is_active_profile(canon),
+    )
+
+
+def _is_active_profile(canon: str) -> bool:
+    """True when *canon* names the profile this process runs as."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        active = (get_active_profile_name() or "").strip()
+    except Exception:
+        active = ""
+    if not active:
+        active = (os.environ.get("HERMES_PROFILE") or "").strip()
+    return bool(active) and active == canon
 
 
 def profile_selects_postgres(profile_name: str) -> bool:
