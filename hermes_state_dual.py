@@ -34,6 +34,11 @@ DUAL_TIMEOUT_SECONDS = 2.0
 # 임계값은 그 실측의 하한 쪽에 둔다: mutation 수는 100 (관측된 대량 배치의 1/4),
 # rowcount 합은 200 (1,351 의 1/6). 통상 배치는 mutation 2 · rowcount 1 이라
 # 임계에 한참 못 미친다 — 일상 경로는 종전과 동일하게 동기 복제된다.
+# replay 는 백그라운드다 — primary 쓰기 경로가 아니므로 2 초 예산을 물려받을 이유가
+# 없다. 오히려 물려받으면 예산 초과로 저널에 들어간 배치가 replay 에서도 같은
+# 지점에서 취소돼 영원히 안 빠진다(2026-09-09 X1-p-19: 저널 #4 attempts 2, mutation
+# 684 개·1,442 행이 2 초에 두 번 취소). 동기 경로의 2 초 계약은 그대로다.
+DUAL_REPLAY_TIMEOUT_SECONDS = 300.0
 DUAL_BATCH_MUTATION_LIMIT = 100
 DUAL_BATCH_ROWCOUNT_LIMIT = 200
 
@@ -301,6 +306,23 @@ def _bind_generated_primary_key(
     raise TypeError("dual-write generated-id INSERT requires positional parameters")
 
 
+def _portable_null_safe_predicates(sql: str) -> str:
+    """저널에 기록된 옛 `col IS ?` 술어를 replay 시 이식 가능한 형태로 바꾼다.
+
+    SQLite 는 `col IS ?` 에 NULL 을 바인딩해 NULL-safe 등가로 쓰지만 PostgreSQL 은
+    `IS $1` 을 문법 오류로 거부한다(결함 #11). 코드는 0043 에서 고쳤지만 저널은 SQL
+    **문자열 원문**을 저장하므로 이미 쌓인 행은 옛 문장을 그대로 재실행한다
+    (2026-09-09 X1-p-19: `_set_session_title` 4 건이 SyntaxError 로 영구 잔존).
+    replay 경로에서만 정규화한다 — 새 쓰기는 애초에 올바른 SQL 을 만든다.
+    """
+    return re.sub(
+        r"\bIS\s+\?(?!\s*(?:NULL|NOT))",
+        "IS NOT DISTINCT FROM ?",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+
 def _idempotent_insert(sql: str) -> str:
     if "ON CONFLICT" in sql.upper() or re.search(
         r"\bINSERT\s+OR\b", sql, re.IGNORECASE
@@ -449,7 +471,8 @@ class DualWriteReplicator:
                 "exceeds the synchronous dual-write budget"
             )
         self.inject("during_replay" if replay else "before_pg_apply")
-        target = self.connection_factory(self.dsn, self.timeout_s)
+        timeout_s = DUAL_REPLAY_TIMEOUT_SECONDS if replay else self.timeout_s
+        target = self.connection_factory(self.dsn, timeout_s)
         timer: Optional[threading.Timer] = None
         try:
             target.execute(TARGET_SCHEMA)
@@ -457,7 +480,7 @@ class DualWriteReplicator:
             raw = getattr(target, "raw", None)
             cancel = getattr(raw, "cancel", None) if raw is not None else None
             if callable(cancel):
-                timer = threading.Timer(self.timeout_s, cancel)
+                timer = threading.Timer(timeout_s, cancel)
                 timer.daemon = True
                 timer.start()
             target.execute("BEGIN")
@@ -470,7 +493,12 @@ class DualWriteReplicator:
                 target.rollback()
                 return "already_applied"
             for mutation in mutations:
-                cursor = target.execute(mutation.sql, mutation.params)
+                sql = (
+                    _portable_null_safe_predicates(mutation.sql)
+                    if replay
+                    else mutation.sql
+                )
+                cursor = target.execute(sql, mutation.params)
                 # replay 는 저널 기록 시점보다 늦게 돈다. 조건부 UPDATE/DELETE
                 # (`WHERE … AND active = 1` 류)는 "그 시점에 참인 행"을 대상으로
                 # 하므로 늦은 replay 에서 rowcount 가 줄어드는 것이 정상이다

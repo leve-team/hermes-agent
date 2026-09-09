@@ -84,3 +84,83 @@ def test_replay_of_oversized_batch_is_attempted(tmp_path):
         replicator.apply("m-oversized", batch, replay=True)
     assert opened == [1], "replay 가 예산 검사에 막혔다"
     source.close()
+
+
+def test_replay_uses_a_generous_timeout_not_the_primary_budget(tmp_path):
+    """replay 는 primary 를 붙잡지 않으므로 2초 예산을 물려받으면 안 된다.
+
+    물려받으면 예산 초과로 저널에 들어간 배치가 replay 에서도 같은 지점에서
+    취소돼 영원히 안 빠진다(X1-p-19 저널 #4: mutation 684·1,442행, attempts 2).
+    """
+    from hermes_state_dual import DUAL_REPLAY_TIMEOUT_SECONDS, DUAL_TIMEOUT_SECONDS
+
+    assert DUAL_REPLAY_TIMEOUT_SECONDS > DUAL_TIMEOUT_SECONDS
+    replicator, source = _replicator(tmp_path)
+    seen = []
+
+    def factory(dsn, timeout_s):
+        seen.append(timeout_s)
+        raise RuntimeError("stop here")
+
+    replicator.connection_factory = factory
+    with pytest.raises(RuntimeError):
+        replicator.apply("m-sync", [_mutation()])
+    with pytest.raises(RuntimeError):
+        replicator.apply("m-replay", [_mutation()], replay=True)
+    assert seen == [DUAL_TIMEOUT_SECONDS, DUAL_REPLAY_TIMEOUT_SECONDS]
+    source.close()
+
+
+def test_journalled_sqlite_null_safe_predicate_is_normalised_on_replay():
+    """저널은 SQL 원문을 저장하므로 옛 `col IS ?` 가 그대로 남는다(결함 #11 잔재)."""
+    from hermes_state_dual import _portable_null_safe_predicates as fix
+
+    old = (
+        "UPDATE sessions SET title = ?, title_source = ? "
+        "WHERE id = ? AND title IS ? AND title_source IS ?"
+    )
+    got = fix(old)
+    assert "IS NOT DISTINCT FROM ?" in got
+    assert got.count("IS NOT DISTINCT FROM ?") == 2
+    # 리터럴 IS NULL / IS NOT NULL 은 건드리지 않는다
+    assert fix("WHERE a IS NULL AND b IS NOT NULL") == "WHERE a IS NULL AND b IS NOT NULL"
+    # 이미 이식 가능한 문장은 그대로
+    already = "WHERE a IS NOT DISTINCT FROM ?"
+    assert fix(already) == already
+
+
+def test_apply_normalises_journalled_sql_on_replay_only(tmp_path):
+    """정규화가 apply 의 replay 경로에 실제로 배선돼 있는지(함수 존재만으론 부족)."""
+    replicator, source = _replicator(tmp_path)
+    executed = []
+
+    class _Cursor:
+        rowcount = 1
+
+    class _Target:
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            return _Cursor()
+
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+        raw = None
+
+    replicator.connection_factory = lambda *a, **k: _Target()
+    legacy = Mutation(
+        sql="UPDATE sessions SET title = ? WHERE id = ? AND title IS ?",
+        params=("t", "s", None),
+        table="sessions",
+        operation="update",
+        expected_rowcount=1,
+    )
+    replicator.apply("m-replay-sql", [legacy], replay=True)
+    replayed = [q for q in executed if "UPDATE sessions" in q]
+    assert replayed and "IS NOT DISTINCT FROM ?" in replayed[0], replayed
+
+    executed.clear()
+    replicator.apply("m-sync-sql", [legacy])
+    synced = [q for q in executed if "UPDATE sessions" in q]
+    assert synced and "IS NOT DISTINCT FROM ?" not in synced[0], synced
+    source.close()
