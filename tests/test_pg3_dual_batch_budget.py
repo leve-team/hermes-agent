@@ -164,3 +164,51 @@ def test_apply_normalises_journalled_sql_on_replay_only(tmp_path):
     synced = [q for q in executed if "UPDATE sessions" in q]
     assert synced and "IS NOT DISTINCT FROM ?" not in synced[0], synced
     source.close()
+
+
+def test_state_dependent_gc_rowcount_never_fails_the_batch(tmp_path):
+    """결함 #17 — `DELETE FROM system_prompts WHERE NOT EXISTS(...)` 의 rowcount 는
+    복제본 상태의 함수라 primary 값과 달라도 정상이다. 같은 배치의 INSERT 가
+    프롬프트를 나르므로 이 DELETE 때문에 배치가 죽으면 프롬프트가 영원히 PG 에
+    못 간다(2026-09-09 Y3-n: 누락 3건, 저널 706/708/710).
+    """
+    from hermes_state_dual import _is_state_dependent_gc
+
+    gc = ("DELETE FROM system_prompts WHERE NOT EXISTS (SELECT 1 FROM sessions "
+          "WHERE sessions.system_prompt_hash = system_prompts.hash)")
+    assert _is_state_dependent_gc(gc)
+    assert _is_state_dependent_gc("DELETE FROM system_prompts\n  WHERE NOT EXISTS (x)")
+    assert not _is_state_dependent_gc("DELETE FROM messages WHERE id = ?")
+    assert not _is_state_dependent_gc("UPDATE sessions SET title = ? WHERE id = ?")
+
+    replicator, source = _replicator(tmp_path)
+    executed = []
+
+    class _Cursor:
+        def __init__(self, n): self.rowcount = n
+
+    class _Target:
+        raw = None
+        def execute(self, sql, params=()):
+            executed.append(sql)
+            # INSERT 1행, GC 는 primary 가 0 을 기대했지만 복제본에선 3행 지움
+            return _Cursor(3 if "NOT EXISTS" in sql else 1)
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+
+    replicator.connection_factory = lambda *a, **k: _Target()
+    batch = [
+        Mutation(sql="INSERT INTO system_prompts (hash, prompt) VALUES (?, ?)",
+                 params=("h", "p"), table="system_prompts", operation="insert", expected_rowcount=1),
+        Mutation(sql=gc, params=(), table="system_prompts", operation="delete", expected_rowcount=0),
+    ]
+    assert replicator.apply("m-gc", batch) == "applied"
+    assert any(q.startswith("DELETE FROM system_prompts") for q in executed)
+
+    # 데이터 문장은 여전히 엄격 — 같은 배치에서 UPDATE 가 어긋나면 죽는다
+    strict = [Mutation(sql="UPDATE sessions SET title = ? WHERE id = ?", params=("t", "s"),
+                       table="sessions", operation="update", expected_rowcount=0)]
+    with pytest.raises(DualApplyMismatch):
+        replicator.apply("m-strict", strict)
+    source.close()
