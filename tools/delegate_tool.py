@@ -1918,11 +1918,19 @@ def _build_child_agent(
             from hermes_state import SessionDB
 
             _parent_db_path = getattr(parent_session_db, "db_path", None)
-            child_session_db = (
-                SessionDB(db_path=_parent_db_path)
-                if _parent_db_path is not None
-                else SessionDB()
-            )
+            # A parent already on PostgreSQL authority must not hand its
+            # child a pinned SQLite path — that would split the delegation
+            # history across two stores (same class of bypass as the mesh
+            # receive path fixed in api_server, 2026-09-09).  Reuse the
+            # parent's physical store selection instead of its file path.
+            if getattr(parent_session_db, "_is_postgres", False):
+                child_session_db = SessionDB()
+            else:
+                child_session_db = (
+                    SessionDB(db_path=_parent_db_path)
+                    if _parent_db_path is not None
+                    else SessionDB()
+                )
         except Exception:
             logger.debug(
                 "subagent: failed to open dedicated SessionDB; child persistence disabled",

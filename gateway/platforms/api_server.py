@@ -159,6 +159,43 @@ RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
 
+
+def _open_profile_session_db(home):
+    """Open *home*'s session store honouring that profile's backend.
+
+    Pinning ``db_path=home/state.db`` names a SQLite file, and the core keeps
+    an explicit ``db_path`` on SQLite by contract (hermes_state.py, "An
+    explicit db_path still stays on SQLite").  Under PostgreSQL authority
+    that sent every mesh-received message to the old file while the live
+    write path ran on Postgres — 2026-09-09 Y3 flip #4: marker Y3F_VERIFY_1
+    landed in SQLite id 629560 and never reached PG, so the verify probe
+    correctly refused the flip.  Resolve the backend the same way
+    ``tui_gateway/server.py`` already does: a named profile goes through the
+    one backend-aware seam; the default profile (``~/.hermes``) follows this
+    process's env/config.
+    """
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+
+    home = Path(home)
+    name = home.name if home.parent.name == "profiles" else ""
+    try:
+        from hermes_state_postgres import (
+            open_store_for_profile,
+            profile_selects_postgres,
+            resolve_state_backend,
+        )
+    except ImportError:
+        return SessionDB(db_path=home / "state.db")
+    if name:
+        if profile_selects_postgres(name):
+            return open_store_for_profile(name)
+        return SessionDB(db_path=home / "state.db")
+    if resolve_state_backend() in {"probe", "authority"}:
+        return SessionDB()
+    return SessionDB(db_path=home / "state.db")
+
 class ThreadSafeAsyncQueue(asyncio.Queue):
     """An ``asyncio.Queue`` that a non-loop thread can push into safely.
 
@@ -2215,7 +2252,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return None
             db = self._session_dbs.get(key)
             if db is None:
-                db = SessionDB(db_path=home / "state.db")
+                db = _open_profile_session_db(home)
                 self._session_dbs[key] = db
             return db
 
