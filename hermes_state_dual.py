@@ -323,6 +323,32 @@ def _portable_null_safe_predicates(sql: str) -> str:
     )
 
 
+_STATE_DEPENDENT_GC = (
+    "DELETE FROM system_prompts WHERE NOT EXISTS",
+)
+
+
+def _is_state_dependent_gc(sql: str) -> bool:
+    """True for garbage-collection statements whose row count is a function
+    of the *replica's* current state, not of this mutation.
+
+    ``_delete_unreferenced_system_prompts`` deletes every prompt no session
+    references. How many that is depends on which sessions/prompts the
+    replica already holds, which legitimately differs from the primary
+    while journal entries are pending or replayed late. Treating the
+    primary's rowcount as a contract for the replica therefore fails the
+    whole batch — and because the batch also carries the INSERT that would
+    have stored the prompt, the prompt never reaches PostgreSQL
+    (2026-09-09 Y3-n: 3 prompts missing, journal #706/708/710 all failed
+    on this DELETE's rowcount). The GC is idempotent and self-correcting:
+    whatever it deletes is by definition unreferenced on that store, and
+    the full diff / flag rescan verify convergence. The data-carrying
+    statements in the same batch keep their strict contract.
+    """
+    head = " ".join(sql.split())
+    return any(head.startswith(prefix) for prefix in _STATE_DEPENDENT_GC)
+
+
 def _idempotent_insert(sql: str) -> str:
     if "ON CONFLICT" in sql.upper() or re.search(
         r"\bINSERT\s+OR\b", sql, re.IGNORECASE
@@ -510,8 +536,11 @@ class DualWriteReplicator:
                     if replay
                     else cursor.rowcount != mutation.expected_rowcount
                 )
-                if mutation.operation in {"update", "delete"} and (
-                    mutation.expected_rowcount >= 0 and mismatch
+                if (
+                    mutation.operation in {"update", "delete"}
+                    and mutation.expected_rowcount >= 0
+                    and mismatch
+                    and not _is_state_dependent_gc(mutation.sql)
                 ):
                     raise DualApplyMismatch(
                         f"{mutation.table} {mutation.operation} affected "
