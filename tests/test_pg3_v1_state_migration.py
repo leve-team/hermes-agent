@@ -194,7 +194,11 @@ def _open_dual(
         "connect_dual_target",
         _sqlite_target_factory(target_path),
     )
-    return SessionDB(db_path=source_path)
+    # dual_write=True explicitly: a pytest-context SessionDB ignores the env
+    # switch (it would otherwise ship fixture rows to the live shadow — see
+    # test_pg3_test_context_never_dual_writes). The target factory above is
+    # patched to a temp SQLite file, so this test is hermetic.
+    return SessionDB(db_path=source_path, dual_write=True)
 
 
 def _ledger_rows(path: Path) -> tuple[list[tuple], list[tuple]]:

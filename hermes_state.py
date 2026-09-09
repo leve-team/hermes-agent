@@ -3416,6 +3416,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._dual_requested = (
             dual_write_enabled() if dual_write is None else bool(dual_write)
         )
+        # A pytest-context process never replicates to the process-global
+        # PostgreSQL shadow. _ensure_test_isolation() above guards the SQLite
+        # *file* against production roots, but dual-write reads
+        # HERMES_CORE_PG_DSN from the environment and would still ship every
+        # test fixture row to the live shadow — on 2026-09-09 a regression run
+        # on the dave pod (which carries the production DSN) created 20
+        # synthetic sessions (s-0000..s-0019, a-child, z-parent) in the live
+        # replica twice, each time surfacing as 46 PG-only rows that blocked
+        # the authority flip preflight. Tests that need a replicator pass an
+        # explicit connection factory; nothing else may reach the env DSN.
+        if (
+            self._dual_requested
+            and dual_write is None
+            and not _STATE_DB_GUARD_BYPASS
+            and not os.environ.get(_STATE_DB_GUARD_BYPASS_ENV)
+            and _in_test_context()
+        ):
+            self._dual_requested = False
         self._dual_mode = bool(self._dual_requested and not read_only)
         self._dual_replicator = None
         # Async token accounting (see queue_token_counts). The condition
