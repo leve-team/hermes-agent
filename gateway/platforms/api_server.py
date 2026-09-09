@@ -206,6 +206,48 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 
 
+
+def _open_profile_session_db(home):
+    """Open *home*'s session store honouring that profile's backend.
+
+    Pinning ``db_path=home/state.db`` names a SQLite file, and the core keeps
+    an explicit ``db_path`` on SQLite by contract (hermes_state.py, "An
+    explicit db_path still stays on SQLite").  Under PostgreSQL authority
+    that sent every mesh-received message to the old file while the live
+    write path ran on Postgres — 2026-09-09 Y3 flip #4: marker Y3F_VERIFY_1
+    landed in SQLite id 629560 and never reached PG, so the verify probe
+    correctly refused the flip.  Resolve the backend the same way
+    ``tui_gateway/server.py`` already does: a named profile goes through the
+    one backend-aware seam; the default profile (``~/.hermes``) follows this
+    process's env/config.  SQLite handles come from the process-wide registry
+    (shared, refcounted — see hermes_state_registry) so two adapters never
+    race close-time WAL checkpoints on the same file.
+    """
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+    from hermes_state_registry import acquire
+
+    home = Path(home)
+    sqlite_path = home / "state.db"
+    name = home.name if home.parent.name == "profiles" else ""
+    try:
+        from hermes_state_postgres import (
+            open_store_for_profile,
+            profile_selects_postgres,
+            resolve_state_backend,
+        )
+    except ImportError:
+        return acquire(sqlite_path)
+    if name:
+        if profile_selects_postgres(name):
+            return open_store_for_profile(name)
+        return acquire(sqlite_path)
+    if resolve_state_backend() in {"probe", "authority"}:
+        return SessionDB()
+    return acquire(sqlite_path)
+
+
 class ThreadSafeAsyncQueue(asyncio.Queue):
     """``asyncio.Queue`` a non-loop thread (run_conversation's executor) can push into via
     ``put_threadsafe``; the SSE consumer's ``await get()`` is woken by ``call_soon_threadsafe``."""
@@ -1681,7 +1723,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return None
             db = self._session_dbs.get(key)
             if db is None:
-                db = acquire(home / "state.db")
+                db = _open_profile_session_db(home)
                 self._session_dbs[key] = db
             return db
 
