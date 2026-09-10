@@ -383,7 +383,7 @@ class _PostgresCursor:
         ``lastrowid`` is not set (matches sqlite3 behaviour for executemany).
         """
         translated = _translate_sql(sql)
-        params_list = list(seq_of_params)
+        params_list = [() if params is None else params for params in seq_of_params]
         if params_list:
             self._cursor.executemany(translated, params_list)
         return self
