@@ -1486,6 +1486,59 @@ def _strict_enabled() -> bool:
     return os.environ.get(_STRICT_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+_BINDING_TOKENS = re.compile(
+    r"(?P<protected>--[^\r\n]*"
+    r"|(?<![\w$])[eE]'(?:\\.|''|[^'\\])*(?:'|$)"
+    r"|'(?:''|[^'])*(?:'|$)"
+    r'|"(?:""|[^"])*(?:"|$)'
+    r"|(?<![\w$])(?P<tag>\$(?:[^\W\d]\w*)?\$).*?(?:(?P=tag)|$))"
+    r"|(?P<block>/\*)"
+    r"|(?P<parameter>%%|%[sbt]|%\([^)]+\)[sbt])"
+    r"|(?P<percent>%)|(?P<question>\?)",
+    re.DOTALL,
+)
+
+
+def _translate_bindings(sql: str) -> str:
+    """Prepare SQL for psycopg's quote-unaware parameter parser.
+
+    SQL literals/comments retain every percent and question mark. Outside
+    those regions, qmarks become placeholders, psycopg placeholders and its
+    existing %% escape survive, and bare modulo/wildcard percents are escaped.
+    Values never enter this transformation. Both cursor methods pass a parameter
+    collection (even when empty), so the driver always consumes these escapes.
+    """
+    parts = []
+    position = 0
+    while match := _BINDING_TOKENS.search(sql, position):
+        parts.append(sql[position:match.start()])
+        end = match.end()
+        token = match.group()
+        if match.group("block"):
+            depth = 1
+            while depth and end < len(sql):
+                pair = sql[end:end + 2]
+                if pair == "/*":
+                    depth += 1
+                    end += 2
+                elif pair == "*/":
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            token = sql[match.start():end].replace("%", "%%")
+        elif match.group("protected"):
+            token = token.replace("%", "%%")
+        elif match.group("percent"):
+            token = "%%"
+        elif match.group("question"):
+            token = "%s"
+        parts.append(token)
+        position = end
+    parts.append(sql[position:])
+    return "".join(parts)
+
+
 def _translate_sql(sql: str) -> str:
     """Rewrite the closed set of SQLite idioms to their PostgreSQL equivalents.
 
@@ -1501,9 +1554,8 @@ def _translate_sql(sql: str) -> str:
         queries (hermes_state helpers ``_delegate_from_json`` /
         ``_ephemeral_child_sql``). Untranslated, these are invalid PostgreSQL and
         the session paths break.
-      * ``?`` placeholders -> ``%s`` (psycopg paramstyle). String/identifier
-        literals do not contain ``?`` in the SessionDB query set, so a direct
-        replace is safe.
+      * Unquoted ``?`` placeholders -> ``%s`` (psycopg paramstyle), escaping
+        SQL percent literals without changing native psycopg placeholders.
     """
     stripped = sql.strip()
     if stripped.upper() == "BEGIN IMMEDIATE":
@@ -1542,7 +1594,7 @@ def _translate_sql(sql: str) -> str:
 
     # MUST stay last: any '?' emitted by a translation above would be eaten
     # here and turned into a paramstyle placeholder (see _rewrite_sqlite_json_fns).
-    translated = translated.replace("?", "%s")
+    translated = _translate_bindings(translated)
 
     if insert_or_ignore and "ON CONFLICT" not in translated.upper():
         translated = translated.rstrip().rstrip(";")
@@ -1926,7 +1978,7 @@ class _PostgresCursor:
         ``lastrowid`` is not set (matches sqlite3 behaviour for executemany).
         """
         translated = _translate_sql(sql)
-        params_list = list(seq_of_params)
+        params_list = [() if params is None else params for params in seq_of_params]
         if params_list:
             self._cursor.executemany(translated, params_list)
         return self
