@@ -2822,15 +2822,23 @@ def open_store_for_profile(
 
 
 def _is_active_profile(canon: str) -> bool:
-    """True when *canon* names the profile this process runs as."""
+    """True when *canon* names the profile this process runs as.
+
+    Two independent signals, either suffices: ``HERMES_PROFILE`` (set by the
+    session-plane launcher on every role) and the profile ``HERMES_HOME``
+    points into. ``get_active_profile_name()`` answers ``"default"`` — not
+    empty — when ``HERMES_HOME`` is unset, so it must not be the only source:
+    on 2026-09-10 the messaging-gateway container had ``HERMES_PROFILE=dave``
+    but no ``HERMES_HOME``, the seam concluded "not the active profile",
+    refused the env DSN, and control-tower bootstrap crash-looped (Y3-u).
+    """
+    if (os.environ.get("HERMES_PROFILE") or "").strip() == canon:
+        return True
     try:
         from hermes_cli.profiles import get_active_profile_name
-        active = (get_active_profile_name() or "").strip()
+        return (get_active_profile_name() or "").strip() == canon
     except Exception:
-        active = ""
-    if not active:
-        active = (os.environ.get("HERMES_PROFILE") or "").strip()
-    return bool(active) and active == canon
+        return False
 
 
 def profile_selects_postgres(profile_name: str) -> bool:

@@ -149,3 +149,16 @@ def test_seam_uses_process_env_dsn_only_for_the_active_profile(monkeypatch, tmp_
     assert seen.get("dsn") == "postgresql://env/dsn"
     with pytest.raises(RuntimeError, match="no DSN"):
         hsp.open_store_for_profile("opsi")
+
+
+def test_active_profile_is_recognised_by_hermes_profile_without_hermes_home(monkeypatch):
+    """messaging-gateway 형상: HERMES_PROFILE 만 있고 HERMES_HOME 없음 → 활성 프로필."""
+    import importlib
+    hsp = importlib.import_module("hermes_state_postgres")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "dave")
+    assert hsp._is_active_profile("dave") is True
+    assert hsp._is_active_profile("opsi") is False
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    # 둘 다 없으면(순수 default 프로필) 어떤 명명 프로필도 활성이 아니다
+    assert hsp._is_active_profile("dave") is False
