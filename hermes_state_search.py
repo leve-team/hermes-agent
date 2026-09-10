@@ -346,6 +346,8 @@ class SessionSearchMixin:
         after the previously-drained key, so the per-chunk scan is bounded instead of re-scanning from the
         start of the table every chunk (O(n²) total on large trash tables, #79324).
         """
+        if self._is_postgres:
+            return False
         with self._read_ctx() as conn:
             trash = [r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ? ESCAPE '\\'",
@@ -522,6 +524,8 @@ class SessionSearchMixin:
         — the heavy delete is deferred. Markers land in the same BEGIN IMMEDIATE, BEFORE
         the empty v23 schema is created (``executescript`` implicitly COMMITs), closing
         the crash window where trash + empty v23 tables exist with no backfill claim."""
+        if self._is_postgres:
+            return 0
         def _stage(conn):
             self._drop_fts_triggers(conn)
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
@@ -617,7 +621,7 @@ class SessionSearchMixin:
         legacy-v22 inline -> external-content, or a v23 ``messages_fts_trigram`` that still stores
         ``tool_calls``. Re-running resumes. ``progress_cb`` receives {"phase", "percent",
         "indexed", "total"}. A missing trigram tokenizer is not fatal (CJK falls back to LIKE)."""
-        if not self._fts_enabled:
+        if self._is_postgres or not self._fts_enabled:
             return {"ok": False, "reason": "fts5_unavailable"}
         if self.read_only:
             return {"ok": False, "reason": "read_only"}
@@ -1208,6 +1212,8 @@ class SessionSearchMixin:
     def _fts_table_exists(self, name: str) -> bool:
         """True if an FTS5 virtual table is queryable ("no such table" and "vtable
         constructor failed" — missing tokenizer / mid-teardown — both count as not)."""
+        if self._is_postgres:
+            return False
         try:
             self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True
@@ -1255,6 +1261,8 @@ class SessionSearchMixin:
         path, which retries in-process from the gateway housekeeping tick (``retry_deferred_fts_recovery``)
         and at next startup.
         """
+        if self._is_postgres:
+            return 0
         self._raise_if_db_corrupt()
         self._raise_if_db_replaced()
         rebuilt = 0

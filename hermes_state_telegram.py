@@ -116,6 +116,13 @@ class SessionTelegramTopicsMixin:
 
         See #76423.
         """
+        if self._is_postgres:
+            if self.get_meta("telegram_dm_topic_schema_version") in {"2", "3"}:
+                return
+            raise NotImplementedError(
+                "Telegram topic schema migration is SQLite-only; "
+                "PostgreSQL requires a backend-specific migration."
+            )
         def _do(conn):
             for table, columns, ddl in _TOPIC_TABLES:
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")

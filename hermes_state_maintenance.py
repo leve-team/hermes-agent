@@ -449,7 +449,7 @@ class SessionMaintenanceMixin:
                 # freelist ratio passed — it holds an exclusive lock for a full rewrite.
                 since_vacuum = _seconds_since(now, self.get_meta("last_vacuum"))
                 vacuum_due = since_vacuum is None or since_vacuum >= min_vacuum_interval_days * 86400
-                if vacuum and pruned > 0 and vacuum_due:
+                if vacuum and not self._is_postgres and pruned > 0 and vacuum_due:
                     result["freelist_ratio"] = ratio = self._freelist_ratio()
                     if ratio is None or ratio > min_vacuum_freelist_ratio:
                         try:

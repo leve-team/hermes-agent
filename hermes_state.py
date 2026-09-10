@@ -1502,7 +1502,7 @@ class SessionDB(
         Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
         exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
         """
-        if self._quarantine_reason() is not None:
+        if self._is_postgres or self._quarantine_reason() is not None:
             return
         try:
             with self._lock:
