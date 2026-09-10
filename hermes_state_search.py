@@ -188,6 +188,8 @@ class SessionSearchMixin:
         comparison, so they keep the legacy chunked ``LIMIT`` delete —
         those shadow tables are small by construction.
         """
+        if self._is_postgres:
+            return False
         with self._lock:
             trash = [
                 r[0] for r in self._conn.execute(
@@ -689,6 +691,8 @@ class SessionSearchMixin:
         the empty schema only after markers are durable closes the crash
         window where trash + empty v23 tables exist with no backfill claim.
         """
+        if self._is_postgres:
+            return 0
         def _stage(conn):
             self._drop_fts_triggers(conn)
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
@@ -760,7 +764,7 @@ class SessionSearchMixin:
         The trigram tokenizer being unavailable is not fatal — the base index
         is still rebuilt (CJK falls back to LIKE), mirroring normal startup.
         """
-        if not self._fts_enabled:
+        if self._is_postgres or not self._fts_enabled:
             return {"ok": False, "reason": "fts5_unavailable"}
         if self.read_only:
             return {"ok": False, "reason": "read_only"}
@@ -2364,6 +2368,8 @@ class SessionSearchMixin:
 
     def _fts_table_exists(self, name: str) -> bool:
         """True if an FTS5 virtual table is queryable in this DB."""
+        if self._is_postgres:
+            return False
         try:
             self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True

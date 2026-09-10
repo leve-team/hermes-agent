@@ -4616,6 +4616,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         databases (65K+ pages) due to the exclusive-lock I/O pressure
         from checkpointing thousands of frames at once (issue #45383).
         """
+        if self._is_postgres:
+            return
         try:
             with self._lock:
                 result = self._conn.execute(
@@ -4670,7 +4672,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a PASSIVE WAL
+        connection). Writable SQLite connections then attempt a PASSIVE WAL
         checkpoint (NOT TRUNCATE: transient per-cron-run connections close
         many times an hour, and a TRUNCATE fires a full WAL reset that
         races the gateway's live writer and tears B-tree pages — issue
@@ -4694,7 +4696,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._close_read_conn(conn)
         with self._lock:
             if self._conn:
-                if not self.read_only:
+                if not self.read_only and not self._is_postgres:
                     # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
                     # transient SessionDB, so a TRUNCATE here fires a full WAL
                     # reset many times/hour, racing the gateway's long-lived
@@ -10536,7 +10538,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cached = getattr(self, "_message_columns_cache", None)
         if cached:
             return cached
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        if self._is_postgres:
+            cols = [row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = ? "
+                "ORDER BY ordinal_position", ("messages",),
+            ).fetchall()]
+        else:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         self._message_columns_cache = cols
         return cols
 
@@ -12576,6 +12585,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         backup_path: Optional[str] = None
         if backup:
+            if self._is_postgres:
+                raise NotImplementedError(
+                    "PostgreSQL marker cleanup requires an external backup; "
+                    "VACUUM INTO is SQLite-only. Back up PostgreSQL before "
+                    "explicitly choosing backup=False."
+                )
             import datetime
 
             stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -12721,6 +12736,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
         """
+        if self._is_postgres:
+            if self.get_meta("telegram_dm_topic_schema_version") == "2":
+                return
+            raise NotImplementedError(
+                "Telegram topic schema migration is SQLite-only; "
+                "PostgreSQL requires a backend-specific migration."
+            )
         def _do(conn):
             conn.executescript(
                 """
@@ -13236,8 +13258,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         negative — the "reclaimed -3820.1 MB" report on a database that had
         actually shrunk 60%.
 
-        Returns None if the pragmas cannot be read.
+        Returns None for PostgreSQL or if the pragmas cannot be read.
         """
+        if self._is_postgres:
+            return None
         try:
             with self._lock:
                 if self._conn is None:
@@ -13268,8 +13292,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         layout-only optimization — search results are unchanged.
 
         Returns the number of FTS indexes that were optimized (0 if the
-        merge step failed or no FTS tables exist).
+        merge step failed or no FTS tables exist). PostgreSQL returns 0
+        without SQL: this SQLite file-rewrite path is not PG maintenance.
         """
+        if self._is_postgres:
+            return 0
         # Merge FTS5 segments before VACUUM so the freed pages are returned
         # to the OS in the same pass. optimize_fts() manages its own lock.
         optimized = 0
@@ -13366,7 +13393,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     vacuum_due = (now - float(last_vacuum_raw)) >= min_vacuum_interval_days * 86400
                 except (TypeError, ValueError):
                     vacuum_due = True
-            if vacuum and pruned > 0 and vacuum_due:
+            if vacuum and not self._is_postgres and pruned > 0 and vacuum_due:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
