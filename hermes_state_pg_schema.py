@@ -288,7 +288,8 @@ CREATE TABLE IF NOT EXISTS delivery_obligations (
     updated_at DOUBLE PRECISION NOT NULL,
     owner_pid INTEGER,
     owner_started_at INTEGER,
-    last_error TEXT
+    last_error TEXT,
+    adapter_profile TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_levos_control_empty_open

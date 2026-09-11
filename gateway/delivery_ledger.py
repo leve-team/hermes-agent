@@ -1,4 +1,5 @@
-"""Durable delivery-obligation ledger for gateway final responses (rows in the shared ``state.db``;
+"""Durable delivery-obligation ledger for gateway final responses (rows in the profile's session store: the shared ``state.db`` on a
+SQLite profile, the profile's PostgreSQL store under PostgreSQL authority;
 WAL, owner pid + process-start liveness, bounded retention) so a crash between finalize and
 platform ACK cannot lose a response silently. Checkpoints: record_obligation() 'pending' before
 any send | mark_attempting() 'attempting' right before the await | mark_delivered() 'delivered'
@@ -150,11 +151,11 @@ def _connect() -> sqlite3.Connection:
     return SessionDB.open_writer(path, timeout=10, initialize=_initialize_schema)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state_wal import apply_wal_with_fallback
-    apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS delivery_obligations (
+def _is_postgres(conn: Any) -> bool:
+    return bool(getattr(conn, "is_postgres", False))
+
+
+_SCHEMA = """CREATE TABLE IF NOT EXISTS delivery_obligations (
             obligation_id TEXT PRIMARY KEY,
             session_key TEXT NOT NULL,
             platform TEXT NOT NULL,
@@ -170,7 +171,26 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT,
             adapter_profile TEXT
         )"""
-    )
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if _is_postgres(conn):
+        from hermes_state_writer import postgres_ddl
+
+        conn.execute(postgres_ddl(_SCHEMA))
+        columns = {
+            row[0]
+            for row in conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema = current_schema()
+                     AND table_name = 'delivery_obligations'"""
+            ).fetchall()
+        }
+        if "adapter_profile" not in columns:
+            conn.execute(postgres_ddl("ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT"))
+        return
+    from hermes_state_wal import apply_wal_with_fallback
+
+    apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
+    conn.execute(_SCHEMA)
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
         try:
             conn.execute("ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT")
@@ -178,6 +198,36 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             # Concurrent first-use connections can both observe the old schema.
             if "duplicate column" not in str(exc).lower():
                 raise
+
+
+# ``INSERT OR REPLACE`` deletes the old row, so every column absent from the
+# INSERT (``last_error``) resets. The PostgreSQL upsert spells that out: it
+# binds the same parameters, writes ``last_error`` as NULL, and updates every
+# non-key column from ``excluded`` on conflict.
+_RECORD_SQLITE = """INSERT OR REPLACE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, adapter_profile)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)"""
+_RECORD_POSTGRES = """INSERT INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, adapter_profile, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, NULL)
+               ON CONFLICT (obligation_id) DO UPDATE SET
+                 session_key = excluded.session_key,
+                 platform = excluded.platform,
+                 chat_id = excluded.chat_id,
+                 thread_id = excluded.thread_id,
+                 content = excluded.content,
+                 state = excluded.state,
+                 attempts = excluded.attempts,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at,
+                 owner_pid = excluded.owner_pid,
+                 owner_started_at = excluded.owner_started_at,
+                 adapter_profile = excluded.adapter_profile,
+                 last_error = excluded.last_error"""
 
 
 @contextmanager
@@ -253,11 +303,7 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
-               (obligation_id, session_key, platform, chat_id, thread_id,
-                content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+            _RECORD_POSTGRES if _is_postgres(conn) else _RECORD_SQLITE,
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
     _prune()
@@ -381,14 +427,17 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
             # resend is seen as 'attempting' with no error by the next boot and gets the marker.
+            # NULL-safe guard on the previous owner: ``IS ?`` is SQLite-only (PostgreSQL rejects
+            # ``IS $1``); ``IS NOT DISTINCT FROM`` is the portable spelling. ``CASE WHEN ?=1`` keeps the
+            # flag boolean on PostgreSQL (a bare integer WHEN is rejected there).
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
                        adapter_profile=COALESCE(adapter_profile, 'default'),
-                       state=CASE WHEN ? THEN 'attempting' ELSE state END,
-                       last_error=CASE WHEN ? THEN NULL ELSE last_error END
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid, owner_pid))
+                       state=CASE WHEN ?=1 THEN 'attempting' ELSE state END,
+                       last_error=CASE WHEN ?=1 THEN NULL ELSE last_error END
+                   WHERE obligation_id=? AND owner_pid IS NOT DISTINCT FROM ?""",
+                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid))
             if cursor.rowcount:
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries

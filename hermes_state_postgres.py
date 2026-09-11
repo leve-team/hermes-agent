@@ -1232,13 +1232,30 @@ def _is_active_profile(canon: str) -> bool:
 
 
 def profile_selects_postgres(profile_name: str) -> bool:
-    """Resolve a named profile's backend before callers choose their SQLite open path."""
+    """Resolve a named profile's backend before callers choose their SQLite open path.
+
+    True for ``authority`` and ``probe`` (probe still needs open_store_for_profile()
+    to attach the target's own PG comparison DSN). A writer that must know whether
+    the profile's *authority* is PostgreSQL asks :func:`profile_state_backend`.
+    """
+    return profile_state_backend(profile_name) in {"authority", "probe"}
+
+
+def profile_state_backend(profile_name: str) -> str:
+    """``sqlite`` / ``probe`` / ``authority`` as selected by a profile's own
+    ``config.yaml`` (the TARGET profile's config only, never the active
+    process's env; an absent profile is ``sqlite``; a config that exists but
+    cannot be read as a selection source raises via ``_home_sessions_config``).
+    """
     from hermes_cli import profiles as profiles_mod
 
     canon = profiles_mod.normalize_profile_name(profile_name)
     if not profiles_mod.profile_exists(canon):
-        return False
-    return home_selects_postgres(profiles_mod.get_profile_dir(canon))
+        return "sqlite"
+    from hermes_state_read import normalize_read_mode
+
+    sessions = _home_sessions_config(profiles_mod.get_profile_dir(canon))
+    return normalize_read_mode(sessions.get("state_backend") or "sqlite")
 
 
 def is_postgres_retryable(exc: BaseException) -> bool:
