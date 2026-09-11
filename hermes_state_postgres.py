@@ -2853,6 +2853,24 @@ def profile_selects_postgres(profile_name: str) -> bool:
     consulted because they describe the ACTIVE process's backend, not the peer's.
     Soft-fails to False so an absent or unreadable peer config keeps the existing
     SQLite path rather than breaking a listing.
+
+    Probe still returns SQLite data, but it needs open_store_for_profile() to
+    attach the target profile's own PG comparison DSN. Returning False here
+    would send cross-profile readers down their legacy explicit-SQLite path
+    and silently bypass every probe. A writer that must know whether the
+    profile's *authority* is PostgreSQL asks :func:`profile_state_backend`.
+    """
+    return profile_state_backend(profile_name) in {"authority", "probe"}
+
+
+def profile_state_backend(profile_name: str) -> str:
+    """``sqlite`` / ``probe`` / ``authority`` as selected by a profile's own
+    ``config.yaml``.
+
+    Same source and fail-closed rules as :func:`profile_selects_postgres`: the
+    TARGET profile's config only (never the active process's env), an absent
+    profile or config is ``sqlite``, and a config that exists but cannot be
+    read as a selection source raises rather than answering ``sqlite``.
     """
     from pathlib import Path
 
@@ -2860,11 +2878,11 @@ def profile_selects_postgres(profile_name: str) -> bool:
 
     canon = profiles_mod.normalize_profile_name(profile_name)
     if not profiles_mod.profile_exists(canon):
-        return False
+        return "sqlite"
     config_path = Path(profiles_mod.get_profile_dir(canon)) / "config.yaml"
     # No config at all is a legitimate "no selection" -> SQLite.
     if not config_path.is_file():
-        return False
+        return "sqlite"
 
     # A config that EXISTS but cannot be read or parsed must not be reported as
     # "not Postgres": it may be the only source selecting Postgres, and a False
@@ -2882,17 +2900,12 @@ def profile_selects_postgres(profile_name: str) -> bool:
         ) from _cfg_exc
 
     if loaded is None:
-        return False  # absent or genuinely empty — no selection
+        return "sqlite"  # absent or genuinely empty — no selection
     from hermes_state_read import normalize_read_mode
 
-    backend = normalize_read_mode(
+    return normalize_read_mode(
         (loaded.get("sessions") or {}).get("state_backend") or "sqlite"
     )
-    # Probe still returns SQLite data, but it needs open_store_for_profile() to
-    # attach the target profile's own PG comparison DSN. Returning False here
-    # would send cross-profile readers down their legacy explicit-SQLite path
-    # and silently bypass every probe.
-    return backend in {"authority", "probe"}
 
 
 def is_postgres_retryable(exc: BaseException) -> bool:

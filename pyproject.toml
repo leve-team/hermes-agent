@@ -450,7 +450,8 @@ py-modules = [
   "state_transfer",
   "state_reverse",
   "state_go_candidate",
-  "migrate_state_to_postgres"
+  "migrate_state_to_postgres",
+  "migrate_writer_local_tables"
 ]
 
 [tool.setuptools.packages.find]

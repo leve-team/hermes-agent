@@ -3237,11 +3237,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def open_writer(db_path, *, timeout, initialize):
-        """Open a SQLite-primary auxiliary writer without core bootstrap/retries.
+        """Open an auxiliary writer on the backend of the profile that owns
+        *db_path*, without core bootstrap/retries.
 
         The caller retains its SQL, initialization and transaction boundaries.
-        Dual mode records committed batches through RecordingConnection; reads
-        remain on the explicitly supplied SQLite file, as before cutover.
+        On a SQLite profile this is the explicitly supplied SQLite file; dual
+        mode records committed batches through RecordingConnection. On a
+        PostgreSQL-authority profile the returned handle writes to that
+        profile's PostgreSQL store instead (``is_postgres`` is set), so the
+        writer's tables never fall behind in a ``state.db`` the core no longer
+        opens (PG3 0051).
         """
         from hermes_state_writer import open_writer
 

@@ -133,12 +133,11 @@ def _connect() -> sqlite3.Connection:
     return SessionDB.open_writer(path, timeout=10, initialize=_initialize_schema)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
+def _is_postgres(conn: Any) -> bool:
+    return bool(getattr(conn, "is_postgres", False))
 
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS async_delegations (
+
+_SCHEMA = """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
             origin_session TEXT NOT NULL,
             origin_ui_session_id TEXT NOT NULL DEFAULT '',
@@ -159,22 +158,90 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             delivery_claimed_at REAL,
             origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
-    )
+
+# Columns added after the table first shipped; older stores gain them lazily.
+_ADDED_COLUMNS = (
+    ("owner_pid", "INTEGER"),
+    ("owner_started_at", "INTEGER"),
+    ("task_json", "TEXT"),
+    ("delivery_claim", "TEXT"),
+    ("delivery_claimed_at", "REAL"),
+    # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+    # request — the wake self-post target. Without persisting it,
+    # completions recovered after a process restart are unroutable on
+    # api_server (the in-memory record that carried it is gone).
+    ("origin_session_id", "TEXT"),
+)
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if _is_postgres(conn):
+        from hermes_state_writer import postgres_ddl
+
+        conn.execute(postgres_ddl(_SCHEMA))
+        columns = {
+            row[0]
+            for row in conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema = current_schema()
+                     AND table_name = 'async_delegations'"""
+            ).fetchall()
+        }
+        for name, sql_type in _ADDED_COLUMNS:
+            if name not in columns:
+                conn.execute(postgres_ddl(
+                    f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}"
+                ))
+        return
+    from hermes_state import apply_wal_with_fallback
+
+    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    conn.execute(_SCHEMA)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
-    for name, sql_type in (
-        ("owner_pid", "INTEGER"),
-        ("owner_started_at", "INTEGER"),
-        ("task_json", "TEXT"),
-        ("delivery_claim", "TEXT"),
-        ("delivery_claimed_at", "REAL"),
-        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
-        ("origin_session_id", "TEXT"),
-    ):
+    for name, sql_type in _ADDED_COLUMNS:
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+
+
+# ``INSERT OR REPLACE`` deletes the old row, so every column absent from the
+# INSERT (completion, result, delivery claim, delivered_at) resets. The
+# PostgreSQL upsert spells that out: same parameters in the same order, the
+# absent columns written as NULL, every non-key column updated from
+# ``excluded`` on conflict.
+_DISPATCH_SQLITE = """INSERT OR REPLACE INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id,
+                parent_session_id, state, dispatched_at, updated_at,
+                delivery_state, delivery_attempts, owner_pid,
+                owner_started_at, task_json, origin_session_id)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)"""
+_DISPATCH_POSTGRES = """INSERT INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id,
+                parent_session_id, state, dispatched_at, updated_at,
+                delivery_state, delivery_attempts, owner_pid,
+                owner_started_at, task_json, origin_session_id,
+                completed_at, event_json, result_json, delivered_at,
+                delivery_claim, delivery_claimed_at)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?,
+                       NULL, NULL, NULL, NULL, NULL, NULL)
+               ON CONFLICT (delegation_id) DO UPDATE SET
+                 origin_session = excluded.origin_session,
+                 origin_ui_session_id = excluded.origin_ui_session_id,
+                 parent_session_id = excluded.parent_session_id,
+                 state = excluded.state,
+                 dispatched_at = excluded.dispatched_at,
+                 updated_at = excluded.updated_at,
+                 delivery_state = excluded.delivery_state,
+                 delivery_attempts = excluded.delivery_attempts,
+                 owner_pid = excluded.owner_pid,
+                 owner_started_at = excluded.owner_started_at,
+                 task_json = excluded.task_json,
+                 origin_session_id = excluded.origin_session_id,
+                 completed_at = excluded.completed_at,
+                 event_json = excluded.event_json,
+                 result_json = excluded.result_json,
+                 delivered_at = excluded.delivered_at,
+                 delivery_claim = excluded.delivery_claim,
+                 delivery_claimed_at = excluded.delivery_claimed_at"""
 
 
 @contextmanager
@@ -247,12 +314,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
-               (delegation_id, origin_session, origin_ui_session_id,
-                parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+            _DISPATCH_POSTGRES if _is_postgres(conn) else _DISPATCH_SQLITE,
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
