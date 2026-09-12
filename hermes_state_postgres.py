@@ -2558,9 +2558,15 @@ def _prepare_readonly_postgres(
 
     # 2. Base schema present?
     try:
+        # 🔴 2026-09-12 fleet: 스키마를 'public' 으로 못박아 pg3_<profile> 테넌트의
+        # 읽기 전용 open 이 전부 "no Hermes schema found" 로 거부됐다(echo authority
+        # 후 broker 2/3). dave 는 public 이라 드러나지 않았다. 실제 세션 스키마는
+        # 연결의 search_path 가 결정하므로 거기서 찾는다(첫 유효 스키마 = 쓰기 경로가
+        # 테이블을 만드는 곳). search_path 가 비면 종전대로 public.
         cur = conn.execute(
             "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name = 'sessions'"
+            "WHERE table_schema = ANY (current_schemas(false)) "
+            "AND table_name = 'sessions'"
         )
         has_sessions = cur.fetchone() is not None
     except Exception as exc:
