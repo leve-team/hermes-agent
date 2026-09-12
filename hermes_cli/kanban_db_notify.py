@@ -204,17 +204,26 @@ def count_notify_subs(
     counts as zero; platform matches case-insensitively (as notifier routing),
     chat/thread exactly. Raises :class:`sqlite3.Error` if the DB exists but is
     unreadable — callers pick their own fallback.
+
+    PostgreSQL uses :func:`connect` with the same board resolver, selection
+    and schema initialization contract as other core entry points (not a
+    read-only open). Missing schemas and routing/connection/query failures
+    raise rather than pretending there are zero subscriptions.
     """
-    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
-    if not path.exists():
-        return 0
+    selected_backend = resolve_backend()
+    if selected_backend == "postgres":
+        path = None
+    else:
+        path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+        if not path.exists():
+            return 0
     owner_where, owner_params = _notify_profile_filter(
         notifier_profiles, include_unowned=include_unowned,
     )
     clauses: list[str] = []
     params: list[Any] = []
     if owner_where:
-        clauses.append(f"({owner_where})")
+        clauses.append("(1 = 0)" if owner_where == "0" else f"({owner_where})")
         params.extend(owner_params)
     for clause, value in (
         ("LOWER(platform) = LOWER(?)", platform),
@@ -227,15 +236,22 @@ def count_notify_subs(
     query = "SELECT COUNT(*) FROM kanban_notify_subs"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    if selected_backend == "postgres":
+        conn = _kb.connect(db_path, board=board)
+    else:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
             row = conn.execute(query, params).fetchone()
         except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
+            if selected_backend == "sqlite" and "no such table" in str(exc).lower():
                 return 0
             raise
         return int(row[0]) if row else 0
+    except Exception:
+        if selected_backend == "postgres":
+            raise RuntimeError("PostgreSQL notification subscription probe failed") from None
+        raise
     finally:
         conn.close()
 
@@ -427,3 +443,4 @@ def rewind_notify_cursor(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
+from hermes_cli.kanban_persistence import resolve_backend  # noqa: E402
