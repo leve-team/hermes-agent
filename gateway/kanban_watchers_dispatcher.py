@@ -211,7 +211,7 @@ class _KanbanDispatcher:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
-    def ready_nonempty(self) -> bool:
+    def ready_nonempty(self) -> Optional[bool]:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
@@ -228,8 +228,11 @@ class _KanbanDispatcher:
                 conn = _kbc().connect(board=slug)
                 if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
                     return True
-            except Exception:
-                continue
+            except Exception as exc:
+                if not self.is_corrupt_board_db_error(exc):
+                    raise
+                logger.warning("kanban dispatcher: health unknown for corrupt board %s", slug)
+                return None
             finally:
                 if conn is not None:
                     with contextlib.suppress(Exception):
@@ -260,8 +263,10 @@ class _KanbanDispatcher:
                 try:
                     triage_ids = _decomp.list_triage_ids()
                 except Exception as exc:
-                    logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
-                    triage_ids = []
+                    if not self.is_corrupt_board_db_error(exc):
+                        raise
+                    logger.warning("kanban auto-decompose: deferring corrupt board %s to quarantine", slug)
+                    continue
                 for tid in triage_ids:
                     if attempted >= auto_decompose_per_tick:
                         break

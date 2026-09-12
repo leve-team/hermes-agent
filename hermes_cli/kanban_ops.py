@@ -189,11 +189,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
-        try:
-            with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
-        except Exception:
-            return False
+        with kbc.connect_closing() as conn:
+            return kbd.has_spawnable_ready(conn)
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()

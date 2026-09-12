@@ -35,13 +35,8 @@ async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) ->
 
 
 def _list_boards(kb: Any) -> list:
-    """Enumerate live boards; fall back to the default board when listing fails."""
-    try:
-        return kb.list_boards(include_archived=False)
-    except Exception:
-        if kb.resolve_backend() == "postgres":
-            raise
-        return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+    """Enumerate live boards; listing failures propagate (no silent default-board fallback)."""
+    return kb.list_boards(include_archived=False)
 
 
 def _board_slugs(kb: Any) -> list:

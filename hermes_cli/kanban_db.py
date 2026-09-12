@@ -1492,13 +1492,13 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
-    "created": "created_at ASC, id ASC",
-    "created-desc": "created_at DESC, id DESC",
+    "created": "created_at ASC, tasks.id ASC",
+    "created-desc": "created_at DESC, tasks.id DESC",
     "priority": "priority DESC, created_at ASC",
     "priority-desc": "priority ASC, created_at ASC",
     "status": "status ASC, created_at ASC",
     "assignee": "assignee ASC, created_at ASC",
-    "title": "title ASC, id ASC",
+    "title": "title ASC, tasks.id ASC",
     "updated": "started_at DESC NULLS LAST, created_at DESC",
 }
 
@@ -1530,10 +1530,14 @@ def list_tasks(
         query += f" ORDER BY {_dialect(conn).order_by(VALID_SORT_ORDERS[order_by])}"
     else:
         query += " ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
-    if limit:
+    if limit and int(limit) > 0:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+class _TaskClaimedError(RuntimeError):
+    """An assignment is refused because the task has a live claim."""
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -1546,7 +1550,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         if not row:
             return False
         if row["claim_lock"] is not None and row["status"] == "running":
-            raise RuntimeError(
+            raise _TaskClaimedError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
@@ -1667,7 +1671,9 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def _linked_ids(conn: sqlite3.Connection, want: str, where: str, task_id: str) -> list[str]:
     rows = conn.execute(
-        f"SELECT {want} FROM task_links WHERE {where} = ? ORDER BY {want}", (task_id,)
+        f"SELECT {want} FROM task_links WHERE {where} = ? ORDER BY "
+        + _dialect(conn).order_by(f"{want} ASC"),
+        (task_id,),
     ).fetchall()
     return [r[want] for r in rows]
 
@@ -1695,7 +1701,8 @@ def task_graph_contexts(conn: sqlite3.Connection, task_ids: Iterable[str]) -> di
         for row in conn.execute(
             f"SELECT l.{own} AS owner_id, t.id, t.title, t.status "
             f"FROM task_links l JOIN tasks t ON t.id = l.{other} "
-            f"WHERE l.{own} IN ({placeholders}) ORDER BY l.{own}, t.id", tuple(ordered_ids),
+            f"WHERE l.{own} IN ({placeholders}) ORDER BY "
+            + _dialect(conn).order_by(f"l.{own} ASC, t.id ASC"), tuple(ordered_ids),
         ).fetchall():
             contexts[row["owner_id"]][bucket].append(
                 {"id": row["id"], "title": row["title"], "status": row["status"]}
@@ -2489,7 +2496,7 @@ def reassign_task(
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
-    except RuntimeError:
+    except _TaskClaimedError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
         return False
@@ -3399,7 +3406,7 @@ def invalidate_descendants_for_parent_reopen(
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
-            """
+            f"""
             WITH RECURSIVE descendants(id) AS (
                 SELECT child_id FROM task_links WHERE parent_id = ?
                 UNION
@@ -3410,7 +3417,7 @@ def invalidate_descendants_for_parent_reopen(
             SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
             FROM descendants d
             JOIN tasks t ON t.id = d.id
-            ORDER BY t.id
+            ORDER BY {_dialect(conn).order_by("t.id ASC")}
             """,
             (task_id,),
         ).fetchall()
@@ -3740,7 +3747,8 @@ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str
     falling back to ``task.result`` for pre-runs-table data. Stamped with a
     relative age so the worker re-verifies stale upstream results."""
     parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY "
+        + _dialect(conn).order_by("parent_id ASC"), (task_id,),
     ).fetchall()
     wrote_header = False
     for pid in (r["parent_id"] for r in parent_rows):
@@ -4106,12 +4114,12 @@ DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
-        """
+        f"""
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
         WHERE l.child_id = ? AND t.status = 'done'
-        ORDER BY t.completed_at ASC
+        ORDER BY {_dialect(conn).order_by("t.completed_at ASC")}
         """,
         (task_id,),
     ).fetchall()

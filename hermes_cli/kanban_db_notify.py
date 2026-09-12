@@ -201,7 +201,7 @@ def count_notify_subs(
     notifier's cheap zero-subscription early exit. Unlike :func:`connect` it
     never creates the file, runs init/migration or opens writable; WAL rows are
     still visible so a fresh sub is never missed. Missing DB / missing table
-    counts as zero; platform matches case-insensitively (as notifier routing),
+    counts as zero; platform matches ASCII-case-insensitively (SQLite compat),
     chat/thread exactly. Raises :class:`sqlite3.Error` if the DB exists but is
     unreadable — callers pick their own fallback.
 
@@ -242,6 +242,10 @@ def count_notify_subs(
         conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
+            if platform is not None:
+                query = query.replace(
+                    "LOWER(platform) = LOWER(?)", _dialect(conn).notify_platform_equals(), 1,
+                )
             row = conn.execute(query, params).fetchone()
         except sqlite3.OperationalError as exc:
             if selected_backend == "sqlite" and "no such table" in str(exc).lower():
@@ -443,4 +447,4 @@ def rewind_notify_cursor(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
-from hermes_cli.kanban_persistence import resolve_backend  # noqa: E402
+from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend  # noqa: E402

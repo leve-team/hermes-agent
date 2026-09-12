@@ -1645,11 +1645,11 @@ def _apply_default_assignee(
                 {"assignee": assignee, "source": "kanban.default_assignee"},
             )
     except Exception:
-        _kb._log.debug(
+        _kb._log.warning(
             "kanban dispatch: failed to apply default_assignee=%r to task %s",
             assignee, task_id, exc_info=True,
         )
-        return False
+        raise
     return True
 
 
@@ -1742,7 +1742,7 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
     ).fetchall()
 
 
@@ -2381,8 +2381,7 @@ def run_daemon(
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
-                with contextlib.suppress(Exception):
-                    on_tick(res)
+                on_tick(res)
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback

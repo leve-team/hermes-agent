@@ -109,6 +109,9 @@ class SQLiteDialect:
     def order_by(self, expression):
         return expression
 
+    def notify_platform_equals(self):
+        return "LOWER(platform) = LOWER(?)"
+
     def table_info(self, conn, table):
         check_table(table)
         return conn.execute(f"PRAGMA table_info({table})").fetchall()

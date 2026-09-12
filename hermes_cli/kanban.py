@@ -430,10 +430,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
-    try:
-        all_boards = kb.list_boards(include_archived=False)
-    except Exception:
-        all_boards = []
+    all_boards = kb.list_boards(include_archived=False)
     if len(all_boards) > 1:
         other_count = len(all_boards) - 1
         print(f"Board: {kb.get_current_board()} ({other_count} other board{'s' if other_count != 1 else ''} — "

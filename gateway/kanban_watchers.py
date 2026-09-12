@@ -271,6 +271,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Emergency stop (`hermes pause`): no auto-decompose or
                 # dispatch while paused; running workers finish naturally.
+                ready_pending = None
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
                 else:
@@ -283,9 +284,10 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    if ready_pending is not None:
+                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
                 now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                if ready_pending is not None and bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     logger.warning(
                         "kanban dispatcher stuck: ready queue non-empty for "
                         "%d consecutive ticks but 0 workers spawned. Check "
