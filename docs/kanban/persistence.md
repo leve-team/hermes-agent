@@ -83,11 +83,43 @@ returned, so the dispatch tick cannot use it to overcommit the host cap.
 SQLite's historical counting/error policy and all its connection code remain
 unchanged. PG census callers must select the PG backend in their bootstrap.
 
-The notifier's SQLite-only zero-subscription probe, worker environment handoff,
-filesystem board CRUD/repair, attachment/workspace metadata, local dispatch
-locks and K/L/T owner-UoW wiring are not migrated by this entry-point patch.
+Worker environment handoff, filesystem board CRUD/repair, attachment/workspace
+metadata, local dispatch locks and K/L/T owner-UoW wiring are not migrated by
+this entry-point patch.
 The two-board watcher test disables decomposition and uses unassigned tasks:
 it proves real board connects/ticks, not a full worker spawn or notification.
+
+### Notification subscription probe (0056)
+
+`count_notify_subs()` now resolves `HERMES_KANBAN_BACKEND` before inspecting
+SQLite files. PostgreSQL opens through the existing `connect(db_path, board=...)`
+contract, so registered board selection, schema validation and selector conflicts
+are identical. The owned connection is always closed; profile ownership and
+platform/chat/thread filters share the same parameterized COUNT query. An empty
+profile allowlist uses a portable false predicate, not SQLite's integer boolean.
+No signature or default-backend change is required.
+
+Only a successful count of zero permits the notifier to skip collection.
+As with the 0055 running-task census, PG resolution, connection, missing-schema
+and query failures are errors, never zero. The notifier treats errors as unknown
+and attempts its normal backend open/collection; an unsuccessful fallback remains
+a logged failure for a later tick, not a claim that the board has no subscribers.
+
+SQLite keeps its read-only, no-initialization probe: a missing file or legacy
+missing subscription table still returns integer zero. PG deliberately uses the
+existing initialized connection rather than introducing a second resolver or
+read-only connection API: it can initialize tables within a precreated schema,
+but cannot create a missing schema or fall back to public/SQLite. The PG probe is
+therefore not the SQLite zero-write optimization; zero skips the subsequent
+collector open only. A concurrent subscription arriving after a real zero count
+is observed on a later tick, as before.
+
+Real PGlite tests store one subscription and assert probe=1, cover empty boards,
+missing schema/socket, filters and selector errors, and run the notifier through
+delivery/cursor advancement with no SQLite DB files. A transient probe connection
+failure must still deliver via the subsequent real open. Only the external
+messaging adapter is replaced; this does not validate deployed credentials,
+worker spawn, wake delivery or multi-host dispatch ownership.
 
 The optional driver is imported only when PostgreSQL is selected. The PG
 connection implements execute/executemany/executescript, cursor fetching,

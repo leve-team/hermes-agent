@@ -11719,9 +11719,9 @@ def count_notify_subs(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> int:
-    """Count ``kanban_notify_subs`` rows via a read-only connection.
+    """Count ``kanban_notify_subs`` rows using the selected backend.
 
-    Cheap probe for the gateway notifier's zero-subscription early exit:
+    SQLite uses a cheap read-only probe for the notifier's early exit:
     unlike :func:`connect`, this never creates the DB file, never runs
     schema init/migration, and never opens the database writable (no
     write locks, no checkpoints — though a read-only open of a WAL
@@ -11738,11 +11738,21 @@ def count_notify_subs(
     (explicit ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
     :class:`sqlite3.Error` when the DB exists but cannot be read
     (locked, corrupt); callers choose their own fallback.
+
+    PostgreSQL uses :func:`connect` with the same board resolver, selection
+    and schema initialization contract as other core entry points. It is
+    not a read-only open. Missing schemas and routing/connection/query
+    failures raise rather than pretending there are zero subscriptions.
+    The owned connection is closed after counting on either backend.
     """
-    path = db_path if db_path is not None else kanban_db_path(board=board)
-    if not path.exists():
-        return 0
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    selected_backend = resolve_backend()
+    if selected_backend == "postgres":
+        conn = connect(db_path, board=board)
+    else:
+        path = db_path if db_path is not None else kanban_db_path(board=board)
+        if not path.exists():
+            return 0
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
             owner_where, owner_params = _notify_profile_filter(
@@ -11751,7 +11761,7 @@ def count_notify_subs(
             clauses: list[str] = []
             params: list[Any] = []
             if owner_where:
-                clauses.append(f"({owner_where})")
+                clauses.append("(1 = 0)" if owner_where == "0" else f"({owner_where})")
                 params.extend(owner_params)
             if platform is not None:
                 clauses.append("LOWER(platform) = LOWER(?)")
@@ -11767,10 +11777,14 @@ def count_notify_subs(
                 query += " WHERE " + " AND ".join(clauses)
             row = conn.execute(query, params).fetchone()
         except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
+            if selected_backend == "sqlite" and "no such table" in str(exc).lower():
                 return 0
             raise
         return int(row[0]) if row else 0
+    except Exception:
+        if selected_backend == "postgres":
+            raise RuntimeError("PostgreSQL notification subscription probe failed") from None
+        raise
     finally:
         conn.close()
 

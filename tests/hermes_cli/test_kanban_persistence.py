@@ -56,6 +56,201 @@ def routed_boards(pg_server, tmp_path, monkeypatch):
         set_board_dsn_resolver(None)
 
 
+def test_pg_notify_probe_matches_sqlite(routed_boards, tmp_path, monkeypatch):
+    home, _ = routed_boards
+    for backend in ("sqlite", "postgres"):
+        with monkeypatch.context() as selection:
+            selection.setenv("HERMES_KANBAN_BACKEND", backend)
+            db_path = tmp_path / "notify.db" if backend == "sqlite" else None
+            with contextlib.closing(kb.connect(db_path, board="other-guild")) as conn:
+                task_id = kb.create_task(conn, title="notify probe parity")
+                kb.add_notify_sub(
+                    conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+                )
+                stored = conn.execute(
+                    "SELECT COUNT(*) FROM kanban_notify_subs"
+                ).fetchone()[0]
+            probe = kb.count_notify_subs(db_path, board="other-guild")
+            print(f"NOTIFY PROBE: backend={backend} stored={stored} probe={probe}")
+            assert type(probe) is int
+            assert stored == probe == 1
+    assert kb.count_notify_subs(board="default") == 0
+    assert not list(home.rglob("*.db"))
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_notify_probe_filters_and_board_selection(routed_boards, monkeypatch, backend):
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", backend)
+    with contextlib.closing(kb.connect(board="other-guild")) as conn:
+        task_id = kb.create_task(conn, title="notify filter parity")
+        for platform, chat_id, thread_id, profile in (
+            ("tui", "session-1", "", "default"),
+            ("TUI", "session-2", "thread-2", "writer"),
+            ("telegram", "session-1", "", None),
+        ):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                notifier_profile=profile,
+            )
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other-guild")
+    assert kb.count_notify_subs() == 3
+    assert kb.count_notify_subs(board="default") == 0
+    assert kb.count_notify_subs(platform="tui") == 2
+    assert kb.count_notify_subs(chat_id="session-1") == 2
+    assert kb.count_notify_subs(thread_id="thread-2") == 1
+    assert kb.count_notify_subs(platform="tui", chat_id="session-1", thread_id="") == 1
+    assert kb.count_notify_subs(notifier_profiles={"writer"}) == 1
+    assert (
+        kb.count_notify_subs(notifier_profiles={"default"}, include_unowned=True) == 2
+    )
+    assert kb.count_notify_subs(notifier_profiles=set()) == 0
+    assert kb.count_notify_subs(notifier_profiles=set(), include_unowned=True) == 1
+    assert (
+        kb.count_notify_subs(
+            platform="tui", notifier_profiles={"default"}, include_unowned=True
+        )
+        == 1
+    )
+    assert kb.count_notify_subs(chat_id="' OR 1=1 -- % ?") == 0
+    assert kb.count_notify_subs(platform="telegram", notifier_profiles={"writer"}) == 0
+
+
+def test_pg_notify_probe_missing_schema_is_not_zero(routed_boards, pg_server):
+    with psycopg.connect(pg_server, autocommit=True) as raw:
+        raw.execute("DROP SCHEMA svc_kanban_other_guild CASCADE")
+    with pytest.raises(RuntimeError, match="connection failed for board 'other-guild'"):
+        kb.count_notify_subs(board="other-guild")
+    with psycopg.connect(pg_server) as raw:
+        assert (
+            raw.execute("SELECT to_regnamespace('svc_kanban_other_guild')").fetchone()[
+                0
+            ]
+            is None
+        )
+
+
+def test_pg_notify_probe_connection_failure_is_not_zero(routed_boards, tmp_path):
+    from psycopg.conninfo import make_conninfo
+
+    set_board_dsn_resolver(
+        lambda token: make_conninfo(
+            host=str(tmp_path / "absent-socket"),
+            dbname="postgres",
+            options=f"-c search_path=svc_kanban_{token}",
+        ),
+        boards=("default", "other-guild"),
+    )
+    with pytest.raises(RuntimeError, match="connection failed for board 'other-guild'"):
+        kb.count_notify_subs(board="other-guild")
+
+
+def test_pg_notify_probe_query_failure_is_not_zero(routed_boards, pg_server):
+    def profiles_after_table_drop():
+        with psycopg.connect(pg_server, autocommit=True) as raw:
+            raw.execute("DROP TABLE svc_kanban_other_guild.kanban_notify_subs")
+        yield "default"
+
+    with pytest.raises(RuntimeError, match="subscription probe failed"):
+        kb.count_notify_subs(
+            board="other-guild", notifier_profiles=profiles_after_table_drop()
+        )
+
+
+def test_pg_notify_probe_rejects_invalid_selectors(
+    routed_boards, tmp_path, monkeypatch
+):
+    with pytest.raises(ValueError, match="not registered"):
+        kb.count_notify_subs(board="unknown")
+    with pytest.raises(ValueError, match="SQLite path"):
+        kb.count_notify_subs(tmp_path / "absent.db")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "absent.db"))
+    with pytest.raises(ValueError, match="SQLite path"):
+        kb.count_notify_subs(board="other-guild")
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="must be sqlite or postgres"):
+        kb.count_notify_subs()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_connection_failure", [False, True])
+async def test_pg_notifier_delivers_after_probe(
+    routed_boards, tmp_path, probe_connection_failure
+):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from psycopg.conninfo import make_conninfo
+
+    home, board_dsn = routed_boards
+    with contextlib.closing(kb.connect(board="other-guild")) as conn:
+        task_id = kb.create_task(conn, title="notify without SQLite", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="default",
+        )
+        kb.complete_task(conn, task_id, summary="PG notification delivered")
+    requests = {"default": 0, "other_guild": 0}
+
+    def resolver(token):
+        requests[token] += 1
+        if probe_connection_failure and token == "other_guild" and requests[token] == 1:
+            return make_conninfo(board_dsn(token), host=str(tmp_path / "absent-socket"))
+        return board_dsn(token)
+
+    set_board_dsn_resolver(resolver, boards=("default", "other-guild"))
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_notifier_profile = "default"
+    runner._kanban_dispatcher_lock_handle = None
+    delivered = asyncio.Event()
+    messages = []
+
+    class RecordingAdapter:
+        async def send(self, chat_id, text, metadata=None):
+            messages.append((chat_id, text))
+            runner._running = False
+            delivered.set()
+
+    runner.adapters = {Platform.TELEGRAM: RecordingAdapter()}
+    watcher = asyncio.create_task(runner._kanban_notifier_watcher(interval=1))
+    try:
+        await asyncio.wait_for(delivered.wait(), timeout=30)
+        await asyncio.wait_for(watcher, timeout=10)
+    finally:
+        runner._running = False
+        if not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
+    assert requests["default"] == 1
+    assert requests["other_guild"] >= 2
+    assert len(messages) == 1
+    assert messages[0][0] == "chat-1"
+    assert "[other-guild]" in messages[0][1]
+    assert "PG notification delivered" in messages[0][1]
+    with contextlib.closing(kb.connect(board="other-guild")) as conn:
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+            kinds=["completed"],
+        )
+        assert events == []
+    assert not list(home.rglob("*.db"))
+    print(
+        f"PG NOTIFIER: probe_connection_failure={probe_connection_failure} "
+        f"delivered={len(messages)} empty_board_opens={requests['default']}"
+    )
+
+
 def test_pg_board_cli_lists_real_subprocesses(routed_boards, pg_server):
     home, _ = routed_boards
     for board in ("default", "other-guild"):

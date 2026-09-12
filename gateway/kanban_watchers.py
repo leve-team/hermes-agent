@@ -343,30 +343,25 @@ class GatewayKanbanWatchersMixin:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
-                        # Zero-subscription early exit: probe the board with a
-                        # cheap read-only connection BEFORE the writable
-                        # `connect()`. A board with no subscriptions has
-                        # nothing to notify, and the writable open (schema
-                        # init/migration on first open, WAL/-shm sidecars,
-                        # checkpoint traffic) is exactly the per-tick cost
-                        # this skip avoids.
+                        subscription_count = None
                         try:
-                            if _kb.count_notify_subs(
+                            subscription_count = _kb.count_notify_subs(
                                 board=slug,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
-                            ) == 0:
-                                logger.debug(
-                                    "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
-                                    slug, sorted(notifier_profiles),
-                                )
-                                continue
+                            )
                         except Exception as exc:
                             logger.debug(
-                                "kanban notifier: read-only subscription probe failed "
-                                "for board %s (%s); falling back to writable open",
+                                "kanban notifier: subscription count unknown "
+                                "for board %s (%s); falling back to backend open",
                                 slug, exc,
                             )
+                        if subscription_count == 0:
+                            logger.debug(
+                                "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
+                                slug, sorted(notifier_profiles),
+                            )
+                            continue
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
