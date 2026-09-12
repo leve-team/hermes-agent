@@ -4,19 +4,385 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
+import asyncio
+from py_pglite import PGliteConfig, PGliteManager
+import json
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import psycopg
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_persistence import dialect_for
+from hermes_cli.kanban_persistence import dialect_for, set_board_dsn_resolver
 from hermes_cli.kanban_postgres import KanbanPostgresConnection
 from tests.hermes_cli.persistence_pg_support import (
     pg_dsn as pg_dsn,
     pg_server as pg_server,
 )
+
+
+@pytest.fixture
+def routed_boards(pg_server, tmp_path, monkeypatch):
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "postgres")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_POSTGRES_DSN", raising=False)
+    boards = ("default", "other-guild")
+    with psycopg.connect(pg_server, autocommit=True) as raw:
+        for board in boards:
+            schema = sql.Identifier("svc_kanban_" + board.replace("-", "_"))
+            raw.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(schema))
+            raw.execute(sql.SQL("CREATE SCHEMA {}").format(schema))
+
+    def resolver(token):
+        return make_conninfo(pg_server, options=f"-c search_path=svc_kanban_{token}")
+
+    set_board_dsn_resolver(resolver, boards=boards)
+    try:
+        yield home, resolver
+    finally:
+        set_board_dsn_resolver(None)
+
+
+def test_pg_board_cli_lists_real_subprocesses(routed_boards, pg_server):
+    home, _ = routed_boards
+    for board in ("default", "other-guild"):
+        assert kb.init_db(board=board) is None
+        with contextlib.closing(kb.connect(board=board)) as conn:
+            task_id = kb.create_task(conn, title=board)
+            conn.execute("UPDATE tasks SET id = ? WHERE id = ?", ("same-id", task_id))
+            kb.add_comment(conn, "same-id", author="test", body=board)
+
+    bootstrap = """
+import os
+from psycopg.conninfo import make_conninfo
+from hermes_cli.kanban_persistence import set_board_dsn_resolver
+set_board_dsn_resolver(
+    lambda token: make_conninfo(os.environ['TEST_PG_DSN'], options=f'-c search_path=svc_kanban_{token}'),
+    boards=('default', 'other-guild'),
+)
+from hermes_cli.main import main
+main()
+"""
+    for board, args in (("default", []), ("other-guild", ["--board", "other-guild"])):
+        command = ["kanban", *args, "list", "--json"]
+        result = subprocess.run(
+            [sys.executable, "-c", bootstrap, *command],
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "TEST_PG_DSN": pg_server},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        print("CLI:", " ".join(command), "EXIT=", result.returncode)
+        print(result.stdout)
+        assert result.returncode == 0, result.stderr
+        tasks = json.loads(result.stdout)
+        assert [(task["id"], task["title"]) for task in tasks] == [("same-id", board)]
+        with contextlib.closing(kb.connect(board=board)) as conn:
+            assert [
+                (row["id"], row["body"])
+                for row in conn.execute("SELECT id, body FROM task_comments").fetchall()
+            ] == [(1, board)]
+    assert not list(home.rglob("*.db"))
+    assert not kb.boards_root().exists()
+
+
+def test_pg_running_census_counts_other_schema_without_sqlite_files(routed_boards):
+    home, _ = routed_boards
+    with contextlib.closing(kb.connect(board="default")) as conn:
+        kb.create_task(conn, title="idle")
+        assert kb.count_running_tasks(conn) == 0
+    with contextlib.closing(kb.connect(board="other-guild")) as conn:
+        task_id = kb.create_task(conn, title="running elsewhere")
+        assert kb.claim_task(conn, task_id, claimer="worker") is not None
+        assert kb.count_running_tasks(conn) == 1
+    assert not list(home.rglob("*.db"))
+    count = kb.count_running_tasks_other_boards("default")
+    print("CENSUS: default=0 other-guild=1 other_boards(default)=", count)
+    assert count == 1
+    assert kb.count_running_tasks_other_boards("other-guild") == 0
+
+
+@pytest.mark.asyncio
+async def test_pg_gateway_watcher_dispatches_each_registered_board(
+    routed_boards, monkeypatch
+):
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from hermes_cli.plugins import get_plugin_manager
+
+    home, _ = routed_boards
+    (home / "config.yaml").write_text(
+        json.dumps({
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "auto_decompose": False,
+                "max_in_progress": 2,
+                "reconcile_orphans": False,
+            }
+        }),
+        encoding="utf-8",
+    )
+    for board, count in (("default", 1), ("other-guild", 2)):
+        with contextlib.closing(kb.connect(board=board)) as conn:
+            for number in range(count):
+                kb.create_task(conn, title=f"{board}-{number}")
+            conn.execute("UPDATE tasks SET status = 'todo'")
+    runner = GatewayKanbanWatchersMixin()
+    runner._running = True
+    ticks = {}
+    finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def observe(**payload):
+        ticks[payload["board"]] = payload["result"].promoted
+        if len(ticks) == 2:
+            runner._running = False
+            loop.call_soon_threadsafe(finished.set)
+
+    manager = get_plugin_manager()
+    monkeypatch.setitem(manager._hooks, "on_kanban_dispatch_tick", [observe])
+    watcher = asyncio.create_task(runner._kanban_dispatcher_watcher())
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=30)
+        await asyncio.wait_for(watcher, timeout=10)
+    finally:
+        runner._running = False
+        if not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
+        runner._release_kanban_dispatcher_lock()
+    print("GATEWAY PG TICKS:", ticks)
+    assert ticks == {"default": 1, "other-guild": 2}
+    assert not list(home.rglob("*.db"))
+
+
+def test_pg_running_census_connection_failure_is_not_zero(routed_boards, tmp_path):
+    from psycopg.conninfo import make_conninfo
+
+    _, resolver = routed_boards
+    set_board_dsn_resolver(
+        lambda token: make_conninfo(resolver(token), host=str(tmp_path / "no-socket")),
+        boards=("default", "other-guild"),
+    )
+    with pytest.raises(
+        RuntimeError, match="census failed for board 'other-guild'"
+    ) as error:
+        kb.count_running_tasks_other_boards("default")
+    print("CENSUS FAILURE:", str(error.value))
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_pg_running_count_query_failure_is_not_zero(routed_boards):
+    with contextlib.closing(kb.connect(board="other-guild")) as conn:
+        conn.execute("DROP TABLE tasks")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            kb.count_running_tasks(conn)
+
+
+def test_pg_missing_inventory_fails_closed(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "postgres")
+    with pytest.raises(ValueError, match="resolver"):
+        kb.count_running_tasks_other_boards("default")
+    with pytest.raises(ValueError, match="resolver"):
+        kb.list_boards()
+
+
+@pytest.mark.parametrize(
+    "slug",
+    [
+        "../other",
+        "other;DROP SCHEMA public",
+        "other'",
+        'other"',
+        "other%20",
+        "other,public",
+        "other\\name",
+        "a\nb",
+        "",
+        "a" * 64,
+    ],
+)
+def test_pg_board_injection_rejected_before_resolver(routed_boards, slug, monkeypatch):
+    calls = []
+
+    def resolver(token):
+        calls.append(token)
+        raise AssertionError("Invalid slugs must not reach the resolver")
+
+    set_board_dsn_resolver(resolver, boards=("default", "other-guild"))
+    with pytest.raises(ValueError, match="slug"):
+        kb.connect(board=slug)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", slug)
+    with pytest.raises(ValueError, match="slug"):
+        kb.init_db()
+    assert not calls
+
+
+def test_pg_normalization_collision_and_unknown_board(routed_boards, monkeypatch):
+    _, resolver = routed_boards
+    with pytest.raises(ValueError, match="colliding"):
+        set_board_dsn_resolver(resolver, boards=("other-guild", "other_guild"))
+    assert [meta["slug"] for meta in kb.list_boards()] == ["default", "other-guild"]
+    with pytest.raises(ValueError, match="not registered"):
+        kb.connect(board="missing")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", " OTHER-GUILD ")
+    with contextlib.closing(kb.connect()) as conn:
+        assert (
+            conn.execute("SELECT current_schema()").fetchone()[0]
+            == "svc_kanban_other_guild"
+        )
+    with kb.scoped_current_board("default"):
+        with contextlib.closing(kb.connect()) as conn:
+            assert (
+                conn.execute("SELECT current_schema()").fetchone()[0]
+                == "svc_kanban_default"
+            )
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_pg_empty_resolver_does_not_fall_back_to_env(
+    routed_boards, pg_server, monkeypatch, value
+):
+    monkeypatch.setenv("HERMES_KANBAN_POSTGRES_DSN", pg_server)
+    set_board_dsn_resolver(lambda token: value, boards=("default",))
+    with pytest.raises(RuntimeError, match="resolution failed"):
+        kb.connect()
+
+
+def test_pg_selector_conflicts_and_explicit_sqlite_override(
+    routed_boards, tmp_path, monkeypatch
+):
+    _, resolver = routed_boards
+    with pytest.raises(ValueError, match="conflicts"):
+        kb.connect(postgres_dsn=resolver("default"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "forbidden.db"))
+    with pytest.raises(ValueError, match="SQLite path"):
+        kb.init_db()
+    with contextlib.closing(
+        kb.connect(tmp_path / "sqlite.db", backend="sqlite")
+    ) as conn:
+        assert isinstance(conn, sqlite3.Connection)
+    assert not (tmp_path / "forbidden.db").exists()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        "",
+        "-c search_path=missing",
+        "-c search_path=public,other",
+        "-c search_path=public;DROP",
+        "-c search_path=" + "a" * 64,
+    ],
+)
+def test_pg_board_schema_must_be_explicit_safe_and_present(
+    routed_boards, pg_server, options
+):
+    from psycopg.conninfo import make_conninfo
+
+    set_board_dsn_resolver(
+        lambda token: make_conninfo(pg_server, options=options),
+        boards=("default",),
+    )
+    with pytest.raises(RuntimeError, match="connection failed for board 'default'"):
+        kb.init_db()
+    with psycopg.connect(pg_server) as raw:
+        assert (
+            raw.execute(
+                "SELECT count(*) FROM pg_tables WHERE schemaname IN (%s, %s)",
+                ("svc_kanban_default", "missing"),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_pg_resolver_exception_does_not_expose_dsn(routed_boards):
+    def resolver(token):
+        raise RuntimeError("postgresql://test-user:test-secret@example.invalid/db")
+
+    set_board_dsn_resolver(resolver, boards=("default", "other-guild"))
+    with pytest.raises(
+        RuntimeError, match="resolution failed for board 'default'"
+    ) as error:
+        kb.init_db()
+    assert "test-secret" not in str(error.value)
+    with pytest.raises(RuntimeError, match="census failed for board 'other-guild'"):
+        kb.count_running_tasks_other_boards("default")
+
+
+def test_pg_explicit_backend_uses_registered_board_not_sqlite_discovery(
+    routed_boards, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_BACKEND", "sqlite")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other-guild")
+    with contextlib.closing(kb.connect(backend="postgres")) as conn:
+        assert (
+            conn.execute("SELECT current_schema()").fetchone()[0]
+            == "svc_kanban_other_guild"
+        )
+
+
+class KanbanPGliteManager(PGliteManager):
+    """Adapt py-pglite 0.5.3 startup to the pinned socket server API."""
+
+    def _generate_unix_js_content(self, ext_requires_str, extensions_obj_str):
+        source = super()._generate_unix_js_content(ext_requires_str, extensions_obj_str)
+        for old, new in (
+            ("const db = new PGlite({", "const db = await PGlite.create({"),
+            ("path: SOCKET_PATH,", "path: SOCKET_PATH, maxConnections: 16,"),
+        ):
+            assert source.count(old) == 1
+            source = source.replace(old, new)
+        return source
+
+
+@pytest.fixture(scope="module")
+def pg_server(tmp_path_factory):
+    work_dir = tmp_path_factory.mktemp("kanban-pg")
+    (work_dir / "package.json").write_text(
+        json.dumps({
+            "private": True,
+            "dependencies": {
+                "@electric-sql/pglite": "0.3.16",
+                "@electric-sql/pglite-socket": "0.0.22",
+            },
+        }),
+        encoding="utf-8",
+    )
+    manager = KanbanPGliteManager(PGliteConfig(work_dir=work_dir))
+    try:
+        manager.start()
+        dsn = manager.get_connection_string().replace(
+            "postgresql+psycopg://", "postgresql://"
+        )
+        with psycopg.connect(dsn) as raw:
+            print("KANBAN_REAL_PG:", raw.execute("SELECT version()").fetchone()[0])
+        yield dsn
+    finally:
+        manager.stop()
+
+
+@pytest.fixture
+def pg_dsn(pg_server):
+    with psycopg.connect(pg_server, autocommit=True) as raw:
+        raw.execute("DROP SCHEMA public CASCADE")
+        raw.execute("CREATE SCHEMA public")
+        raw.execute("SET search_path = public")
+    return pg_server
 
 
 @pytest.fixture(params=["sqlite", "postgres"])

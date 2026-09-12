@@ -20,7 +20,13 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
+from hermes_cli.kanban_persistence import (
+    dialect_for as _dialect,
+    has_board_dsn_resolver,
+    normalize_postgres_board,
+    resolve_backend,
+    resolve_board_dsn,
+)
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -687,6 +693,29 @@ def connect(
     or ``HERMES_KANBAN_POSTGRES_DSN`` and returns a SQLite-shaped adapter
     without opening a SQLite file."""
     if resolve_backend(backend) == "postgres":
+        if has_board_dsn_resolver():
+            # Routed PG: board selection by explicit slug or current-board chain;
+            # SQLite paths and explicit DSNs conflict with that routing contract.
+            if db_path is not None or os.environ.get("HERMES_KANBAN_DB"):
+                raise ValueError("PostgreSQL kanban cannot use a SQLite path or board file")
+            if postgres_dsn is not None:
+                raise ValueError("Explicit postgres_dsn conflicts with the board DSN resolver")
+            slug = (
+                normalize_postgres_board(board)
+                if board is not None else _kb._get_current_postgres_board()
+            )
+            dsn = resolve_board_dsn(slug)
+            from hermes_cli.kanban_postgres import open_postgres
+
+            try:
+                return open_postgres(
+                    _kb.SCHEMA_SQL, _migrate_add_optional_columns,
+                    dsn=dsn, require_board_schema=True,
+                )
+            except Exception:
+                raise RuntimeError(
+                    f"PostgreSQL kanban connection failed for board {slug!r}"
+                ) from None
         if (
             db_path is not None or board is not None
             or os.environ.get("HERMES_KANBAN_DB")
@@ -777,13 +806,17 @@ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = No
             conn.close()
 
 
-def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> Path:
-    """Create the schema if it doesn't exist; return the path used. Unlike
+def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> Optional[Path]:
+    """Create the schema; return the SQLite path, or None for routed PostgreSQL. Unlike
     :func:`connect`'s cached first-time auto-init, this always re-runs the
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
     if resolve_backend() == "postgres":
-        raise ValueError("Use connect() to initialize PostgreSQL; init_db() names a SQLite file")
+        if db_path is not None or not has_board_dsn_resolver():
+            raise ValueError("PostgreSQL init_db requires a board resolver, not a SQLite file")
+        with contextlib.closing(connect(board=board)):
+            pass
+        return None
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.

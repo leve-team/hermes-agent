@@ -137,6 +137,8 @@ class _KanbanDispatcher:
         return _board_slugs(self.kb)
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
+        if self.kb.resolve_backend() == "postgres":
+            return (f"postgres-board:{slug}", None, None)
         path = self.kb.kanban_db_path(slug)
         try:
             resolved = str(path.expanduser().resolve())

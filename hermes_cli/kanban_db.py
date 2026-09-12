@@ -26,7 +26,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
+from hermes_cli.kanban_persistence import (
+    dialect_for as _dialect,
+    has_board_dsn_resolver,
+    normalize_postgres_board,
+    postgres_board_slugs,
+    resolve_backend,
+    resolve_board_dsn,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -402,10 +409,30 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def _get_current_postgres_board() -> str:
+    slug = _CURRENT_BOARD_OVERRIDE.get()
+    if slug is None:
+        slug = os.environ.get("HERMES_KANBAN_BOARD")
+    if slug is None:
+        try:
+            slug = current_board_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            slug = DEFAULT_BOARD
+    slug = normalize_postgres_board(slug)
+    if slug not in postgres_board_slugs():
+        raise ValueError(f"PostgreSQL board {slug!r} is not registered")
+    return slug
+
+
 def get_current_board() -> str:
     """Active slug: context override -> ``HERMES_KANBAN_BOARD`` -> ``<root>/kanban/current``
     (only while that board exists) -> ``DEFAULT_BOARD``. A malformed/stale slug
-    falls through — the dispatcher must never crash on a hand-edited file."""
+    falls through — the dispatcher must never crash on a hand-edited file.
+    Routed PostgreSQL instead validates every selector against its injected
+    board inventory."""
+    if resolve_backend() == "postgres" and has_board_dsn_resolver():
+        return _get_current_postgres_board()
+
     def _existing(candidate: str) -> Optional[str]:
         if not candidate:
             return None
@@ -460,7 +487,11 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Board has ``board.json`` or ``kanban.db`` on disk; ``default`` always exists."""
+    """Board has ``board.json`` or ``kanban.db`` on disk; ``default`` always exists.
+    PostgreSQL uses only the externally registered board inventory."""
+    if resolve_backend() == "postgres":
+        slug = normalize_postgres_board(board if board is not None else DEFAULT_BOARD)
+        return slug in postgres_board_slugs()
     slug = _slug_or_default(board)
     if slug == DEFAULT_BOARD:
         return True
@@ -610,7 +641,14 @@ def create_board(
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
     """Metadata for every board: ``default`` first (always present), then
-    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted."""
+    ``boards/<slug>/`` dirs holding a ``kanban.db`` or ``board.json``, sorted.
+    PostgreSQL returns the injected active boards without filesystem discovery;
+    archived-board management stays external."""
+    if resolve_backend() == "postgres":
+        return [
+            {"slug": slug, "name": _default_board_display_name(slug), "archived": False}
+            for slug in postgres_board_slugs()
+        ]
     entries = [read_board_metadata(DEFAULT_BOARD)]
     seen = {DEFAULT_BOARD}
     root = boards_root()

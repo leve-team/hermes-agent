@@ -1348,7 +1348,14 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    This legacy fail-open policy is SQLite-only; PG query errors propagate.
     """
+    if not _dialect(conn).uses_sqlite_files:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        )
     try:
         return int(
             conn.execute(
@@ -1365,8 +1372,30 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    board to one file) yields 0. Fails open per board (SQLite-only). PG enumerates
+    the injected active boards and propagates failures, naming the failed board
+    rather than returning a partial count that could overcommit workers.
     """
+    if resolve_backend() == "postgres":
+        current = (
+            normalize_postgres_board(board)
+            if board is not None else _kb.get_current_board()
+        )
+        boards = postgres_board_slugs()
+        if current not in boards:
+            raise ValueError(f"PostgreSQL board {current!r} is not registered")
+        total = 0
+        for slug in boards:
+            if slug == current:
+                continue
+            try:
+                with contextlib.closing(_kbc.connect(board=slug)) as other:
+                    total += count_running_tasks(other)
+            except Exception:
+                raise RuntimeError(
+                    f"PostgreSQL running-task census failed for board {slug!r}"
+                ) from None
+        return total
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
     except Exception:
@@ -2364,5 +2393,11 @@ def run_daemon(
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
+from hermes_cli.kanban_persistence import (  # noqa: E402
+    dialect_for as _dialect,
+    normalize_postgres_board,
+    postgres_board_slugs,
+    resolve_backend,
+)
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402

@@ -39,6 +39,8 @@ def _list_boards(kb: Any) -> list:
     try:
         return kb.list_boards(include_archived=False)
     except Exception:
+        if kb.resolve_backend() == "postgres":
+            raise
         return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
 
 
