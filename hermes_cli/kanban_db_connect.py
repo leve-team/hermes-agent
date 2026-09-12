@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import os
 import hashlib
 import random
 import re
@@ -19,6 +20,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -225,6 +227,8 @@ def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
     """``PRAGMA wal_checkpoint(PASSIVE)`` at most once per interval per board,
     from the dispatcher tick under the dispatch lock. Never raises: pure
     hygiene, must not fail a tick."""
+    if not _dialect(conn).uses_sqlite_files:
+        return
     try:
         key = str(db_path.resolve())
     except OSError:
@@ -664,13 +668,36 @@ def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     return conn, out
 
 
-def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> sqlite3.Connection:
+def connect(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    backend: Optional[str] = None,
+    postgres_dsn: Optional[str] = None,
+) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB. WAL is (re)enabled on
     every connection so a re-created file stays robust; the first connection
     per path auto-runs :func:`init_db`, later ones skip via
     ``_INITIALIZED_PATHS``. Path: explicit ``db_path``, else ``board``, else
     :func:`kanban_db_path` (``HERMES_KANBAN_DB`` -> ``HERMES_KANBAN_BOARD`` ->
-    ``<root>/kanban/current`` -> ``default``)."""
+    ``<root>/kanban/current`` -> ``default``).
+
+    Backend selection uses the explicit ``backend`` keyword or
+    ``HERMES_KANBAN_BACKEND`` (default sqlite). PostgreSQL uses ``postgres_dsn``
+    or ``HERMES_KANBAN_POSTGRES_DSN`` and returns a SQLite-shaped adapter
+    without opening a SQLite file."""
+    if resolve_backend(backend) == "postgres":
+        if (
+            db_path is not None or board is not None
+            or os.environ.get("HERMES_KANBAN_DB")
+            or os.environ.get("HERMES_KANBAN_BOARD")
+        ):
+            raise ValueError("PostgreSQL kanban is selected by DSN, not a SQLite path or board")
+        from hermes_cli.kanban_postgres import open_postgres
+
+        return open_postgres(_kb.SCHEMA_SQL, _migrate_add_optional_columns, dsn=postgres_dsn)
+    if postgres_dsn is not None:
+        raise ValueError("postgres_dsn requires backend='postgres'")
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     from agent.delegation_context import is_delegated_child_process_context
     if is_delegated_child_process_context():
@@ -755,6 +782,8 @@ def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> P
     :func:`connect`'s cached first-time auto-init, this always re-runs the
     migration pass — callers that know the on-disk schema may have drifted
     (tests writing legacy event kinds, external upgrades) use it to force it."""
+    if resolve_backend() == "postgres":
+        raise ValueError("Use connect() to initialize PostgreSQL; init_db() names a SQLite file")
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Clear the cache entry so connect() re-runs schema + migrations.
@@ -829,13 +858,11 @@ _NOTIFY_SUB_COLUMNS = (
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    return {row["name"] for row in _dialect(conn).table_info(conn, table)}
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute(
-        f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
-    ).fetchone() is not None
+    return _dialect(conn).table_exists(conn, table)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -922,7 +949,7 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     write_txn serializes against concurrent dispatchers, and the per-row
     UPDATE uses ``current_run_id IS NULL`` as a CAS guard so a racing claim
     can't produce an orphaned row."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=not _dialect(conn).uses_sqlite_files):
         inflight = conn.execute(
             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
             "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -1026,7 +1053,7 @@ _REBUILD_SPECS = {
 
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
-    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    info = _dialect(conn).table_info(conn, table)
     if not info:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
@@ -1036,6 +1063,8 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
         return False
+    if not _dialect(conn).uses_sqlite_files and id_col["identity"] != "d":
+        return True
     return not ((id_col["type"] or "").upper() == "INTEGER" and id_col["pk"])
 
 
@@ -1055,6 +1084,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     drifted = [t for t in _REBUILD_SPECS if _table_has_drifted(conn, t)]
     if not drifted:
         return
+
+    if not _dialect(conn).uses_sqlite_files:
+        raise RuntimeError("PostgreSQL kanban schema drift requires an explicit migration")
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1096,6 +1128,8 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     file, silently dropping concurrent writers' (and a running VACUUM's) locks
     and letting other processes write into a database a writer still believed
     it owned (sqlite.org/howtocorrupt.html §2.2)."""
+    if not _dialect(conn).uses_sqlite_files:
+        return
     from hermes_cli.sqlite_safe_read import file_length_matches_header
 
     # In WAL mode a just-committed page can still live in -wal, so the main
@@ -1156,6 +1190,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation()
+    dialect = _dialect(conn)
+    if dialect.backend != "sqlite":
+        with dialect.write_txn(conn, allow_nested=allow_nested):
+            yield conn
+        return
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1488,9 +1489,9 @@ def list_tasks(
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
             raise ValueError(f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}")
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+        query += f" ORDER BY {_dialect(conn).order_by(VALID_SORT_ORDERS[order_by])}"
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        query += " ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
     if limit:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
