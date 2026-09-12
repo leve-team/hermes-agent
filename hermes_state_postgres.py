@@ -1499,7 +1499,7 @@ _BINDING_TOKENS = re.compile(
 )
 
 
-def _translate_bindings(sql: str) -> str:
+def _translate_bindings(sql: str, *, null_safe: bool = False) -> str:
     """Prepare SQL for psycopg's quote-unaware parameter parser.
 
     SQL literals/comments retain every percent and question mark. Outside
@@ -1507,6 +1507,8 @@ def _translate_bindings(sql: str) -> str:
     existing %% escape survive, and bare modulo/wildcard percents are escaped.
     Values never enter this transformation. Both cursor methods pass a parameter
     collection (even when empty), so the driver always consumes these escapes.
+    Kanban opts into ``null_safe`` for its ``IS ?`` / ``IS NOT ?`` CAS predicates;
+    quoted/commented text is untouched and the state store keeps its default.
     """
     parts = []
     position = 0
@@ -1532,6 +1534,14 @@ def _translate_bindings(sql: str) -> str:
         elif match.group("percent"):
             token = "%%"
         elif match.group("question"):
+            if null_safe:
+                parts[-1] = re.sub(
+                    r"\bIS\s+(NOT\s+)?$",
+                    lambda clause: "IS DISTINCT FROM " if clause.group(1)
+                    else "IS NOT DISTINCT FROM ",
+                    parts[-1],
+                    flags=re.IGNORECASE,
+                )
             token = "%s"
         parts.append(token)
         position = end

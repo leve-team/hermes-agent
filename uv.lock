@@ -1708,6 +1708,9 @@ homeassistant = [
 honcho = [
     { name = "honcho-ai" },
 ]
+kanban-postgres-test = [
+    { name = "py-pglite" },
+]
 matrix = [
     { name = "aiohttp" },
     { name = "aiohttp-socks" },
@@ -1922,6 +1925,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = "==3.3.4" },
     { name = "ptyprocess", marker = "sys_platform != 'win32'", specifier = ">=0.7.0,<1" },
     { name = "pvporcupine", marker = "extra == 'wake'", specifier = "==4.0.3" },
+    { name = "py-pglite", marker = "extra == 'kanban-postgres-test'", specifier = "==0.5.3" },
     { name = "pyasn1", marker = "extra == 'google'", specifier = "==0.6.4" },
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pyjwt", extras = ["crypto"], specifier = "==2.13.0" },
@@ -1968,7 +1972,7 @@ requires-dist = [
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "vercel", "hindsight", "dev", "postgres", "messaging", "cron", "slack", "matrix", "wecom", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "vercel", "hindsight", "dev", "postgres", "kanban-postgres-test", "messaging", "cron", "slack", "matrix", "wecom", "tts-premium", "voice", "wake", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [[package]]
 name = "hf-xet"
@@ -3430,6 +3434,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b2/37/db209e19c4e1d931d1752bdf05c763f119271bb79661d482bdf5f564f662/pvporcupine-4.0.3.tar.gz", hash = "sha256:87d0e4d743a13c3a15b1fb34a9ced66e14bb1125ae079f2e2c09423364a68386", size = 3643620, upload-time = "2026-06-25T21:58:11.366Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/ef/1c4b8e47d8248fe1b615772028265ca65d9ff3ea98022d84cd973d46db87/pvporcupine-4.0.3-py3-none-any.whl", hash = "sha256:92796dbd3cf80a56db1ce20702cbceb151aee34f19ef730591f815eb16f2ebfb", size = 3659883, upload-time = "2026-06-25T21:58:08.805Z" },
+]
+
+[[package]]
+name = "py-pglite"
+version = "0.5.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "psutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2a/12/fb2a0b898f0f34b4e98ea2a2158c1e91afbdfb2b4717a77d7840ae44fb9d/py_pglite-0.5.3.tar.gz", hash = "sha256:58c694602b48fa0562588d7d7c70dd05cc75d048b365ddf3e34d76833598194d", size = 32903, upload-time = "2025-09-17T04:03:51.561Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/e8/9265f8ffced326468dac06919a1ca1cc7cbf8c4267a4547cddf7ef887602/py_pglite-0.5.3-py3-none-any.whl", hash = "sha256:c0526d3f69de34bfab2073be43f83b5f023b1856af9623d491bda0de5bef3475", size = 42375, upload-time = "2025-09-17T04:03:49.892Z" },
 ]
 
 [[package]]

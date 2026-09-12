@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1796,6 +1797,8 @@ def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
     elapsed since this process last checkpointed this board. Never raises:
     the checkpoint is pure hygiene and must not fail a dispatch tick.
     """
+    if not _dialect(conn).uses_sqlite_files:
+        return
     try:
         key = str(db_path.resolve())
     except OSError:
@@ -2328,10 +2331,16 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    backend: Optional[str] = None,
+    postgres_dsn: Optional[str] = None,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
+    Backend selection uses the explicit keyword or HERMES_KANBAN_BACKEND
+    (default sqlite). PostgreSQL uses postgres_dsn or HERMES_KANBAN_POSTGRES_DSN
+    and returns a SQLite-shaped adapter without opening a SQLite file.
+
+    On SQLite, WAL mode is enabled on every connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
 
     The first connection to a given path auto-runs :func:`init_db` so
@@ -2347,6 +2356,18 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    if resolve_backend(backend) == "postgres":
+        if (
+            db_path is not None or board is not None
+            or os.environ.get("HERMES_KANBAN_DB")
+            or os.environ.get("HERMES_KANBAN_BOARD")
+        ):
+            raise ValueError("PostgreSQL kanban is selected by DSN, not a SQLite path or board")
+        from hermes_cli.kanban_postgres import open_postgres
+
+        return open_postgres(SCHEMA_SQL, _migrate_add_optional_columns, dsn=postgres_dsn)
+    if postgres_dsn is not None:
+        raise ValueError("postgres_dsn requires backend='postgres'")
     if db_path is not None:
         path = db_path
     else:
@@ -2513,6 +2534,8 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    if resolve_backend() == "postgres":
+        raise ValueError("Use connect() to initialize PostgreSQL; init_db() names a SQLite file")
     if db_path is not None:
         path = db_path
     else:
@@ -2533,7 +2556,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    cols = {row["name"] for row in _dialect(conn).table_info(conn, "tasks")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -2555,7 +2578,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # columns (for example ``consecutive_failures``) even when this function's
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    cols = {row["name"] for row in _dialect(conn).table_info(conn, "tasks")}
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
@@ -2696,7 +2719,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
-    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    ev_cols = {row["name"] for row in _dialect(conn).table_info(conn, "task_events")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
 
@@ -2708,12 +2731,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
-    notify_table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
-    ).fetchone() is not None
+    notify_table_exists = _dialect(conn).table_exists(conn, "kanban_notify_subs")
     if notify_table_exists:
         notify_cols = {
-            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+            row["name"] for row in _dialect(conn).table_info(conn, "kanban_notify_subs")
         }
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
@@ -2771,11 +2792,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
+    runs_exist = _dialect(conn).table_exists(conn, "task_runs")
     if runs_exist:
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=not _dialect(conn).uses_sqlite_files):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
@@ -2898,7 +2917,7 @@ _REBUILD_SPECS = {
 
 def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     """True when ``table`` still carries the legacy (pre-AUTOINCREMENT) shape."""
-    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    info = _dialect(conn).table_info(conn, table)
     if not info:
         return False  # table absent — nothing to rebuild
     if table == "kanban_notify_subs":
@@ -2908,6 +2927,8 @@ def _table_has_drifted(conn: sqlite3.Connection, table: str) -> bool:
     id_col = next((c for c in info if c["name"] == "id"), None)
     if id_col is None:
         return False
+    if not _dialect(conn).uses_sqlite_files and id_col["identity"] != "d":
+        return True
     return not ((id_col["type"] or "").upper() == "INTEGER" and id_col["pk"])
 
 
@@ -2932,6 +2953,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     drifted = [t for t in _REBUILD_SPECS if _table_has_drifted(conn, t)]
     if not drifted:
         return
+
+    if not _dialect(conn).uses_sqlite_files:
+        raise RuntimeError("PostgreSQL kanban schema drift requires an explicit migration")
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -2986,6 +3010,8 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     write into a database a writer still believed it owned. That is the
     documented corruption route in sqlite.org/howtocorrupt.html section 2.2.
     """
+    if not _dialect(conn).uses_sqlite_files:
+        return
     from hermes_cli.sqlite_safe_read import file_length_matches_header
 
     # In WAL mode a just-committed page can still live in the -wal file, so
@@ -3064,6 +3090,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
+    dialect = _dialect(conn)
+    if dialect.backend != "sqlite":
+        with dialect.write_txn(conn, allow_nested=allow_nested):
+            yield conn
+        return
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -3690,9 +3721,9 @@ def list_tasks(
             raise ValueError(
                 f"order_by must be one of {sorted(VALID_SORT_ORDERS.keys())}"
             )
-        query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
+        query += f" ORDER BY {_dialect(conn).order_by(VALID_SORT_ORDERS[order_by])}"
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        query += " ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
     if limit:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
