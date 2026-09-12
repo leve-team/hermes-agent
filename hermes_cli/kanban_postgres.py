@@ -252,6 +252,7 @@ def open_postgres(
     dsn=None,
     env_var="HERMES_KANBAN_POSTGRES_DSN",
     connection_type=KanbanPostgresConnection,
+    require_board_schema=False,
 ):
     selected_dsn = dsn if dsn is not None else os.environ.get(env_var)
     if not selected_dsn or not selected_dsn.strip():
@@ -259,12 +260,27 @@ def open_postgres(
         raise ValueError(f"PostgreSQL {store_name} requires {env_var}")
     import psycopg
 
+    schema = None
+    if require_board_schema:
+        from psycopg.conninfo import conninfo_to_dict
+
+        options = conninfo_to_dict(selected_dsn).get("options", "")
+        match = re.fullmatch(r"-c\s+search_path=([a-z0-9_]{1,63})", options.strip())
+        if match is None:
+            raise ValueError(
+                "Board DSN requires exactly -c search_path=<schema identifier>"
+            )
+        schema = match.group(1)
     conn = connection_type(
         psycopg.connect(
             selected_dsn, autocommit=True, connect_timeout=5, prepare_threshold=None
         )
     )
     try:
+        if schema is not None:
+            conn.execute("SELECT set_config('search_path', ?, false)", (schema,))
+            if conn.execute("SELECT current_schema()").fetchone()[0] != schema:
+                raise ValueError("PostgreSQL board schema must exist and be accessible")
         conn.execute("SELECT set_config('lock_timeout', '5s', false)")
         conn.execute("SELECT set_config('statement_timeout', '30s', false)")
         conn.kanban_dialect.initialize(conn, schema_sql, migrate)

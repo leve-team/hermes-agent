@@ -1407,6 +1407,8 @@ class GatewayKanbanWatchersMixin:
         ] = {}
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
+            if _kb.resolve_backend() == "postgres":
+                return (f"postgres-board:{slug}", None, None)
             path = _kb.kanban_db_path(slug)
             try:
                 resolved = str(path.expanduser().resolve())
@@ -1529,6 +1531,8 @@ class GatewayKanbanWatchersMixin:
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
+                if _kb.resolve_backend() == "postgres":
+                    raise
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:

@@ -90,7 +90,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from hermes_cli.kanban_persistence import dialect_for as _dialect, resolve_backend
+from hermes_cli.kanban_persistence import (
+    dialect_for as _dialect,
+    has_board_dsn_resolver,
+    normalize_postgres_board,
+    postgres_board_slugs,
+    resolve_backend,
+    resolve_board_dsn,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -608,6 +615,21 @@ def current_board_path() -> Path:
     return kanban_home() / "kanban" / "current"
 
 
+def _get_current_postgres_board() -> str:
+    slug = _CURRENT_BOARD_OVERRIDE.get()
+    if slug is None:
+        slug = os.environ.get("HERMES_KANBAN_BOARD")
+    if slug is None:
+        try:
+            slug = current_board_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            slug = DEFAULT_BOARD
+    slug = normalize_postgres_board(slug)
+    if slug not in postgres_board_slugs():
+        raise ValueError(f"PostgreSQL board {slug!r} is not registered")
+    return slug
+
+
 def get_current_board() -> str:
     """Return the active board slug, honouring the resolution chain.
 
@@ -621,8 +643,11 @@ def get_current_board() -> str:
 
     A malformed or stale slug at any step falls through to the next layer
     with a best-effort warning — the dispatcher must never crash because a
-    user hand-edited a file or removed a board directory.
+    user hand-edited a file or removed a board directory. Routed PostgreSQL
+    instead validates every selector against its injected board inventory.
     """
+    if resolve_backend() == "postgres" and has_board_dsn_resolver():
+        return _get_current_postgres_board()
     scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
     if scoped:
         try:
@@ -703,7 +728,11 @@ def board_exists(board: Optional[str] = None) -> bool:
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
     in a configuration where the kanban feature is usable at all.
+    PostgreSQL uses only the externally registered board inventory.
     """
+    if resolve_backend() == "postgres":
+        slug = normalize_postgres_board(board if board is not None else DEFAULT_BOARD)
+        return slug in postgres_board_slugs()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
@@ -963,8 +992,14 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     that either contain a ``kanban.db`` or a ``board.json``.
 
     Returns a list of metadata dicts, sorted with ``default`` first and
-    the rest alphabetically.
+    the rest alphabetically. PostgreSQL returns the injected active boards
+    without filesystem discovery; archived-board management stays external.
     """
+    if resolve_backend() == "postgres":
+        return [
+            {"slug": slug, "name": _default_board_display_name(slug), "archived": False}
+            for slug in postgres_board_slugs()
+        ]
     entries: list[dict] = []
     seen: set[str] = set()
 
@@ -2339,6 +2374,9 @@ def connect(
     Backend selection uses the explicit keyword or HERMES_KANBAN_BACKEND
     (default sqlite). PostgreSQL uses postgres_dsn or HERMES_KANBAN_POSTGRES_DSN
     and returns a SQLite-shaped adapter without opening a SQLite file.
+    With a registered board DSN resolver, board selection uses the explicit
+    slug or current-board chain instead; SQLite paths and explicit DSNs
+    conflict with that routing contract.
 
     On SQLite, WAL mode is enabled on every connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
@@ -2357,6 +2395,27 @@ def connect(
       ``<root>/kanban/current`` → ``default``.
     """
     if resolve_backend(backend) == "postgres":
+        if has_board_dsn_resolver():
+            if db_path is not None or os.environ.get("HERMES_KANBAN_DB"):
+                raise ValueError("PostgreSQL kanban cannot use a SQLite path or board file")
+            if postgres_dsn is not None:
+                raise ValueError("Explicit postgres_dsn conflicts with the board DSN resolver")
+            slug = (
+                normalize_postgres_board(board)
+                if board is not None else _get_current_postgres_board()
+            )
+            dsn = resolve_board_dsn(slug)
+            from hermes_cli.kanban_postgres import open_postgres
+
+            try:
+                return open_postgres(
+                    SCHEMA_SQL, _migrate_add_optional_columns,
+                    dsn=dsn, require_board_schema=True,
+                )
+            except Exception:
+                raise RuntimeError(
+                    f"PostgreSQL kanban connection failed for board {slug!r}"
+                ) from None
         if (
             db_path is not None or board is not None
             or os.environ.get("HERMES_KANBAN_DB")
@@ -2523,8 +2582,8 @@ def init_db(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> Path:
-    """Create the schema if it doesn't exist; return the path used.
+) -> Optional[Path]:
+    """Create the schema; return the SQLite path, or None for routed PostgreSQL.
 
     Kept as a public entry point so CLI ``hermes kanban init`` and the
     daemon have something explicit to call. Unlike :func:`connect`'s
@@ -2535,7 +2594,11 @@ def init_db(
     force re-migration.
     """
     if resolve_backend() == "postgres":
-        raise ValueError("Use connect() to initialize PostgreSQL; init_db() names a SQLite file")
+        if db_path is not None or not has_board_dsn_resolver():
+            raise ValueError("PostgreSQL init_db requires a board resolver, not a SQLite file")
+        with contextlib.closing(connect(board=board)):
+            pass
+        return None
     if db_path is not None:
         path = db_path
     else:
@@ -9758,7 +9821,14 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     the machine's total, not just its own. Fails open to 0 — a broken
     board must not brick dispatch on healthy ones (corruption is handled
     separately by the watcher's quarantine logic).
+    This legacy fail-open policy is SQLite-only; PG query errors propagate.
     """
+    if not _dialect(conn).uses_sqlite_files:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        )
     try:
         return int(
             conn.execute(
@@ -9781,8 +9851,30 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     Boards are matched by resolved DB path, so the ``HERMES_KANBAN_DB``
     override (which pins every board to one file) naturally yields 0.
     Fails open per board: one broken/corrupt board must not brick dispatch
-    on the healthy ones.
+    on the healthy ones. This policy remains SQLite-only. PG enumerates
+    the injected active boards and propagates failures, naming the failed
+    board rather than returning a partial count that could overcommit workers.
     """
+    if resolve_backend() == "postgres":
+        current = (
+            normalize_postgres_board(board)
+            if board is not None else get_current_board()
+        )
+        boards = postgres_board_slugs()
+        if current not in boards:
+            raise ValueError(f"PostgreSQL board {current!r} is not registered")
+        total = 0
+        for slug in boards:
+            if slug == current:
+                continue
+            try:
+                with contextlib.closing(connect(board=slug)) as other:
+                    total += count_running_tasks(other)
+            except Exception:
+                raise RuntimeError(
+                    f"PostgreSQL running-task census failed for board {slug!r}"
+                ) from None
+        return total
     try:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
     except Exception:

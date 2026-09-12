@@ -14,12 +14,80 @@ PG DSN with SQLite selected fails before filesystem creation. Driver/connection
 errors do not fall back to SQLite. No configuration file or environment is
 written. A bootstrap can resolve its own configuration and pass these keywords.
 
-The PG DSN identifies **one board namespace** via its database/current schema.
-An explicit SQLite path/board or `HERMES_KANBAN_DB`/`HERMES_KANBAN_BOARD` conflicts
-with PG selection and is rejected. The adapter must not silently merge boards.
-`init_db()` remains a SQLite-file entry point and rejects PG; PG initialization
-is performed by `connect()`. `connect_closing()` supports environment selection.
-Board-aware CLI/dispatcher wiring and path-based readers are not migrated here.
+Without board registration, the PG DSN still identifies **one board namespace**:
+explicit SQLite paths/boards and `HERMES_KANBAN_DB`/`HERMES_KANBAN_BOARD` are
+rejected, and `init_db()` requires registration. The legacy direct-DSN
+`connect()` path remains available. `connect_closing()` supports environment
+selection.
+
+## Board-aware entry points (0055)
+
+A trusted outer bootstrap registers routing before CLI dispatch or gateway
+threads start, in **each process** (including spawned workers):
+
+```python
+from psycopg.conninfo import make_conninfo
+from hermes_cli.kanban_persistence import set_board_dsn_resolver
+
+def board_dsn(token):
+    schema = "svc_kanban_" + token
+    if len(schema) > 63:
+        raise ValueError("Board schema identifier is too long")
+    return make_conninfo(service_dsn, options=f"-c search_path={schema}")
+
+set_board_dsn_resolver(board_dsn, boards=("default", "other-guild"))
+```
+
+`service_dsn` comes from the outer application, not a core default. Select
+`HERMES_KANBAN_BACKEND=postgres` in that process's existing bootstrap configuration.
+Registration alone does not change the backend. This is not an environment-file
+edit or a deployment instruction. No host application is imported by core.
+
+Registration requires a complete, nonempty, active-board inventory. Core strips
+and lowercases slugs, validates `[a-z0-9][a-z0-9_-]{0,62}`, then passes the
+`[a-z0-9_]+` token (`-` becomes `_`) to the resolver. Rejecting duplicate tokens
+prevents `other-guild`/`other_guild` and case aliases from silently colliding.
+Unknown/invalid boards fail before the callback; failed registration leaves the
+previous registration intact. `set_board_dsn_resolver(None)` clears routing.
+Do not mutate process-global routing while workers are active. Archive/CRUD,
+inventory completeness, distinct schema mappings and privileges belong to the
+bootstrap, not filesystem metadata or schema-catalog guessing.
+
+Each resolver DSN must carry exactly `options=-c search_path=<schema>` (URL-encode
+when constructing a URI). The complete schema identifier must match
+`[a-z0-9_]{1,63}`. Multiple schemas, extra options and missing schemas are rejected.
+The connection explicitly binds `set_config('search_path', schema, false)` and
+verifies `current_schema()` **before DDL**. It never creates schemas or falls
+back to `public`. This also covers socket proxies that ignore startup options.
+The resolver is trusted configuration, not an authorization mechanism.
+
+`connect(board=...)` creates and owns one connection in the selected schema.
+Without `board`, selection is scoped CLI override → `HERMES_KANBAN_BOARD` →
+the current-board pointer → `default`; invalid, empty or unregistered selectors
+fail rather than routing to another board. Existence and `list_boards()` use the
+injected inventory (active boards only, independent of `include_archived`).
+Explicit SQLite paths, `HERMES_KANBAN_DB`, or explicit `postgres_dsn` conflict
+with registered routing. The resolver is authoritative over the legacy DSN env;
+empty returns never fall back to it. `init_db()` closes its PG connection and
+returns `None`; its unchanged SQLite branch returns the file `Path`.
+
+`kanban list` and `kanban --board other-guild list` run through the real CLI
+after bootstrap registration; simply setting a DSN in an unbootstrapped CLI is
+not enough. The gateway dispatcher enumerates the same inventory and connects
+separately for each slug. It does not use SQLite file fingerprints for PG.
+PG `count_running_tasks_other_boards()` excludes the selected slug and sums
+the other registered schemas without file-existence checks. Enumeration,
+resolution, connection and query failures propagate; board failures carry the
+slug, not DSN/password/driver details. No partial count or disguised zero is
+returned, so the dispatch tick cannot use it to overcommit the host cap.
+SQLite's historical counting/error policy and all its connection code remain
+unchanged. PG census callers must select the PG backend in their bootstrap.
+
+The notifier's SQLite-only zero-subscription probe, worker environment handoff,
+filesystem board CRUD/repair, attachment/workspace metadata, local dispatch
+locks and K/L/T owner-UoW wiring are not migrated by this entry-point patch.
+The two-board watcher test disables decomposition and uses unassigned tasks:
+it proves real board connects/ticks, not a full worker spawn or notification.
 
 The optional driver is imported only when PostgreSQL is selected. The PG
 connection implements execute/executemany/executescript, cursor fetching,
@@ -88,6 +156,14 @@ cold connection setup is not covered: PGlite's single-backend socket multiplexer
 deadlocks on that setup pattern. Native multi-backend PG startup concurrency,
 network-loss/commit-response ambiguity, service privileges and deployment remain
 separate validation obligations. Sequence gaps after PG rollback are allowed.
+
+The board entry-point tests in `test_kanban_persistence.py` exercise real CLI
+subprocesses with bootstrap registration, two schemas with identical IDs,
+the live gateway dispatcher loop, other-board counts, missing sockets, failed
+queries and hostile slugs/DSN options. The pinned PGlite socket server ignores
+startup options and shares session state across clients: explicit schema setup
+is tested, but simultaneous per-session `search_path` isolation requires native
+PostgreSQL validation. Do not infer that guarantee from the PGlite fixture.
 
 An outer migration must map `(guild, id)`/board routing, choose the service
 database/schema, initialize before the UoW, and adapt K/L/T repositories to the
