@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
+from hermes_cli.kanban_persistence import resolve_backend as _resolve_backend
+from hermes_cli.projects_persistence import project_columns as _project_columns, write_txn
+from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_constants import get_hermes_home
 
 
@@ -116,7 +118,16 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
     WAL with DELETE fallback for network filesystems (``hermes_state`` helper). Schema init is
     idempotent (``CREATE TABLE IF NOT EXISTS`` + additive migrations) and cached per-path per-process.
+
+    ``HERMES_PROJECTS_BACKEND=postgres`` opts into the projects DSN. Explicit
+    SQLite paths cannot be mixed with PostgreSQL selection.
     """
+    if _resolve_backend(env_var="HERMES_PROJECTS_BACKEND") == "postgres":
+        if db_path is not None:
+            raise ValueError("PostgreSQL projects cannot use a SQLite db_path")
+        from hermes_cli.projects_postgres import open_projects_postgres
+
+        return open_projects_postgres(SCHEMA_SQL, _migrate_add_optional_columns)
     path = db_path if db_path is not None else projects_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
@@ -129,10 +140,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         conn.execute("PRAGMA foreign_keys=ON")
         if resolved not in _INITIALIZED_PATHS:
             conn.executescript(SCHEMA_SQL)
-            cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
-            for col in _OPTIONAL_PROJECT_COLUMNS:
-                if col not in cols:
-                    _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+            _migrate_add_optional_columns(conn)
             _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()
@@ -150,6 +158,14 @@ def connect_closing(db_path: Optional[Path] = None):
     finally:
         with contextlib.suppress(Exception):
             conn.close()
+
+
+def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after v1 to legacy DBs (safe on every open)."""
+    cols = {row["name"] for row in _project_columns(conn)}
+    for col in _OPTIONAL_PROJECT_COLUMNS:
+        if col not in cols:
+            _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
 
 
 @dataclass

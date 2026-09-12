@@ -24,14 +24,10 @@ def check_table(table):
         raise ValueError("Table is outside the kanban persistence contract")
 
 
-def resolve_backend(backend=None):
-    selected = (
-        backend
-        if backend is not None
-        else os.environ.get("HERMES_KANBAN_BACKEND", "sqlite")
-    )
+def resolve_backend(backend=None, *, env_var="HERMES_KANBAN_BACKEND"):
+    selected = backend if backend is not None else os.environ.get(env_var, "sqlite")
     if selected not in ("sqlite", "postgres"):
-        raise ValueError("HERMES_KANBAN_BACKEND must be sqlite or postgres")
+        raise ValueError(f"{env_var} must be sqlite or postgres")
     return selected
 
 
