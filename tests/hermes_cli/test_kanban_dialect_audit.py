@@ -427,3 +427,10 @@ def test_notify_platform_case_folding_matches_sqlite(routed_store):
     actual = {platform: kb.count_notify_subs(platform=platform) for platform in ("tui", "ä", "Ä", "İ", "i")}
     print(f"PLATFORM CASE: backend={backend} counts={actual}")
     assert actual == {"tui": 1, "ä": 1, "Ä": 1, "İ": 1, "i": 1}
+
+
+def test_list_notify_subs_empty_owner_filter_is_valid_on_both_engines(stores):
+    """빈/공백 소유자 필터가 SQLite 에서는 [] 이고 PG 에서는 42804 로 죽던 반례(2-b 6차)."""
+    for backend, conn in stores.items():
+        for profiles in ([], ["  "]):
+            assert kb.list_notify_subs(conn, notifier_profiles=profiles) == [], backend

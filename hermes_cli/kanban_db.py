@@ -11671,7 +11671,10 @@ def _notify_profile_filter(
     if include_unowned:
         clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
     if not clauses:
-        return "0", []
+        # "0" is a valid SQLite predicate but PostgreSQL rejects an integer in
+        # WHERE (SQLSTATE 42804 datatype mismatch, and it aborts the owner
+        # transaction). "1=0" is false on both engines. (2-b 6th bounce, 2026-09-13)
+        return "1=0", []
     return "(" + ") OR (".join(clauses) + ")", params
 
 
