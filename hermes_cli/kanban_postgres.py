@@ -62,18 +62,31 @@ class PostgresDialect:
 
     def order_by(self, expression):
         terms = []
+        text_columns = {
+            "status", "assignee", "title", "tasks.id", "t.id",
+            "parent_id", "child_id", "l.parent_id", "l.child_id",
+        }
+        numeric_columns = {
+            "created_at", "id", "priority", "started_at",
+            "t.completed_at", "r.ended_at",
+        }
         for term in expression.split(", "):
             match = re.fullmatch(
-                r"(?:created_at|id|priority|status|assignee|title|started_at) "
+                r"([a-z_.]+) "
                 r"(ASC|DESC)(?: NULLS (FIRST|LAST))?",
                 term,
             )
-            if match is None:
+            if match is None or match.group(1) not in text_columns | numeric_columns:
                 raise ValueError("Unknown kanban sort expression")
-            if match.group(2) is None:
-                term += " NULLS FIRST" if match.group(1) == "ASC" else " NULLS LAST"
+            column, direction, nulls = match.groups()
+            collation = ' COLLATE "C"' if column in text_columns else ""
+            nulls = nulls or ("FIRST" if direction == "ASC" else "LAST")
+            term = f"{column}{collation} {direction} NULLS {nulls}"
             terms.append(term)
         return ", ".join(terms)
+
+    def notify_platform_equals(self):
+        return 'LOWER(platform COLLATE "C") = LOWER(? COLLATE "C")'
 
     def table_info(self, conn, table):
         self.check_table(table)

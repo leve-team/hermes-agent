@@ -3730,13 +3730,13 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
-    "created": "created_at ASC, id ASC",
-    "created-desc": "created_at DESC, id DESC",
+    "created": "created_at ASC, tasks.id ASC",
+    "created-desc": "created_at DESC, tasks.id DESC",
     "priority": "priority DESC, created_at ASC",
     "priority-desc": "priority ASC, created_at ASC",
     "status": "status ASC, created_at ASC",
     "assignee": "assignee ASC, created_at ASC",
-    "title": "title ASC, id ASC",
+    "title": "title ASC, tasks.id ASC",
     "updated": "started_at DESC NULLS LAST, created_at DESC",
 }
 
@@ -3787,10 +3787,14 @@ def list_tasks(
         query += f" ORDER BY {_dialect(conn).order_by(VALID_SORT_ORDERS[order_by])}"
     else:
         query += " ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
-    if limit:
+    if limit and int(limit) > 0:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+class _TaskClaimedError(RuntimeError):
+    """An assignment is refused because the task has a live claim."""
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -3807,7 +3811,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         if not row:
             return False
         if row["claim_lock"] is not None and row["status"] == "running":
-            raise RuntimeError(
+            raise _TaskClaimedError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
@@ -3997,7 +4001,8 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY "
+        + _dialect(conn).order_by("parent_id ASC"),
         (task_id,),
     ).fetchall()
     return [r["parent_id"] for r in rows]
@@ -4005,7 +4010,8 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
 
 def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
-        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY "
+        + _dialect(conn).order_by("child_id ASC"),
         (task_id,),
     ).fetchall()
     return [r["child_id"] for r in rows]
@@ -4027,7 +4033,8 @@ def task_graph_contexts(
     for row in conn.execute(
         "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
         "FROM task_links l JOIN tasks t ON t.id = l.parent_id "
-        f"WHERE l.child_id IN ({placeholders}) ORDER BY l.child_id, t.id",
+        f"WHERE l.child_id IN ({placeholders}) ORDER BY "
+        + _dialect(conn).order_by("l.child_id ASC, t.id ASC"),
         tuple(ordered_ids),
     ).fetchall():
         contexts[row["owner_id"]]["parents"].append({
@@ -4038,7 +4045,8 @@ def task_graph_contexts(
     for row in conn.execute(
         "SELECT l.parent_id AS owner_id, t.id, t.title, t.status "
         "FROM task_links l JOIN tasks t ON t.id = l.child_id "
-        f"WHERE l.parent_id IN ({placeholders}) ORDER BY l.parent_id, t.id",
+        f"WHERE l.parent_id IN ({placeholders}) ORDER BY "
+        + _dialect(conn).order_by("l.parent_id ASC, t.id ASC"),
         tuple(ordered_ids),
     ).fetchall():
         contexts[row["owner_id"]]["children"].append({
@@ -4057,12 +4065,12 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
-        """
+        f"""
         SELECT t.id AS id, t.result AS result
         FROM tasks t
         JOIN task_links l ON l.parent_id = t.id
         WHERE l.child_id = ? AND t.status = 'done'
-        ORDER BY t.completed_at ASC
+        ORDER BY {_dialect(conn).order_by("t.completed_at ASC")}
         """,
         (task_id,),
     ).fetchall()
@@ -5301,7 +5309,7 @@ def reassign_task(
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
-    except RuntimeError:
+    except _TaskClaimedError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
         return False
@@ -7177,7 +7185,7 @@ def invalidate_descendants_for_parent_reopen(
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
-            """
+            f"""
             WITH RECURSIVE descendants(id) AS (
                 SELECT child_id FROM task_links WHERE parent_id = ?
                 UNION
@@ -7188,7 +7196,7 @@ def invalidate_descendants_for_parent_reopen(
             SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
             FROM descendants d
             JOIN tasks t ON t.id = d.id
-            ORDER BY t.id
+            ORDER BY {_dialect(conn).order_by("t.id ASC")}
             """,
             (task_id,),
         ).fetchall()
@@ -10159,7 +10167,7 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.
@@ -10168,7 +10176,7 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
+            "ORDER BY " + _dialect(conn).order_by("priority DESC, created_at ASC")
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
@@ -10269,13 +10277,12 @@ def _dispatch_once_locked(
                                 },
                             )
                     except Exception:
-                        _log.debug(
+                        _log.warning(
                             "kanban dispatch: failed to apply default_assignee=%r "
                             "to task %s",
                             _default_assignee, row["id"], exc_info=True,
                         )
-                        result.skipped_unassigned.append(row["id"])
-                        continue
+                        raise
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
             else:
@@ -11109,10 +11116,7 @@ def run_daemon(
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
-                try:
-                    on_tick(res)
-                except Exception:
-                    pass
+                on_tick(res)
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
@@ -11256,7 +11260,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
     parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY "
+        + _dialect(conn).order_by("parent_id ASC"),
         (task_id,),
     ).fetchall()
     parent_ids = [r["parent_id"] for r in parent_rows]
@@ -11321,14 +11326,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
             "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
+            "ORDER BY " + _dialect(conn).order_by("r.ended_at DESC") + " LIMIT 5",
             (task.assignee, task_id),
         ).fetchall()
         if role_rows:
             lines.append(f"## Recent work by @{task.assignee}")
             for row in role_rows:
-                ts = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
+                ts = (
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"])))
+                    if row["ended_at"] is not None else "unknown time"
                 )
                 age = _relative_age(row["ended_at"], _now)
                 ts_disp = f"{ts}, {age}" if age else ts
@@ -11733,7 +11739,7 @@ def count_notify_subs(
     by those profiles are counted; ``include_unowned`` also includes legacy
     rows without an owner stamp. Optional platform/chat/thread filters narrow
     the probe to one notification owner without changing the unfiltered count.
-    Platform matching is case-insensitive, matching notifier routing; chat and
+    Platform matching is ASCII-case-insensitive (SQLite compatibility); chat and
     thread identifiers are exact. Path resolution matches :func:`connect`
     (explicit ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
     :class:`sqlite3.Error` when the DB exists but cannot be read
@@ -11764,7 +11770,7 @@ def count_notify_subs(
                 clauses.append("(1 = 0)" if owner_where == "0" else f"({owner_where})")
                 params.extend(owner_params)
             if platform is not None:
-                clauses.append("LOWER(platform) = LOWER(?)")
+                clauses.append(_dialect(conn).notify_platform_equals())
                 params.append(platform)
             if chat_id is not None:
                 clauses.append("chat_id = ?")

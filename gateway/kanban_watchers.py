@@ -324,10 +324,7 @@ class GatewayKanbanWatchersMixin:
                     # HERMES_KANBAN_DB pins the board path; without this guard
                     # one gateway could collect the same subscription/event
                     # more than once before advancing the cursor.
-                    try:
-                        boards = _kb.list_boards(include_archived=False)
-                    except Exception:
-                        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    boards = _kb.list_boards(include_archived=False)
                     seen_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
@@ -1535,7 +1532,7 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
+        def _ready_nonempty() -> Optional[bool]:
             """Cheap probe: is there at least one ready+assigned+unclaimed
             task on ANY board whose assignee maps to a real Hermes profile
             (i.e. one the dispatcher would actually spawn for)?
@@ -1554,10 +1551,7 @@ class GatewayKanbanWatchersMixin:
             # fire a false "dispatcher stuck" warning that never clears. Shares
             # the exact gate the dispatcher uses so the two can't drift.
             _review_probe = _kb.review_dispatch_enabled()
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _kb.list_boards(include_archived=False)
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -1567,8 +1561,11 @@ class GatewayKanbanWatchersMixin:
                         return True
                     if _review_probe and _kb.has_spawnable_review(conn):
                         return True
-                except Exception:
-                    continue
+                except Exception as exc:
+                    if not _is_corrupt_board_db_error(exc):
+                        raise
+                    logger.warning("kanban dispatcher: health unknown for corrupt board %s", slug)
+                    return None
                 finally:
                     if conn is not None:
                         try:
@@ -1608,10 +1605,7 @@ class GatewayKanbanWatchersMixin:
                     "kanban auto-decompose: import failed (%s); skipping", exc,
                 )
                 return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _kb.list_boards(include_archived=False)
             attempted = 0
             successes = 0
             for b in boards:
@@ -1628,11 +1622,10 @@ class GatewayKanbanWatchersMixin:
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
-                        triage_ids = []
+                        if not _is_corrupt_board_db_error(exc):
+                            raise
+                        logger.warning("kanban auto-decompose: deferring corrupt board %s to quarantine", slug)
+                        continue
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
@@ -1724,11 +1717,12 @@ class GatewayKanbanWatchersMixin:
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
-                    if ready_pending and not any_spawned:
-                        bad_ticks += 1
-                    else:
-                        bad_ticks = 0
-                if bad_ticks >= HEALTH_WINDOW:
+                    if ready_pending is not None:
+                        if ready_pending and not any_spawned:
+                            bad_ticks += 1
+                        else:
+                            bad_ticks = 0
+                if ready_pending is not None and bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
                         logger.warning(

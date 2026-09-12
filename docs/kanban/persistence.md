@@ -169,6 +169,46 @@ datetime('now') or FTS call to translate.
 
 ## Verification and handoff
 
+### Dialect audit (0057)
+
+Dispatcher ready/review selection uses the same closed `order_by()` dialect as
+task listing. PostgreSQL adds SQLite-compatible NULL placement without changing
+stored priorities. Text task/graph keys and task title/status/assignee sorting
+use PostgreSQL `COLLATE "C"`, matching the canonical SQLite BINARY collation;
+numeric run/event IDs never receive a text collation. Notification platform
+matching does not depend on the PostgreSQL locale:
+`notify_platform_equals()` preserves SQLite's ASCII-only LOWER behavior, keeping
+non-ASCII platform strings distinct rather than broadening subscription counts.
+Nullable parent completion
+and role-history timestamps also use the dialect. A missing role-history end
+time renders as `unknown time`, not a fabricated epoch. Ordering ties without a
+declared tie-breaker remain unspecified. Nonpositive task-list limits retain
+SQLite's unbounded-list behavior without sending a negative LIMIT to PostgreSQL.
+
+Inventory and ordinary storage failures in notifier, gateway health,
+auto-decomposition and CLI list/daemon paths are not empty/idle results. They
+propagate to the existing error/reporting boundary. A default-assignment write
+failure rolls back and fails the tick instead of reporting an unassigned card.
+Reassignment maps only the specific live-claim refusal to False, not transaction
+composition errors. Known SQLite corruption still reaches the existing board
+quarantine; health is explicitly unknown (`None`) and does not reset the stuck
+counter. Neither general PostgreSQL failures nor other SQLite query errors use
+that corruption exception.
+
+`scripts/kanban_dialect_audit.py --revision <commit>` emits every execute call,
+exception handler, suppress block, lexical hit and source hash in the three
+audited files. With no revision it audits the working tree. It is an inventory,
+not a generic SQL translator or a claim that arbitrary dynamic SQL is safe.
+The 0057 handoff classifies each baseline site, including standard SQL and
+SQLite-only administration/repair, legacy JSON tolerance, best-effort observer
+and filesystem cleanup, and already-guarded SQLite counting/probes. PostgreSQL
+schema drift continues to require an explicit migration; this patch does not
+implement management CLI migration, distributed locks, or deployment bootstrap.
+
+Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_dialect_audit.py` for the
+real SQLite/PostgreSQL parity, failure and inventory regressions. The dispatch
+test actually claims and calls an injected process-spawn boundary, not dry-run.
+
 Install the pinned dev, postgres and kanban-postgres-test extras. The new test
 file requires Node/npm and py-pglite 0.5.3 (absence is an error, not a skip); its
 throwaway socket fixture pins PGlite 0.3.16 and pglite-socket 0.0.22. Run:

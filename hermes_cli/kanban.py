@@ -1663,10 +1663,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     # Passive discoverability: when the user has multiple boards, surface
     # which one they're looking at in the list header. Single-board users
     # never see this — the feature stays invisible until you opt in.
-    try:
-        all_boards = kb.list_boards(include_archived=False)
-    except Exception:
-        all_boards = []
+    all_boards = kb.list_boards(include_archived=False)
     if len(all_boards) > 1:
         current = kb.get_current_board()
         other_count = len(all_boards) - 1
@@ -2845,11 +2842,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         terminals via ``claim_task`` directly — those are correctly idle
         from the dispatcher's perspective, not stuck.
         """
-        try:
-            with kb.connect_closing() as conn:
-                return kb.has_spawnable_ready(conn)
-        except Exception:
-            return False
+        with kb.connect_closing() as conn:
+            return kb.has_spawnable_ready(conn)
 
     try:
         kb.run_daemon(
