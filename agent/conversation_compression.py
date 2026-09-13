@@ -2125,13 +2125,21 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> None:
 
 def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
     """Preserve human intent, not merely a synthetic user-role placeholder."""
-    if any(_is_real_user_message(message) for message in compressed):
-        return
     from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
         COMPRESSION_CONTINUATION_USER_CONTENT,
+        _INFLIGHT_REPLAY_MERGED_KEY,
         _fresh_compaction_message_copy,
     )
 
+    if any(
+        message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        and _INFLIGHT_REPLAY_MERGED_KEY in message
+        for message in compressed
+    ):
+        return
+    if any(_is_real_user_message(message) for message in compressed):
+        return
     for message in reversed(original_messages):
         if _is_real_user_message(message):
             _insert_real_user_anchor(
