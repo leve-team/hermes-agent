@@ -2132,10 +2132,20 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
     # walk treats the whole compacted transcript as unpersisted and re-INSERTs it — the live set doubles on
     # every compaction (~58K → ~512K tokens in production).
     from agent.context_compressor import (
-        _INFLIGHT_REPLAY_MERGED_KEY, COMPRESSION_CONTINUATION_USER_CONTENT, _fresh_compaction_message_copy,
+        _INFLIGHT_REPLAY_MERGED_KEY, COMPRESSED_SUMMARY_METADATA_KEY, COMPRESSION_CONTINUATION_USER_CONTENT,
+        _fresh_compaction_message_copy,
     )
     if any(isinstance(message, dict) and message.get(_INFLIGHT_REPLAY_MERGED_KEY) for message in compressed):
         # The in-flight request was restated onto the summary carrier (#100818); an anchor would duplicate it.
+        return "already_present"
+    if any(
+        isinstance(message, dict)
+        and message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        and _INFLIGHT_REPLAY_MERGED_KEY in message
+        for message in compressed
+    ):
+        # Fable harness carrier: protected turns already ride inside the summary as reference data
+        # (levos fable-5-1 harness contract); a restored anchor would add a second user row.
         return "already_present"
     # One reversed scan over BOTH kinds: scanning steer then user would let an older
     # consumed steer outrank a newer real user request and replay it.

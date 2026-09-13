@@ -21,7 +21,7 @@ from agent.anthropic_endpoints import (
     _requires_bearer_auth,
 )
 from agent.anthropic_message_convert import (
-    convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name,
+    _is_fable_model, convert_messages_to_anthropic, convert_tools_to_anthropic, normalize_model_name,
 )
 
 from hermes_cli import __version__ as _HERMES_VERSION

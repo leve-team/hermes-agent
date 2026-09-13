@@ -101,6 +101,14 @@ def _is_bedrock_model_id(model: str) -> bool:
     return model.lower().startswith(_BEDROCK_REGION_PREFIXES + ("anthropic.",))
 
 
+def _is_fable_model(model: str | None) -> bool:
+    """Match Fable slugs, including provider prefixes and Bedrock profiles."""
+    normalized = normalize_model_name(model or "").lower()
+    if _is_bedrock_model_id(normalized):
+        normalized = normalized.split("anthropic.", 1)[-1]
+    return normalized.startswith("claude-fable-")
+
+
 def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     """Strip the ``anthropic/`` prefix (case-insensitive) and, unless ``preserve_dots`` (DashScope:
     ``qwen3.5-plus``), convert version dots to hyphens for Claude models only (``claude-opus-4.6``
@@ -579,7 +587,8 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
                 if _block_type(b) not in _THINKING_TYPES or not (b.get("signature") or b.get("data"))
             ]
             m["content"] = new_content or [_text_block("(empty)")]
-        elif is_third_party or idx != last_assistant_idx:
+        elif is_third_party or (idx != last_assistant_idx and not _is_fable_model(model)):
+            # Direct Anthropic except Fable: strip non-latest assistant messages.
             m["content"] = _strip_thinking(m["content"]) or [_text_block("(thinking elided)")]
         else:
             new_content = _keep_valid_latest_thinking(m["content"], bool(m.get("_thinking_signature_invalidated")))
