@@ -51,6 +51,22 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 logger = logging.getLogger(__name__)
 
 
+_FABLE_SUMMARY_PRESERVATION = (
+    "Be sure to preserve: "
+    "(1) any difficulties or problems that came up, and how they were handled or resolved; "
+    "(2) any possibilities, options, or approaches that were raised, tried, or set aside, and why; "
+    "(3) anything that was asked for, decided, agreed, ruled out, or established as a preference, constraint, or boundary — stated exactly; "
+    "(4) exactly where things stand now — what has been covered, settled, or completed so far; "
+    "(5) anything still open, unresolved, promised, or expected to happen next; "
+    "(6) specific details that would be hard to reconstruct — names, numbers, dates, exact wording, links or references — kept exactly. "
+    "Be complete on these even at the cost of length; keep everything else concise. "
+    "Weight the two voices differently: keep what the user said, asked for, shared, or established carefully and close to their own words; "
+    "your own explanations and reasoning can be condensed much further, to what they concluded or produced — as long as nothing in the six items above is dropped. "
+    "Apply these requirements within the existing sections, including when a focus topic is supplied. "
+    "Secret redaction and the no-user-authored-turn provenance rules still take precedence."
+)
+
+
 def _safe_int(value: Any) -> int | None:
     """Best-effort integer coercion for telemetry fields."""
     try:
@@ -5359,6 +5375,8 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
             "with [REDACTED]. Note that credentials were present, but do not "
             "preserve their values."
         )
+        if self._uses_fable_harness():
+            _summarizer_preamble += "\n\n" + _FABLE_SUMMARY_PRESERVATION
 
         # Temporal anchoring directive. Rewrites relative / still-pending-sounding
         # references into absolute, dated, past-tense facts so a resumed
@@ -6816,7 +6834,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
     @classmethod
     def _find_inflight_user_task(
-        cls, messages: List[Dict[str, Any]]
+        cls, messages: List[Dict[str, Any]], *, include_media: bool = False
     ) -> Optional[Dict[str, Any]]:
         """Return the user turn that is still awaiting completion, or ``None``.
 
@@ -6836,15 +6854,29 @@ This compaction should PRIORITISE preserving all information related to the focu
         whose only user-role row is an inherited summary yields ``None`` and is
         never re-animated (#80622).
         """
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import _SYNTHETIC_USER_FLAGS, _is_real_user_message
 
+        if include_media:
+            messages = [
+                message for message in messages
+                if message.get(_INFLIGHT_REPLAY_MERGED_KEY)
+                or not any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS)
+            ]
         last_user_idx = -1
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
             # _is_real_user_message also rejects metadata-flagged scaffolding
             # (_todo_snapshot_synthetic, recovery nudges, ...) that
             # _is_actionable_user_turn cannot see.
-            if cls._is_actionable_user_turn(msg) and _is_real_user_message(msg):
+            if cls._is_actionable_user_turn(msg) and (
+                _is_real_user_message(msg)
+                or (
+                    include_media
+                    and _content_has_images(msg.get("content"))
+                    and not any(msg.get(flag) for flag in _SYNTHETIC_USER_FLAGS)
+                    and not cls._is_synthetic_compression_user_turn(msg)
+                )
+            ):
                 last_user_idx = i
                 break
             if isinstance(msg, dict) and msg.get(_INFLIGHT_REPLAY_MERGED_KEY):
@@ -8035,6 +8067,85 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
+    def _uses_fable_harness(self) -> bool:
+        from agent.anthropic_adapter import _is_fable_model
+
+        return _is_fable_model(self.model)
+
+    def _rebase_fable_compaction(
+        self,
+        compressed: List[Dict[str, Any]],
+        summary: str,
+        inflight: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Start a new prefix without discarding protected text or live media.
+
+        Protected turns become reference data in the single user checkpoint,
+        not replayed assistant turns with signatures bound to the old prefix.
+        Only the unfinished user request belongs after the summary boundary.
+        """
+        from agent.agent_runtime_helpers import strip_think_blocks
+        from agent.anthropic_adapter import _to_plain_data
+
+        live = self._strip_context_summary_handoff_message(inflight) if inflight else None
+        content = [{"type": "text", "text": summary + "\n\n## Preserved Turns (reference only)\n"}]
+        systems = []
+        retained_turns = [self._strip_context_summary_handoff_message(message) for message in compressed]
+        live_index = max((
+            index for index, retained in enumerate(retained_turns)
+            if live and retained and retained.get("role") == "user"
+            and retained.get("content") == live.get("content")
+        ), default=-1)
+        for index, retained in enumerate(retained_turns):
+            if retained is None or index == live_index:
+                continue
+            role = retained.get("role", "unknown")
+            if role == "system":
+                systems.append(retained)
+                continue
+            label = f"\n[{role.upper()}]"
+            if retained.get("tool_call_id"):
+                label += f" tool_call_id={retained['tool_call_id']}"
+            content.append({"type": "text", "text": label + "\n"})
+            body = retained.get("content")
+            if isinstance(body, dict) and body.get("_multimodal"):
+                body = body.get("content") or body.get("text_summary", "")
+            parts = body if isinstance(body, list) else [{"type": "text", "text": body or ""}]
+            for part in parts:
+                part = {"type": "text", "text": part} if isinstance(part, str) else copy.deepcopy(part)
+                if not isinstance(part, dict) or part.get("type") in {"thinking", "redacted_thinking", "reasoning"}:
+                    continue
+                part.pop("cache_control", None)
+                if role == "assistant" and part.get("type") == "text":
+                    part["text"] = strip_think_blocks(None, part.get("text", ""))
+                if part.get("type") in {"tool_use", "tool_result"}:
+                    part = {"type": "text", "text": json.dumps(part, ensure_ascii=False)}
+                if part.get("type") == "text":
+                    part["text"] = _redact_compaction_text(str(part.get("text", "")))
+                content.append(part)
+            if retained.get("tool_calls"):
+                content.append({
+                    "type": "text",
+                    "text": "\n[TOOL CALLS]\n" + _redact_compaction_text(
+                        json.dumps(_to_plain_data(retained["tool_calls"]), ensure_ascii=False)
+                    ),
+                })
+
+        self._previous_summary = self._strip_summary_prefix(_content_text_for_contains(content))
+        content.append({"type": "text", "text": "\n\n" + _SUMMARY_END_MARKER})
+        carrier = {
+            "role": "user", "content": content,
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(self._summary_has_user_turn),
+        }
+        if live and inflight:
+            if not inflight.get(_INFLIGHT_REPLAY_MERGED_KEY):
+                content.append({"type": "text", "text": "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n"})
+            body = live.get("content")
+            content.extend(copy.deepcopy(body) if isinstance(body, list) else [{"type": "text", "text": body or ""}])
+            carrier[_INFLIGHT_REPLAY_MERGED_KEY] = True
+        return systems + [carrier]
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -8538,7 +8649,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # short-circuit on summary_indices here: a merged handoff carries
             # real user content that a blanket skip would silently delete.
             msg = _fresh_compaction_message_copy(messages[i])
-            if i == 0 and msg.get("role") == "system":
+            if i == 0 and msg.get("role") == "system" and not self._uses_fable_harness():
                 existing = msg.get("content")
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
                 if _compression_note not in _content_text_for_contains(existing):
@@ -8807,9 +8918,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         # sitting there would make a genuinely pending assistant(tool_calls) look
         # orphaned and get its calls stripped.
         compressed = self._sanitize_tool_pairs(compressed)
-        compressed = self._reappend_inflight_user_task(
-            compressed, self._find_inflight_user_task(messages)
-        )
+        if self._uses_fable_harness():
+            compressed = self._rebase_fable_compaction(
+                _strip_historical_media(compressed), summary,
+                self._find_inflight_user_task(messages, include_media=True),
+            )
+        else:
+            compressed = self._reappend_inflight_user_task(
+                compressed, self._find_inflight_user_task(messages)
+            )
 
         self.compression_count += 1
 
