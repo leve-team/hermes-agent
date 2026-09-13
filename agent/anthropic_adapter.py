@@ -1769,6 +1769,14 @@ def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     return model
 
 
+def _is_fable_model(model: str | None) -> bool:
+    """Match Fable slugs, including provider prefixes and Bedrock profiles."""
+    normalized = normalize_model_name(model or "").lower()
+    if _is_bedrock_model_id(normalized):
+        normalized = normalized.split("anthropic.", 1)[-1]
+    return normalized.startswith("claude-fable-")
+
+
 def _sanitize_tool_id(tool_id: str) -> str:
     """Sanitize a tool call ID for the Anthropic API.
 
@@ -2607,9 +2615,9 @@ def _manage_thinking_signatures(
                     continue
                 new_content.append(b)
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
-        elif _is_third_party or idx != last_assistant_idx:
+        elif _is_third_party or (idx != last_assistant_idx and not _is_fable_model(model)):
             # Third-party: strip ALL thinking blocks (signatures are proprietary).
-            # Direct Anthropic: strip from non-latest assistant messages only.
+            # Direct Anthropic except Fable: strip non-latest assistant messages.
             stripped = [
                 b for b in m["content"]
                 if not (isinstance(b, dict) and b.get("type") in _THINKING_TYPES)
