@@ -4345,6 +4345,33 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
+def _is_pool_capacity_error(exc: Exception) -> bool:
+    """Detect a 503 that means the proxy's upstream account pool is exhausted.
+
+    A relay proxy in front of a subscription backend (e.g. the Codex proxy)
+    translates an upstream 429 ``usage_limit_reached`` into a 503 whose body
+    carries ``pool_unavailable`` / ``all upstreams unavailable``.  That is a
+    capacity wall, not a blip: every attempt against the same provider will
+    keep failing until the account quota resets, so the auxiliary call has to
+    move to the next provider in the chain.
+
+    Deliberately narrower than ``_is_transient_transport_error``, which stays
+    True for these (the same-provider retries still run first) and must keep
+    covering plain 5xx blips.  Only the body code promotes a 503 to a capacity
+    error — a bare 503 is still worth retrying on the same target.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status != 503:
+        return False
+    err_lower = str(exc).lower()
+    return any(kw in err_lower for kw in (
+        "pool_unavailable",
+        "all upstreams unavailable",
+    ))
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Detect auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -9987,6 +10014,12 @@ def _call_llm_impl(
         # auxiliary task on the floor (silent compression failure /
         # message loss). Auth is NOT a capacity error: it only bypasses
         # the explicit-provider gate when the user is in auto mode.
+        #
+        # ── Pool-capacity fallback ───────────────────────────────────
+        # A relay proxy reports upstream account exhaustion as a 503
+        # `pool_unavailable`. The same-provider retries above have already
+        # run and failed; without this term the 503 matches no gate and the
+        # auxiliary task is dropped even though a fallback chain exists.
         should_fallback = (
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
@@ -9994,6 +10027,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_pool_capacity_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10011,12 +10045,16 @@ def _call_llm_impl(
         # fallback asked to compress a glm-5.2 conversation), so they bypass
         # the explicit-provider gate and continue to the next candidate
         # instead of aborting the auxiliary task and churning the session.
+        # A 503 `pool_unavailable` is capacity by the same reading: the
+        # proxy's upstream accounts are exhausted, so the pinned provider
+        # cannot serve this request until a quota resets.
         is_capacity_error = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_pool_capacity_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10036,19 +10074,24 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_pool_capacity_error(first_err):
+                reason = "upstream pool exhausted"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
             # Narrow the configured-chain skip to the exact model that
-            # failed ONLY for model-specific failures. Auth (401) and
-            # payment (402) errors are provider-wide — the credentials or
-            # account behind every model on that provider are the same — so
-            # a sibling model can't recover; keep skipping the whole
-            # provider so the main-agent-model safety net is still reached.
+            # failed ONLY for model-specific failures. Auth (401), payment
+            # (402), and upstream pool exhaustion (503 pool_unavailable)
+            # errors are provider-wide — the credentials or account pool
+            # behind every model on that provider are the same — so a
+            # sibling model can't recover; keep skipping the whole provider
+            # so the main-agent-model safety net is still reached.
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                None
+                if reason in ("auth error", "payment error", "upstream pool exhausted")
+                else final_model
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
@@ -10697,6 +10740,8 @@ async def _async_call_llm_impl(
         # falls back in auto mode just like the sync call_llm() path. Auth is
         # NOT a capacity error, so on an explicit provider it still respects
         # the user's choice (handled by the is_auto/is_capacity_error gate).
+        # Pool-capacity 503s (`pool_unavailable`) fall back here too — see the
+        # sync call_llm() path for the proxy-exhaustion rationale.
         should_fallback = (
             _is_auth_error(first_err)
             or _is_payment_error(first_err)
@@ -10704,6 +10749,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_pool_capacity_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -10712,6 +10758,7 @@ async def _async_call_llm_impl(
         # See #26803: daily token quota must fall back like a 402 credit error.
         # Model-incompatibility 400s (route cannot run this model at all)
         # bypass the gate too — see the sync call_llm() path for rationale.
+        # A 503 `pool_unavailable` from a relay proxy is likewise capacity.
         is_auto = resolved_provider in {"auto", "", None}
         is_capacity_error = (
             _is_payment_error(first_err)
@@ -10719,6 +10766,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _is_pool_capacity_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
@@ -10734,19 +10782,24 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _is_pool_capacity_error(first_err):
+                reason = "upstream pool exhausted"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
             # Narrow the configured-chain skip to the exact model that
-            # failed ONLY for model-specific failures. Auth (401) and
-            # payment (402) errors are provider-wide — the credentials or
-            # account behind every model on that provider are the same — so
-            # a sibling model can't recover; keep skipping the whole
-            # provider so the main-agent-model safety net is still reached.
+            # failed ONLY for model-specific failures. Auth (401), payment
+            # (402), and upstream pool exhaustion (503 pool_unavailable)
+            # errors are provider-wide — the credentials or account pool
+            # behind every model on that provider are the same — so a
+            # sibling model can't recover; keep skipping the whole provider
+            # so the main-agent-model safety net is still reached.
             _chain_failed_model = (
-                None if reason in ("auth error", "payment error") else final_model
+                None
+                if reason in ("auth error", "payment error", "upstream pool exhausted")
+                else final_model
             )
             # Fallback order (#26882, #26803):
             #   1. User-configured fallback_chain (per-task) if set
