@@ -3143,6 +3143,33 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES
 
 
+def _is_pool_capacity_error(exc: Exception) -> bool:
+    """Detect a 503 that means the proxy's upstream account pool is exhausted.
+
+    A relay proxy in front of a subscription backend (e.g. the Codex proxy)
+    translates an upstream 429 ``usage_limit_reached`` into a 503 whose body
+    carries ``pool_unavailable`` / ``all upstreams unavailable``.  That is a
+    capacity wall, not a blip: every attempt against the same provider will
+    keep failing until the account quota resets, so the auxiliary call has to
+    move to the next provider in the chain.
+
+    Deliberately narrower than ``_is_transient_transport_error``, which stays
+    True for these (the same-provider retries still run first) and must keep
+    covering plain 5xx blips.  Only the body code promotes a 503 to a capacity
+    error — a bare 503 is still worth retrying on the same target.
+    """
+    status = getattr(exc, "status_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+    if status != 503:
+        return False
+    err_lower = str(exc).lower()
+    return any(kw in err_lower for kw in (
+        "pool_unavailable",
+        "all upstreams unavailable",
+    ))
+
+
 def _is_auth_error(exc: Exception) -> bool:
     """Auth failures that should trigger provider-specific refresh."""
     status = getattr(exc, "status_code", None)
@@ -6866,6 +6893,9 @@ _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
     (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
     (_is_invalid_aux_response_error, "invalid provider response"), (_is_connection_error, "connection error"),
+    # levos: a 503 whose body carries pool_unavailable is the proxy's upstream account pool exhausted —
+    # a capacity wall, so the fallback ladder must run instead of retrying the same target.
+    (_is_pool_capacity_error, "pool capacity exhausted"),
 )
 
 
