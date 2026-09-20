@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 
+from hermes_cli import kanban_dialect_rules
 from hermes_cli.kanban_persistence import (
     TABLE_KEYS as _TABLE_KEYS,
 )
@@ -140,6 +141,38 @@ class PostgresDialect:
 
 
 class KanbanPostgresCursor(_PostgresCursor):
+    def _absorb(self, sql):
+        """Answer SQLite dialect in front of the adapter, or pass the statement on.
+
+        Levos' callers write catalog probes, savepoint-free transaction control
+        and file pragmas in SQLite's spelling and hand them to whichever board
+        connection they hold. The service-store adapter on the other lineage has
+        absorbed that spelling since the eighteenth window; this one had not, so
+        ``PRAGMA database_list`` reached psycopg verbatim and the nineteenth
+        window's claim returned 500. Rewriting the hundred-odd call sites is a
+        hundred windows, so the rule lives here, once.
+
+        The rules table is shared with that other adapter
+        (``packages/guild-kit-py/sqlite_dialect_rules.py`` in Levos) by
+        vendoring, and an identity test there fails if either copy is edited
+        alone. Unknown pragmas raise rather than becoming quiet no-ops, and
+        ``BEGIN IMMEDIATE`` opens a real transaction rather than degrading to
+        autocommit.
+        """
+        conn = self._conn
+        return kanban_dialect_rules.absorb_statement(
+            sql,
+            schema=None,
+            in_transaction=conn.in_transaction,
+            begin=lambda: conn.raw.execute("BEGIN"),
+            commit=conn.commit,
+            rollback=conn.rollback,
+            set_read_only=lambda enabled: conn.raw.execute(
+                "SET default_transaction_read_only = " + ("on" if enabled else "off")
+            ),
+        )
+
+
     def _prepare(self, sql, *, returning):
         sql = sql.strip().rstrip(";")
         insert = _INSERT.match(sql)
@@ -183,7 +216,7 @@ class KanbanPostgresCursor(_PostgresCursor):
     def execute(self, sql, params=()):
         import psycopg
 
-        translated, want_id = self._prepare(sql, returning=True)
+        translated, want_id = self._prepare(self._absorb(sql), returning=True)
         self.lastrowid = None
         try:
             self._cursor.execute(translated, params or ())

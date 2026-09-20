@@ -876,7 +876,10 @@ def test_pg_rejects_unmapped_dialects(pg_dsn):
     with contextlib.closing(
         kb.connect(backend="postgres", postgres_dsn=pg_dsn)
     ) as conn:
-        with pytest.raises(psycopg.errors.SyntaxError):
+        # 0056 moved this refusal from the server's parser to the adapter's
+        # allowlist. It is still a refusal: an unmapped pragma must never
+        # become a quiet no-op that answers the caller's question wrongly.
+        with pytest.raises(sqlite3.NotSupportedError):
             conn.execute("PRAGMA unknown_setting")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
