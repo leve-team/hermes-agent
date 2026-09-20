@@ -96,7 +96,28 @@ def check_table(table):
 
 
 def resolve_backend(backend=None, *, env_var="HERMES_KANBAN_BACKEND"):
-    selected = backend if backend is not None else os.environ.get(env_var, "sqlite")
+    """Pick the kanban backend: explicit argument > explicit env > registered resolver > sqlite.
+
+    A registered board DSN resolver *is* the PostgreSQL authority declaration
+    (``set_board_dsn_resolver`` is only called after the host app decided the
+    service board is authoritative). Until 2026-09-20 this function read only
+    the env var, so a process that had registered a resolver still answered
+    "sqlite": the host's board_store lineage wrote PostgreSQL while this core
+    lineage kept reading SQLite -- cards were created in PG and then could not
+    be claimed (404). One decision, two sources of truth. The env var still
+    outranks the registration so an operator can force SQLite without
+    unregistering anything.
+    """
+    if backend is not None:
+        selected = backend
+    else:
+        env_choice = os.environ.get(env_var)
+        if env_choice:
+            selected = env_choice
+        elif env_var == "HERMES_KANBAN_BACKEND" and has_board_dsn_resolver():
+            selected = "postgres"
+        else:
+            selected = "sqlite"
     if selected not in ("sqlite", "postgres"):
         raise ValueError(f"{env_var} must be sqlite or postgres")
     return selected
