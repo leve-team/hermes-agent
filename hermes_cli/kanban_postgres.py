@@ -17,7 +17,10 @@ import sqlite3
 
 from hermes_cli import kanban_dialect_rules
 from hermes_cli.kanban_persistence import (
+    SERVICE_TABLE_STORE as _SERVICE_TABLE_STORE,
     TABLE_KEYS as _TABLE_KEYS,
+    service_identity_tables as _service_identity_tables,
+    service_table_keys as _service_table_keys,
 )
 from hermes_state_pg_schema import _split_sql_statements
 from hermes_state_pg_sql import _bind_parameters as _translate_bindings_base
@@ -65,8 +68,46 @@ class PostgresDialect:
     identity_tables = _IDENTITY_TABLES
     store_name = "kanban"
 
+    def service_table_keys(self):
+        """Conflict keys registered by the host service, for this store only.
+
+        Gated on ``store_name`` rather than on a flag a subclass has to
+        remember to clear: a dialect that reuses this adapter under another
+        name (projects) has its own closed metadata, and a kanban registration
+        must not widen it by inheritance.
+        """
+        if self.store_name != _SERVICE_TABLE_STORE:
+            return {}
+        return _service_table_keys()
+
+    def keys_for(self, table):
+        """The conflict key of a writable table, or ``None`` if it has none.
+
+        One lookup answers both "is this table in the contract" and "what does
+        a conflict resolve against", so a table can never be admitted by one
+        question and left keyless for the other.
+        """
+        keys = self.table_keys.get(table)
+        if keys is None:
+            keys = self.service_table_keys().get(table)
+        return keys
+
+    def has_identity(self, table):
+        """Does this table's primary key come from a generated identity?
+
+        A registered table answers from its own declaration. Guessing ``True``
+        would append ``RETURNING id`` to a table whose key is a text column and
+        fail every insert; guessing ``False`` would leave ``lastrowid`` empty
+        for a table that does have one.
+        """
+        if table in self.identity_tables:
+            return True
+        if self.store_name != _SERVICE_TABLE_STORE:
+            return False
+        return table in _service_identity_tables()
+
     def check_table(self, table):
-        if table not in self.table_keys:
+        if self.keys_for(table) is None:
             raise ValueError(
                 f"Table is outside the {self.store_name} persistence contract"
             )
@@ -192,6 +233,7 @@ class KanbanPostgresCursor(_PostgresCursor):
             table = table.lower()
             dialect = self._conn.kanban_dialect
             dialect.check_table(table)
+            keys = dialect.keys_for(table)
             if mode:
                 sql = re.sub(
                     r"\bINSERT\s+OR\s+\w+", "INSERT", sql, count=1, flags=re.IGNORECASE
@@ -200,7 +242,7 @@ class KanbanPostgresCursor(_PostgresCursor):
                     raise ValueError(
                         "SQLite conflict clauses cannot include a PG conflict clause"
                     )
-                target = ", ".join(dialect.table_keys[table])
+                target = ", ".join(keys)
                 sql += f" ON CONFLICT ({target}) DO "
                 if mode.upper() == "IGNORE":
                     sql += "NOTHING"
@@ -209,12 +251,12 @@ class KanbanPostgresCursor(_PostgresCursor):
                     updates = ", ".join(
                         f'"{column["name"]}" = EXCLUDED."{column["name"]}"'
                         for column in columns
-                        if column["name"] not in dialect.table_keys[table]
+                        if column["name"] not in keys
                     )
                     sql += f"UPDATE SET {updates}" if updates else "NOTHING"
             want_id = (
                 returning
-                and table in dialect.identity_tables
+                and dialect.has_identity(table)
                 and not re.search(r"\bRETURNING\b", sql, re.IGNORECASE)
             )
             if want_id:
