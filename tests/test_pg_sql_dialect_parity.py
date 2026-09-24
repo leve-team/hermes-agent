@@ -120,5 +120,11 @@ def test_no_ifnull_in_sql_emitting_state_modules():
     for path in sorted(repo.glob("hermes_state*.py")) + [repo / "tui_gateway" / "server.py"]:
         source = path.read_text(encoding="utf-8")
         for m in re.finditer(r"\bIFNULL\s*\(", source, flags=re.IGNORECASE):
+            line_start = source.rfind("\n", 0, m.start()) + 1
+            line = source[line_start : source.find("\n", m.start())]
+            # The strict-mode denylist names the token as a quoted literal; that is the guard
+            # against IFNULL, not a use of it.
+            if '"ifnull("' in line or "'ifnull('" in line:
+                continue
             offenders.append(f"{path.name}:{source[: m.start()].count(chr(10)) + 1}")
     assert not offenders, "SQLite-only IFNULL( in SQL-emitting code — use COALESCE(: " + ", ".join(offenders)
