@@ -2500,6 +2500,16 @@ def remove_job(job_id: str) -> bool:
                     "Failed to clear notepad for removed job %s",
                     canonical_id, exc_info=True,
                 )
+            # Same for its stored latest output / monitor baseline (levos 0068).
+            try:
+                from cron import durable
+                if durable.authority():
+                    durable.delete_outputs(canonical_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear stored outputs for removed job %s",
+                    canonical_id, exc_info=True,
+                )
             # Prune the per-job fire-fence lock entry so the registry does
             # not grow monotonically across create/remove cycles.
             _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
@@ -3764,6 +3774,14 @@ def save_job_output(job_id: str, output: str):
 
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
     _prune_job_output(job_output_dir, _cron_output_keep())
+
+    # levos 0068: on PostgreSQL authority the file above is this pod's work
+    # product; the next run (``context_from``) may run on another pod and
+    # reads the latest output from the profile's store.
+    from cron import durable
+
+    if durable.authority():
+        durable.save_output(job_id, durable.LATEST, output)
 
     return output_file
 

@@ -627,6 +627,27 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _store_cron_scripts(*scripts: Optional[str]) -> None:
+    """Store the bodies of validated job scripts on PostgreSQL authority (levos 0068).
+
+    The job row lives in the profile's store (0060) but the script it names
+    is a file on this pod's disk; another pod may fire the job. A script not
+    written yet is stored by its first run instead. Off authority: no-op.
+    """
+    from cron import durable
+    from hermes_constants import get_hermes_home
+
+    if not durable.authority():
+        return
+    scripts_dir = (get_hermes_home() / "scripts").resolve()
+    for script in scripts:
+        if not script or not script.strip():
+            continue
+        path = (scripts_dir / script.strip()).resolve()
+        if path.is_file() and path.is_relative_to(scripts_dir):
+            durable.capture_script(path, scripts_dir)
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -1258,6 +1279,7 @@ def cronjob(
                 monitor_error = _validate_cron_script_path(monitor_script)
                 if monitor_error:
                     return tool_error(monitor_error, success=False)
+            _store_cron_scripts(script, monitor_script)
 
             # Reject a model-supplied base_url that would route a named
             # provider's stored credential to an attacker endpoint (F8).
@@ -1541,6 +1563,7 @@ def cronjob(
                 updates["monitor_script"] = (
                     _normalize_optional_job_value(monitor_script) if monitor_script else None
                 )
+            _store_cron_scripts(script, monitor_script)
             if monitor_url is not None:
                 # Pass empty string to clear an existing monitor_url
                 updates["monitor_url"] = (

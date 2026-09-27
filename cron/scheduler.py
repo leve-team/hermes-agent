@@ -3856,6 +3856,21 @@ def _run_job_script(
             f"({scripts_dir_resolved}): {script_path!r}"
         )
 
+    # levos 0068: on PostgreSQL authority the job row may come from another
+    # pod whose disk held the script. A local file runs as before and its body
+    # is stored; a missing one is written back from the profile's store.
+    from cron import durable
+    from hermes_aux_store import AuxStoreUnavailable
+
+    try:
+        if durable.authority():
+            if path.is_file():
+                durable.capture_script(path, scripts_dir_resolved)
+            elif not path.exists():
+                durable.restore_script(path, scripts_dir_resolved)
+    except (AuxStoreUnavailable, OSError) as exc:
+        return False, f"Script store unavailable: {exc}"
+
     if not path.exists():
         return False, f"Script not found: {path}"
     if not path.is_file():
@@ -4123,8 +4138,12 @@ def _build_job_prompt(
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
+        from cron import durable
         from cron.jobs import get_cron_output_dir
         output_dir = get_cron_output_dir()
+        # levos 0068: on PostgreSQL authority the latest output is the stored
+        # one — the source job may have last run on another pod.
+        outputs_on_pg = durable.authority()
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
@@ -4149,17 +4168,20 @@ def _build_job_prompt(
                 )
                 continue
             try:
-                job_output_dir = output_dir / source_job_id
-                if not job_output_dir.exists():
-                    continue  # silent skip — no output yet
-                output_files = sorted(
-                    job_output_dir.glob("*.md"),
-                    key=lambda f: f.stat().st_mtime,
-                    reverse=True,
-                )
-                if not output_files:
-                    continue  # silent skip — no output yet
-                latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                if outputs_on_pg:
+                    latest_output = (durable.load_output(source_job_id) or "").strip()
+                else:
+                    job_output_dir = output_dir / source_job_id
+                    if not job_output_dir.exists():
+                        continue  # silent skip — no output yet
+                    output_files = sorted(
+                        job_output_dir.glob("*.md"),
+                        key=lambda f: f.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if not output_files:
+                        continue  # silent skip — no output yet
+                    latest_output = output_files[0].read_text(encoding="utf-8").strip()
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:

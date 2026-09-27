@@ -23,7 +23,9 @@ State lives in two places, both durable across scheduler restarts:
 * ``job["monitor_state"]`` in jobs.json — ``last_output_hash`` +
   ``last_changed_at`` (additive JSON fields, no migration needed);
 * ``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` — the previous output
-  text, kept only so the next change can render a diff.
+  text, kept only so the next change can render a diff. On a PostgreSQL
+  authority profile it is the ``monitor`` row of ``core_cron_outputs``
+  instead (levos 0068): the next tick may run on another pod.
 
 Inspired by: ChatGPT Work monitor tasks (idea-level, docs-only);
 enabler: #80774.
@@ -90,7 +92,11 @@ def _snapshot_path(job_id: str):
 
 
 def _read_last_output(job_id: str) -> str:
+    from cron import durable
+
     try:
+        if durable.authority():
+            return durable.load_output(job_id, durable.MONITOR) or ""
         path = _snapshot_path(job_id)
         if path.exists():
             return path.read_text(encoding="utf-8")
@@ -100,7 +106,12 @@ def _read_last_output(job_id: str) -> str:
 
 
 def _write_last_output(job_id: str, output: str) -> None:
+    from cron import durable
+
     try:
+        if durable.authority():
+            durable.save_output(job_id, durable.MONITOR, output)
+            return
         path = _snapshot_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(output, encoding="utf-8")

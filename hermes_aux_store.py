@@ -94,6 +94,13 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     # non-authority store is ``cron/jobs.json``); one row holds one job document.
     "cron_executions": (AuxTable("executions", "core_cron_executions", ("id",)),),
     "cron_notepad": (AuxTable("cron_notepad", "core_cron_notes", ("job_id", "key")),),
+    # levos 0068: cron state a run hands to the next one; files, not SQLite,
+    # off authority (see ``cron/durable.py`` and ``cron/suggestions.py``).
+    "cron_outputs": (AuxTable("cron_outputs", "core_cron_outputs", ("job_id", "kind")),),
+    "cron_scripts": (AuxTable("cron_scripts", "core_cron_scripts", ("path",)),),
+    "cron_suggestions": (
+        AuxTable("cron_suggestions", "core_cron_suggestions", ("id",)),
+    ),
     "cron_jobs": (AuxTable("cron_jobs", "core_cron_jobs", ("id",)),),
     # levos 0062: gateway turn leases, the shutdown pending-message queue and
     # the tui interrupted-turn markers. PostgreSQL only — elsewhere they stay
