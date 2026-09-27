@@ -91,6 +91,20 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     "cron_executions": (AuxTable("executions", "core_cron_executions", ("id",)),),
     "cron_notepad": (AuxTable("cron_notepad", "core_cron_notes", ("job_id", "key")),),
     "cron_jobs": (AuxTable("cron_jobs", "core_cron_jobs", ("id",)),),
+    # levos 0062: gateway turn leases, the shutdown pending-message queue and
+    # the tui interrupted-turn markers. PostgreSQL only — elsewhere they stay
+    # ``.clean_shutdown``, ``pending_messages/`` and ``desktop/``.
+    "gateway_turns": (
+        AuxTable("gateway_turn_leases", "core_gateway_turn_leases", ("token",)),
+    ),
+    "gateway_pending": (
+        AuxTable(
+            "gateway_pending_messages", "core_gateway_pending_messages", ("id",), "id"
+        ),
+    ),
+    "tui_turn_markers": (
+        AuxTable("tui_turn_markers", "core_tui_turn_markers", ("home", "session_key")),
+    ),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {

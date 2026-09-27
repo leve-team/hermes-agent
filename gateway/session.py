@@ -3070,8 +3070,29 @@ class SessionStore:
         The opaque token is returned to the caller and must be supplied to
         :meth:`clear_turn_active`.  Re-marking replaces the previous token so
         a stale asynchronous unwind cannot clear a newer turn.
+
+        On PostgreSQL authority (levos 0062) the token is leased to this
+        process in ``core_gateway_turn_leases`` before the marker is written,
+        so an overlapping pod can tell a running turn from an orphaned one.
         """
-        token = uuid.uuid4().hex
+        from gateway import turn_owner
+
+        leased = turn_owner.enabled()
+        token = turn_owner.new_token() if leased else uuid.uuid4().hex
+        if leased:
+            turn_owner.acquire(
+                token, scope=self._routing_scope(), session_key=session_key
+            )
+        try:
+            marked = self._mark_turn_active(session_key, token)
+        except BaseException:
+            self._drop_turn_lease(token)
+            raise
+        if marked is None:
+            self._drop_turn_lease(token)
+        return marked
+
+    def _mark_turn_active(self, session_key: str, token: str) -> Optional[str]:
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
@@ -3121,7 +3142,21 @@ class SessionStore:
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+        self._drop_turn_lease(token)
         return True
+
+    @staticmethod
+    def _drop_turn_lease(token: str) -> None:
+        """Best-effort: a lease row left behind is renewed by this process and
+        released as ``clean`` at exit, which a peer then discards."""
+        from gateway import turn_owner
+
+        if not turn_owner.is_leased(token):
+            return
+        try:
+            turn_owner.drop(token)
+        except Exception as exc:
+            logger.warning("Could not drop the turn lease of a concluded turn: %s", exc)
 
     def recover_interrupted_turns(
         self,
@@ -3136,10 +3171,7 @@ class SessionStore:
 
         Returns the number of newly promoted sessions.
         """
-        from datetime import timedelta
-
         now = _now()
-        max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
         changed = False
 
@@ -3148,34 +3180,8 @@ class SessionStore:
             for entry in self._entries.values():
                 if not entry.active_turn_token:
                     continue
-
-                started_at = entry.active_turn_started_at
-                try:
-                    marker_is_stale = (
-                        started_at is None
-                        or (max_age_seconds > 0 and now - started_at > max_age)
-                    )
-                except TypeError:
-                    # Mixed aware/naive timestamps are invalid for this local
-                    # marker.  Clear rather than risking an unsafe old resume.
-                    marker_is_stale = True
-
-                if not marker_is_stale and not entry.suspended:
-                    if entry.resume_pending:
-                        # A drain-timeout marker is more specific than the
-                        # generic crash reason; preserve it and its freshness.
-                        if entry.last_resume_marked_at is None:
-                            entry.last_resume_marked_at = now
-                    else:
-                        entry.resume_pending = True
-                        entry.resume_reason = "restart_interrupted"
-                        # Freshness starts when recovery is discovered, not
-                        # when a potentially hours-long turn began.
-                        entry.last_resume_marked_at = now
-                        promoted += 1
-
-                entry.active_turn_token = None
-                entry.active_turn_started_at = None
+                if self._settle_turn_marker(entry, now, max_age_seconds):
+                    promoted += 1
                 changed = True
 
             if changed:
@@ -3184,6 +3190,152 @@ class SessionStore:
                 self._save()
 
         return promoted
+
+    @staticmethod
+    def _settle_turn_marker(
+        entry: SessionEntry, now: datetime, max_age_seconds: int
+    ) -> bool:
+        """Clear an interrupted turn's marker; True when that newly armed
+        ``resume_pending``. Old or invalid markers and suspended sessions are
+        cleared without resuming."""
+        started_at = entry.active_turn_started_at
+        try:
+            marker_is_stale = started_at is None or (
+                max_age_seconds > 0
+                and now - started_at > timedelta(seconds=max(0, max_age_seconds))
+            )
+        except TypeError:
+            # Mixed aware/naive timestamps are invalid for this local
+            # marker.  Clear rather than risking an unsafe old resume.
+            marker_is_stale = True
+
+        promoted = False
+        if not marker_is_stale and not entry.suspended:
+            if entry.resume_pending:
+                # A drain-timeout marker is more specific than the
+                # generic crash reason; preserve it and its freshness.
+                if entry.last_resume_marked_at is None:
+                    entry.last_resume_marked_at = now
+            else:
+                entry.resume_pending = True
+                entry.resume_reason = "restart_interrupted"
+                # Freshness starts when recovery is discovered, not
+                # when a potentially hours-long turn began.
+                entry.last_resume_marked_at = now
+                promoted = True
+
+        entry.active_turn_token = None
+        entry.active_turn_started_at = None
+        return promoted
+
+    def recover_turns_from_leases(
+        self,
+        max_age_seconds: int = 60 * 60,
+        *,
+        legacy_clean: Optional[bool] = None,
+    ) -> int:
+        """PostgreSQL-authority recovery of interrupted turns (levos 0062).
+
+        Replaces the ``.clean_shutdown`` decision, which a pod cannot make for
+        a peer: a marker is settled only after its lease was claimed from a
+        dead or finished owner (:func:`gateway.turn_owner.claim_dead`), and the
+        routing entry is re-read from PostgreSQL and written back one row at a
+        time, so a peer's live turns and rows are never touched. Run at startup
+        and periodically — an overlapping peer usually exits after this pod
+        started.
+
+        *legacy_clean* (startup only) settles markers written before 0062,
+        which have no lease: ``True`` discards them (the previous gateway left
+        ``.clean_shutdown``), ``False`` resumes them.
+
+        Returns the number of sessions made resumable.
+        """
+        from gateway import turn_owner
+
+        resumable = 0
+        if legacy_clean is not None:
+            resumable += self._settle_legacy_turn_markers(
+                max_age_seconds, discard=legacy_clean
+            )
+        claims = turn_owner.claim_dead(self._routing_scope())
+        if not claims:
+            return resumable
+        _db = getattr(self, "_db", None)
+        loader = getattr(_db, "load_gateway_routing_entries", None) if _db else None
+        if not callable(loader):
+            return resumable
+        # Re-read from PostgreSQL: the peer may have created or changed these
+        # entries after this pod loaded its routing index.
+        routing = loader(scope=self._routing_scope())
+        for claim in claims:
+            if self._adopt_claimed_turn(claim, routing.get(claim.session_key), max_age_seconds):
+                resumable += 1
+        return resumable
+
+    def _settle_legacy_turn_markers(self, max_age_seconds: int, *, discard: bool) -> int:
+        from gateway import turn_owner
+
+        now = _now()
+        promoted = 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            for key, entry in list(self._entries.items()):
+                token = entry.active_turn_token
+                if not token or turn_owner.is_leased(token):
+                    continue
+                if discard:
+                    entry.active_turn_token = None
+                    entry.active_turn_started_at = None
+                elif self._settle_turn_marker(entry, now, max_age_seconds):
+                    promoted += 1
+                self._save_entry(key, lock_held=True)
+        return promoted
+
+    def _adopt_claimed_turn(
+        self, claim: Any, entry_json: Optional[str], max_age_seconds: int
+    ) -> bool:
+        """Settle the routing entry (as stored now) a claimed lease pointed at.
+
+        True when the session is left resumable for
+        ``GatewayRunner._schedule_resume_pending_sessions``.
+        """
+        from gateway import turn_owner
+
+        key = claim.session_key
+        if not entry_json:
+            return False
+        fresh = SessionEntry.from_dict(json.loads(entry_json))
+        if claim.handoff:
+            # The draining owner armed resume_pending and its turn unwound.
+            # A marker means someone has started a newer turn since.
+            if fresh.active_turn_token or fresh.suspended or not fresh.resume_pending:
+                return False
+            with self._lock:
+                self._ensure_loaded_locked()
+                self._entries[key] = fresh
+            return True
+        if fresh.active_turn_token != claim.token:
+            return False  # concluded, or superseded by a newer turn
+        with self._lock:
+            self._ensure_loaded_locked()
+            if claim.outcome == turn_owner.OUTCOME_CLEAN:
+                fresh.active_turn_token = None
+                fresh.active_turn_started_at = None
+                resumable = False
+            else:
+                self._settle_turn_marker(fresh, _now(), max_age_seconds)
+                resumable = fresh.resume_pending and not fresh.suspended
+            self._entries[key] = fresh
+            self._save_entry(key, lock_held=True)
+        return resumable
+
+    def hand_over_turns(self, session_keys: List[str]) -> int:
+        """Leave the resume_pending sessions of a draining gateway to a peer."""
+        from gateway import turn_owner
+
+        return turn_owner.hand_over(
+            scope=self._routing_scope(), session_keys=session_keys
+        )
 
     def discard_active_turn_markers(self) -> int:
         """Clear orphan turn markers after a verified clean shutdown."""

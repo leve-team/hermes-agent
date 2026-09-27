@@ -12466,15 +12466,134 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         marker_path.unlink()
         return discarded
 
+    async def _recover_sessions_after_previous_run(self) -> None:
+        """Settle the turns the previous gateway left behind (startup)."""
+        # Recover sessions that were active when the gateway last exited.
+        # Exact durable turn markers cover long-running work; the 120-second
+        # recency heuristic remains as an upgrade fallback for turns started by
+        # older Hermes versions that did not write exact markers.
+        #
+        # SKIP suspension after a clean (graceful) shutdown — the previous
+        # process already drained active agents, so sessions aren't stuck.
+        # This prevents unwanted auto-resets after `hermes update`,
+        # `hermes gateway restart`, or `/restart`.
+        #
+        # PostgreSQL authority (levos 0062): the marker file is pod-local and a
+        # peer pod may still be running the turns this pod can see, so the
+        # decision moves to the PostgreSQL turn leases (no recency fallback:
+        # every gateway that can run on authority writes exact markers).
+        _clean_marker = _hermes_home / ".clean_shutdown"
+        if self._turn_leases_on_postgres():
+            await self._recover_turns_from_leases(_clean_marker)
+        elif _clean_marker.exists():
+            logger.info("Previous gateway exited cleanly — skipping session suspension")
+            try:
+                discarded = await self._consume_clean_shutdown_marker(_clean_marker)
+            except Exception as exc:
+                logger.error(
+                    "Clean-start marker cleanup failed; refusing startup so the "
+                    "clean-exit receipt cannot mask a later unclean exit: %s",
+                    exc,
+                )
+                raise RuntimeError("clean-start recovery cleanup failed") from exc
+            if discarded:
+                logger.info(
+                    "Discarded %d orphan active-turn marker(s) after clean shutdown",
+                    discarded,
+                )
+        else:
+            exact, fallback = await self._recover_unclean_sessions()
+            recovered = exact + fallback
+            if recovered:
+                logger.info(
+                    "Marked %d in-flight session(s) as resumable from previous run "
+                    "(%d exact, %d legacy)",
+                    recovered,
+                    exact,
+                    fallback,
+                )
+
+    @staticmethod
+    def _turn_leases_on_postgres() -> bool:
+        from gateway import turn_owner
+
+        return turn_owner.enabled()
+
+    @staticmethod
+    def _active_turn_marker_max_age() -> int:
+        agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
+        return max(60 * 60, int(agent_timeout * 2))
+
+    async def _recover_turns_from_leases(self, legacy_marker) -> int:
+        """Startup recovery on PostgreSQL authority (levos 0062).
+
+        ``.clean_shutdown`` is only read, once, for markers of a gateway older
+        than 0062 (no lease); it is never written on authority.
+        """
+        legacy_clean = legacy_marker.exists()
+        resumable = 0
+        try:
+            resumable = await self.async_session_store.recover_turns_from_leases(
+                self._active_turn_marker_max_age(), legacy_clean=legacy_clean
+            )
+        except Exception as exc:
+            logger.warning("Turn-lease recovery on startup failed: %s", exc)
+        if legacy_clean:
+            try:
+                legacy_marker.unlink()
+            except OSError as exc:
+                logger.warning("Could not remove the legacy clean-shutdown marker: %s", exc)
+        if resumable:
+            logger.info(
+                "Marked %d session(s) resumable from dead or finished turn owners",
+                resumable,
+            )
+        return resumable
+
+    async def _turn_lease_watcher(self, interval: Optional[float] = None) -> None:
+        """Take over what a dead or finished peer left in PostgreSQL (levos 0062).
+
+        Overlapping pods start before the old one exits, so the startup pass
+        cannot see the turns and pending messages the old pod leaves when it
+        drains or dies; this repeats that pass every lease-renew period.
+        """
+        from gateway import turn_owner
+
+        period = turn_owner.LEASE_RENEW_SECONDS if interval is None else interval
+        while self._running:
+            await asyncio.sleep(period)
+            if not self._running or self._draining:
+                return
+            await self._sweep_turn_leases()
+
+    async def _sweep_turn_leases(self) -> int:
+        resumable = 0
+        try:
+            resumable = await self.async_session_store.recover_turns_from_leases(
+                self._active_turn_marker_max_age()
+            )
+        except Exception as exc:
+            logger.warning("Turn-lease sweep failed: %s", exc)
+        if resumable:
+            logger.info("Resuming %d session(s) left by a dead or finished peer", resumable)
+            self._schedule_resume_pending_sessions()
+        try:
+            from gateway.shutdown_flush import recover_pending_to_db
+
+            recovered = await asyncio.to_thread(recover_pending_to_db)
+            if recovered:
+                logger.info("Recovered %d pending message(s) left by a peer", recovered)
+        except Exception as exc:
+            logger.warning("Pending-message sweep failed: %s", exc)
+        return resumable
+
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
         """Recover exact active turns, then run the legacy recency fallback."""
         exact = 0
         fallback = 0
         try:
-            agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
-            marker_max_age = max(60 * 60, int(agent_timeout * 2))
             exact = await self.async_session_store.recover_interrupted_turns(
-                max_age_seconds=marker_max_age
+                max_age_seconds=self._active_turn_marker_max_age()
             )
         except Exception as exc:
             logger.warning("Exact active-turn recovery on startup failed: %s", exc)
@@ -12855,43 +12974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
-        # Recover sessions that were active when the gateway last exited.
-        # Exact durable turn markers cover long-running work; the 120-second
-        # recency heuristic remains as an upgrade fallback for turns started by
-        # older Hermes versions that did not write exact markers.
-        #
-        # SKIP suspension after a clean (graceful) shutdown — the previous
-        # process already drained active agents, so sessions aren't stuck.
-        # This prevents unwanted auto-resets after `hermes update`,
-        # `hermes gateway restart`, or `/restart`.
-        _clean_marker = _hermes_home / ".clean_shutdown"
-        if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
-            try:
-                discarded = await self._consume_clean_shutdown_marker(_clean_marker)
-            except Exception as exc:
-                logger.error(
-                    "Clean-start marker cleanup failed; refusing startup so the "
-                    "clean-exit receipt cannot mask a later unclean exit: %s",
-                    exc,
-                )
-                raise RuntimeError("clean-start recovery cleanup failed") from exc
-            if discarded:
-                logger.info(
-                    "Discarded %d orphan active-turn marker(s) after clean shutdown",
-                    discarded,
-                )
-        else:
-            exact, fallback = await self._recover_unclean_sessions()
-            recovered = exact + fallback
-            if recovered:
-                logger.info(
-                    "Marked %d in-flight session(s) as resumable from previous run "
-                    "(%d exact, %d legacy)",
-                    recovered,
-                    exact,
-                    fallback,
-                )
+        await self._recover_sessions_after_previous_run()
 
         # Stuck-loop detection (#7536): if a session has been active across
         # 3+ consecutive restarts, it's probably stuck in a loop (the same
@@ -13393,6 +13476,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
+
+        # PostgreSQL authority: pick up turns and pending messages a peer pod
+        # leaves behind after this pod started (levos 0062).
+        if self._turn_leases_on_postgres():
+            self._spawn_supervised(self._turn_lease_watcher, "turn_lease_watcher")
 
         # Stall watchdog: pending inbound + stale agent activity → warn user
         # to /new (does not kill the turn; see agent.session_stall_timeout).
@@ -14914,13 +15002,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
-                for _sk in self._resume_pending_agent_session_keys():
+                _resume_keys = list(self._resume_pending_agent_session_keys())
+                for _sk in _resume_keys:
                     try:
                         await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
+                        )
+                # PostgreSQL authority: the peer that resumes these sessions is
+                # another pod; leave it a row it can claim once we are gone.
+                if _resume_keys and GatewayRunner._turn_leases_on_postgres():
+                    try:
+                        await self.async_session_store.hand_over_turns(_resume_keys)
+                    except Exception as _e:
+                        logger.warning(
+                            "Could not hand %d interrupted session(s) over to a "
+                            "peer gateway: %s",
+                            len(_resume_keys), _e,
                         )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
@@ -15163,7 +15263,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message).  Skip the marker in that case so the next startup
             # suspends those sessions — giving users a clean slate instead
             # of resuming a half-finished tool loop.
-            if not timed_out:
+            #
+            # PostgreSQL authority (levos 0062): a peer pod never sees this
+            # disk; the receipt is the outcome on this process's turn leases.
+            if GatewayRunner._turn_leases_on_postgres():
+                from gateway import turn_owner
+
+                try:
+                    turn_owner.release(
+                        turn_owner.OUTCOME_INTERRUPTED
+                        if timed_out
+                        else turn_owner.OUTCOME_CLEAN
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "Could not release this gateway's turn leases; peers "
+                        "take them over when the leases run out: %s",
+                        _e,
+                    )
+            elif not timed_out:
                 try:
                     (_hermes_home / ".clean_shutdown").touch()
                 except Exception:
