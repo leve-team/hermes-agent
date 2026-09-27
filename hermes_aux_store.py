@@ -577,6 +577,47 @@ def aux_kv_trim(namespace: str, keep: int, *, conn: Any = None) -> int:
         return cursor.rowcount
 
 
+@contextlib.contextmanager
+def aux_connection_lock(
+    conn: Any, name: str, *, wait_seconds: float, poll_seconds: float = 0.05
+) -> Iterator[None]:
+    """Hold session advisory lock *name* on the caller's own connection (levos 0070).
+
+    For DDL that must run on *conn* itself and outside a transaction
+    (``CREATE INDEX CONCURRENTLY``), where neither :func:`aux_xact_lock` nor a
+    dedicated :class:`AuxSessionLock` connection fits. The wait is a
+    ``pg_try_advisory_lock`` poll, never a blocking ``pg_advisory_lock``: a
+    statement blocked on the lock keeps a snapshot open, and the holder's
+    ``CREATE INDEX CONCURRENTLY`` waits for every older snapshot, so a blocking
+    waiter would deadlock with it. Past *wait_seconds* this raises
+    :class:`AuxStoreUnavailable`; other PostgreSQL errors propagate unchanged.
+    Leaving the block unlocks; a dead holder's session takes the lock with it.
+    """
+    raw = conn.raw if hasattr(conn, "raw") else conn
+    schema = raw.execute("SELECT COALESCE(current_schema(), 'public')").fetchone()[0]
+    key = aux_lock_key(schema, name)
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while not raw.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0]:
+        if time.monotonic() >= deadline:
+            raise AuxStoreUnavailable(
+                f"advisory lock {name!r}: still held by another process after "
+                f"{wait_seconds:g}s"
+            )
+        time.sleep(poll_seconds)
+    unlock = "SELECT pg_advisory_unlock(%s)"
+    try:
+        yield
+    finally:
+        try:
+            raw.execute(unlock, (key,))
+        except Exception:
+            try:  # an aborted transaction refuses the unlock until rolled back
+                raw.rollback()
+                raw.execute(unlock, (key,))
+            except Exception:
+                pass  # a broken connection's server session released the lock
+
+
 class AuxPostgresConnection(_PostgresWriterConnection):
     """The writer handle plus the owner's closed SQLite dialect for one store."""
 

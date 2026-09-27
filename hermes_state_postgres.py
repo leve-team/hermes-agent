@@ -1015,7 +1015,36 @@ def _postgres_schema_statements(*, indexes: bool) -> List[str]:
     return selected
 
 
+# How long a writable open waits for another process's schema run before it
+# fails (levos 0070): the default pod termination grace period, past which the
+# overlapping old pod is gone anyway.
+SCHEMA_LOCK_WAIT_SECONDS = 60.0
+
+
+def _schema_lock(conn: Any):
+    from hermes_aux_store import aux_connection_lock
+
+    return aux_connection_lock(
+        conn, "schema:core", wait_seconds=SCHEMA_LOCK_WAIT_SECONDS
+    )
+
+
 def init_postgres_schema(
+    conn: Any, schema_version: int, *, defer_indexes: bool = False
+) -> None:
+    """Run :func:`_init_postgres_schema_locked` under the profile schema lock.
+
+    Two pods of one profile share only its PostgreSQL schema; when they
+    overlap, both open it writable at once. Unserialized, a first open on an
+    empty schema loses a catalog race (``pg_type`` unique violation) and a
+    pending migration runs twice concurrently. The lock is a session advisory
+    lock keyed on the connection's schema, held on *conn* for the whole run.
+    """
+    with _schema_lock(conn):
+        _init_postgres_schema_locked(conn, schema_version, defer_indexes=defer_indexes)
+
+
+def _init_postgres_schema_locked(
     conn: Any, schema_version: int, *, defer_indexes: bool = False
 ) -> None:
     """Create the PostgreSQL schema if absent, record the base schema version,
@@ -1079,15 +1108,16 @@ def init_postgres_schema(
 def finalize_postgres_schema(conn: Any) -> None:
     """Build deferred base/GIN indexes after a bulk COPY has completed."""
     raw = conn.raw if hasattr(conn, "raw") else conn
-    for statement in _postgres_schema_statements(indexes=True):
-        raw.execute(statement)
-    apply_postgres_migrations(conn)
-    try:
-        from hermes_state import SCHEMA_SQL
+    with _schema_lock(conn):
+        for statement in _postgres_schema_statements(indexes=True):
+            raw.execute(statement)
+        apply_postgres_migrations(conn)
+        try:
+            from hermes_state import SCHEMA_SQL
 
-        reconcile_postgres_columns(conn, SCHEMA_SQL)
-    except Exception as exc:
-        logger.warning("pg column reconciliation skipped: %s", exc)
+            reconcile_postgres_columns(conn, SCHEMA_SQL)
+        except Exception as exc:
+            logger.warning("pg column reconciliation skipped: %s", exc)
 
 
 def postgres_schema_version(conn: Any) -> int:

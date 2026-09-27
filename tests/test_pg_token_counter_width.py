@@ -85,6 +85,10 @@ class CatalogDriver:
             self.rows = [(max(self.applied, default=None),)]
         elif sql.startswith("SELECT version FROM pg_migration_version"):
             self.rows = [(version,) for version in sorted(self.applied)]
+        elif sql == "SELECT COALESCE(current_schema(), 'public')":
+            self.rows = [("public",)]
+        elif sql.startswith(("SELECT pg_try_advisory_lock(", "SELECT pg_advisory_unlock(")):
+            self.rows = [(True,)]  # levos 0070 schema lock around init/finalize
         elif sql.startswith("SELECT version FROM schema_version"):
             self.rows = [] if self.version is None else [(self.version,)]
         elif sql.startswith("INSERT INTO schema_version"):
