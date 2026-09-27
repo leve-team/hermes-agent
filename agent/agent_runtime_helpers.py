@@ -840,6 +840,12 @@ def recover_with_credential_pool(
                 # Ambiguous billing body: size the cooldown as transient, not a 1-hour bench.
                 from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
                 failure_reason = FAILURE_REASON_BILLING_UNVERIFIED
+            elif effective_reason == FailoverReason.rate_limit:
+                from agent.credential_pool import (
+                    FAILURE_REASON_MODEL_RATE_LIMIT, is_model_scoped_rate_limit,
+                )
+                if is_model_scoped_rate_limit(error_context):
+                    failure_reason = FAILURE_REASON_MODEL_RATE_LIMIT
             kwargs["failure_reason"] = failure_reason
         next_entry = pool.mark_exhausted_and_rotate(**kwargs)
         if next_entry is None:
@@ -849,6 +855,16 @@ def recover_with_credential_pool(
             rotate_status, label, getattr(next_entry, "id", "?"),
         )
         return agent._swap_credential(next_entry) is not False
+    if effective_reason == FailoverReason.rate_limit:
+        from agent.credential_pool import is_model_scoped_rate_limit
+        if is_model_scoped_rate_limit(error_context):
+            # 요청한 모델만 한도에 걸렸다 — 계정은 멀쩡하다. 벤치하면 폴백이 다른 모델로 갈 자격증명까지
+            # 같이 사라진다(실사고 2026-09-26: fable 429 로 계정 2개 소진 → 폴백 opus 무자격 → 무응답).
+            _ra().logger.info(
+                "Model-scoped rate limit (%s) — skipping credential rotation, deferring to fallback chain",
+                (error_context or {}).get("model") if error_context else None,
+            )
+            return False, has_retried_429
     if effective_reason == FailoverReason.upstream_rate_limit:
         # Upstream (e.g. DeepSeek behind OpenRouter) is throttling the aggregator; the credential is
         # healthy. Do not rotate/exhaust; let fallback switch models.
