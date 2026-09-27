@@ -1268,6 +1268,10 @@ class SessionStore:
         # from _routing_generation, so fast and full snapshots are totally
         # ordered; guarded by _save_lock (see _save_entry).
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
+        # PostgreSQL authority only: session_key -> (normalized entry JSON,
+        # row text) as this process last read or wrote the gateway_routing
+        # row. Row-level saves diff against it; guarded by _save_lock.
+        self._routing_rows: Dict[str, tuple[str, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1441,6 +1445,129 @@ class SessionStore:
         except Exception:
             return str(self.sessions_dir)
 
+    def _routing_on_pg_authority(self) -> bool:
+        """True when the routing index lives only in PostgreSQL authority.
+
+        Two gateways of one profile (overlapping pods) then share the index:
+        saves write only the rows this process changed, key lookups re-read
+        the row, and sessions.json is neither read nor written.  Every other
+        backend keeps the whole-index rewrite and the mirror unchanged.
+        """
+        cached = getattr(self, "_routing_authority", None)
+        if cached is None:
+            from hermes_aux_store import aux_store_authority
+
+            cached = self._routing_authority = aux_store_authority()
+        return cached
+
+    def _routing_db_for_authority(self):
+        _db = getattr(self, "_db", None)
+        if not _db:
+            from hermes_aux_store import AuxStoreUnavailable
+
+            raise AuxStoreUnavailable(
+                "gateway routing: PostgreSQL authority is selected but the "
+                "session store is unavailable; refusing the sessions.json fallback"
+            )
+        return _db
+
+    def _routing_row_view(self) -> Dict[str, tuple[str, str]]:
+        rows = getattr(self, "_routing_rows", None)
+        if rows is None:
+            rows = self._routing_rows = {}
+        return rows
+
+    @staticmethod
+    def _parse_routing_row(entry_json: str) -> tuple[SessionEntry, tuple[str, str]]:
+        """Entry and its row-view state; the normalized form is what a save
+        of the unchanged entry would write, so it diffs as unchanged."""
+        data = json.loads(entry_json)
+        if not isinstance(data, dict):
+            raise TypeError(f"expected dict, got {type(data).__name__}")
+        entry = SessionEntry.from_dict(data)
+        return entry, (json.dumps(entry.to_dict()), entry_json)
+
+    def _load_routing_rows_locked(self) -> None:
+        """Load every routing row of this scope (authority). Caller holds ``_lock``."""
+        rows = self._routing_db_for_authority().load_gateway_routing_entries(
+            scope=self._routing_scope()
+        )
+        view = self._routing_row_view()
+        for key, entry_json in rows.items():
+            try:
+                entry, state = self._parse_routing_row(entry_json)
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("Skipping invalid routing entry %r: %s", key, e)
+                continue
+            self._entries[key] = entry
+            view[key] = state
+
+    def _write_routing_rows(self, data: Dict[str, Any]) -> None:
+        """Persist *data* row by row (authority). Caller holds ``_save_lock``.
+
+        Only keys whose serialization differs from the row this process last
+        saw are upserted, and only keys this process dropped are deleted —
+        conditionally, so another gateway's newer row for that key survives.
+        Keys this process never saw are untouched.
+        """
+        _db = self._routing_db_for_authority()
+        view = self._routing_row_view()
+        rows = {key: json.dumps(value) for key, value in data.items() if key}
+        upserts = {
+            key: entry_json
+            for key, entry_json in rows.items()
+            if key not in view or view[key][0] != entry_json
+        }
+        deletes = {key: state[1] for key, state in view.items() if key not in rows}
+        if upserts or deletes:
+            _db.apply_gateway_routing_changes(
+                upserts, deletes, scope=self._routing_scope()
+            )
+        for key in deletes:
+            del view[key]
+        for key, entry_json in upserts.items():
+            view[key] = (entry_json, entry_json)
+
+    def _refresh_routing_key(self, session_key: str) -> None:
+        """Re-read one routing row so another gateway's change is seen (authority).
+
+        The row is the shared truth: a new or changed row replaces the local
+        entry, and a row that disappeared since this process last saw it
+        drops the entry.  A local write that lands between the read and the
+        apply is newer than the read, so the read is discarded.
+        """
+        if not session_key or not self._routing_on_pg_authority():
+            return
+        self._ensure_loaded()
+        save_lock = getattr(self, "_save_lock", None)
+        if save_lock is None:
+            save_lock = self._save_lock = threading.Lock()
+        view = self._routing_row_view()
+        with save_lock:
+            seen = view.get(session_key)
+        entry_json = self._routing_db_for_authority().load_gateway_routing_entry(
+            session_key, scope=self._routing_scope()
+        )
+        with self._lock, save_lock:
+            if view.get(session_key) != seen:
+                return
+            if entry_json is None:
+                # Only a row this process had seen counts as deleted; an entry
+                # published but not yet saved by another thread stays.
+                if seen is not None:
+                    del view[session_key]
+                    self._entries.pop(session_key, None)
+                return
+            if seen is not None and seen[1] == entry_json:
+                return
+            try:
+                entry, state = self._parse_routing_row(entry_json)
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("Skipping invalid routing entry %r: %s", session_key, e)
+                return
+            self._entries[session_key] = entry
+            view[session_key] = state
+
     def _ensure_loaded_locked(self) -> None:
         """Load the routing index. Must be called with self._lock held.
 
@@ -1453,6 +1580,15 @@ class SessionStore:
             return
 
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        if self._routing_on_pg_authority():
+            # The table is the only copy: a load failure raises instead of
+            # starting empty, and sessions.json is not imported — a file left
+            # on this pod's disk must not revive keys the shared table dropped.
+            self._load_routing_rows_locked()
+            self._loaded = True
+            self._prune_stale_sessions_locked()
+            return
 
         # Primary: state.db gateway_routing table. getattr: some tests build
         # partially-initialized stores without __init__ (same pattern as
@@ -1663,7 +1799,12 @@ class SessionStore:
                         data[key] = json.loads(entry_json)
             db_saved = False
             _db = getattr(self, "_db", None)
-            if _db:
+            authority = self._routing_on_pg_authority()
+            if authority:
+                # Shared with an overlapping gateway: never a scope-wide
+                # rewrite, never a file. A failed write raises.
+                self._write_routing_rows(data)
+            elif _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
@@ -1676,7 +1817,9 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
-            if getattr(self, "_write_sessions_json", True) or not db_saved:
+            if not authority and (
+                getattr(self, "_write_sessions_json", True) or not db_saved
+            ):
                 try:
                     self._save_sessions_json(data)
                 except Exception as exc:
@@ -1840,6 +1983,8 @@ class SessionStore:
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
+                    if self._routing_on_pg_authority():
+                        self._routing_row_view()[session_key] = (entry_json, entry_json)
                 return
             except Exception as exc:
                 logger.warning(
@@ -2600,6 +2745,7 @@ class SessionStore:
         protects only ``_entries`` / ``_loaded`` mutations.
         """
         session_key = self._generate_session_key(source)
+        self._refresh_routing_key(session_key)
         now = _now()
 
         # One-time routing-index migration for Slack sessions created before
@@ -3492,6 +3638,7 @@ class SessionStore:
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
+        self._refresh_routing_key(session_key)
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -3597,6 +3744,7 @@ class SessionStore:
         """
         if not session_key or not expected_session_id or not target_session_id:
             return None
+        self._refresh_routing_key(session_key)
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -3631,6 +3779,7 @@ class SessionStore:
         """
         db_end_session_id = None
         new_entry = None
+        self._refresh_routing_key(session_key)
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -3719,6 +3868,7 @@ class SessionStore:
         """Return the persisted routing entry for an exact session key."""
         if not session_key:
             return None
+        self._refresh_routing_key(session_key)
         with self._lock:
             self._ensure_loaded_locked()
             return self._entries.get(session_key)
@@ -3734,6 +3884,7 @@ class SessionStore:
         """
         if not session_key:
             return None
+        self._refresh_routing_key(session_key)
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
