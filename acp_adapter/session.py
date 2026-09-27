@@ -412,7 +412,13 @@ class SessionManager:
         if self._db_instance is not None:
             return self._db_instance
         try:
+            from hermes_aux_store import aux_store_authority
             from hermes_state import SessionDB
+            if aux_store_authority():
+                # levos 0069: an explicit db_path pins SQLite. On PostgreSQL
+                # authority the history belongs in the profile's store.
+                self._db_instance = SessionDB()
+                return self._db_instance
             hermes_home = get_hermes_home()
             self._db_instance = SessionDB(db_path=hermes_home / "state.db")
             return self._db_instance

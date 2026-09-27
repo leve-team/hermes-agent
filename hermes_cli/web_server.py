@@ -338,10 +338,18 @@ def _eager_reconcile_own_session_db() -> None:
     (jittered retries) absorbing transient contention. Never raises: a
     store this cannot fix is still served through the read-probe heal in
     :func:`_open_session_db_at_path`, which retries on every poll.
+
+    On PostgreSQL authority there is no own state.db to reconcile (levos
+    0069): session reads already go to the profile's store, whose schema the
+    gateway's writable open owns, and the open here would only leave an empty
+    SQLite file on the pod's disk.
     """
     try:
+        from hermes_aux_store import aux_store_authority
         from hermes_state import SessionDB, _default_db_path
 
+        if aux_store_authority():
+            return
         SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
     except Exception as exc:
         _log.warning(
@@ -1865,9 +1873,13 @@ def _count_status_active_sessions() -> int:
 
     # The heal helper bootstraps a missing store; this garnish must not — on
     # a fresh install /api/status polls would otherwise create state.db
-    # before the user's first session.
+    # before the user's first session. On PostgreSQL authority the file never
+    # exists and the count comes from the profile's store (levos 0069).
     if not Path(_default_db_path()).exists():
-        return 0
+        from hermes_aux_store import aux_store_authority
+
+        if not aux_store_authority():
+            return 0
 
     db = _open_session_db_for_profile(None, read_only=True)
     try:

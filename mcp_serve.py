@@ -332,6 +332,29 @@ def _ts_float(ts) -> float:
     return 0.0
 
 
+def _state_change_signature():
+    """What moves when any process writes the session store.
+
+    SQLite: state.db's mtime. PostgreSQL authority (levos 0069): no writer
+    touches that file — and an overlapping pod writes another disk — so the
+    profile store's own digest (``hermes_aux_store.aux_change_signal``). A
+    PostgreSQL failure raises; the poll loop logs it and retries next tick.
+    """
+    from hermes_aux_store import aux_change_signal, aux_store_authority
+
+    if aux_store_authority():
+        return aux_change_signal("sessions")
+    try:
+        from hermes_constants import get_hermes_home
+        db_file = get_hermes_home() / "state.db"
+    except ImportError:
+        db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+    try:
+        return db_file.stat().st_mtime if db_file.exists() else 0.0
+    except OSError:
+        return 0.0
+
+
 class EventBridge:
     """Background poller that watches SessionDB for new messages and
     maintains an in-memory event queue with waiter support.
@@ -489,13 +512,8 @@ class EventBridge:
         message is still delivered on its state.db-change tick.
         """
         try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-        try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
+            self._state_db_mtime = _state_change_signature()
+        except Exception:
             self._state_db_mtime = 0.0
         try:
             self._cached_sessions_index = _load_sessions_index()
@@ -545,17 +563,7 @@ class EventBridge:
         eliminating the old dual-file (sessions.json + state.db) race that
         could drop brand-new conversations (#8925).
         """
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-
-        try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            db_mtime = 0.0
-
+        db_mtime = _state_change_signature()
         if db_mtime == self._state_db_mtime:
             return  # Nothing changed since last poll — skip entirely
 

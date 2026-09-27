@@ -3971,9 +3971,24 @@ def _pet_changed_payload() -> dict:
         return {"enabled": False}
 
 
+def _state_authority() -> bool:
+    """True on a PostgreSQL-authority profile (levos 0069): nothing writes
+    state.db or cron/jobs.json there, and an overlapping pod writes another
+    disk, so the signatures below read the profile's store instead
+    (``hermes_aux_store.aux_change_signal``; a PostgreSQL failure raises and
+    the watcher skips that tick)."""
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
 def _cron_sig():
     """mtime of the profile's cron/jobs.json — moves on create/edit/pause/
     remove AND on scheduler tick bookkeeping (last_run/next_run)."""
+    if _state_authority():
+        from hermes_aux_store import aux_change_signal
+
+        return aux_change_signal("cron_jobs")
     try:
         return (_watcher_home() / "cron" / "jobs.json").stat().st_mtime_ns
     except OSError:
@@ -3985,6 +4000,10 @@ def _sessions_sig():
     signal. Messaging-gateway turns and cron runs are written by OTHER
     processes that never touch this gateway's transports; the shared SQLite
     file is the one thing they all move (#58671)."""
+    if _state_authority():
+        from hermes_aux_store import aux_change_signal
+
+        return aux_change_signal("sessions")
     home = _watcher_home()
     sig = None
     for name in ("state.db", "state.db-wal"):

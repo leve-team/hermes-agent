@@ -808,6 +808,88 @@ class AuxLeaseRenewer:
 
 
 # ---------------------------------------------------------------------------
+# Change signals (levos 0069)
+# ---------------------------------------------------------------------------
+# Watchers (the dashboard's tui change watcher, ``hermes mcp serve``) stat
+# ``state.db`` / ``cron/jobs.json`` because every writer moves those files. On
+# authority no writer touches them, and the other pod of an overlapping
+# rollout writes a disk this pod never sees. The signal is read from the
+# profile's PostgreSQL store instead, so it moves whichever process wrote.
+#
+# ``sessions`` is too big to digest every half second (a row-hash scan costs
+# ~16 ms at 20k sessions), so it pairs the newest message id (primary-key
+# index: exact and immediate for a new turn) with the server's cumulative
+# insert/update/delete counters of both tables — any write, like the file
+# mtime. Those counters are published when the writing backend goes idle
+# (within about a second) and need ``track_counts``, which autovacuum needs
+# too. ``cron_jobs`` is small: an exact, order-independent sum of row hashes.
+
+# name -> (table whose absence is a valid state, signal query)
+AUX_CHANGE_SIGNALS: Mapping[str, Tuple[str, str]] = {
+    "sessions": (
+        "sessions",
+        "SELECT (SELECT COALESCE(MAX(id), 0) FROM messages), "
+        "pg_stat_get_tuples_inserted(s) + pg_stat_get_tuples_updated(s) "
+        "+ pg_stat_get_tuples_deleted(s), "
+        "pg_stat_get_tuples_inserted(m) + pg_stat_get_tuples_updated(m) "
+        "+ pg_stat_get_tuples_deleted(m) "
+        "FROM (SELECT 'sessions'::regclass AS s, 'messages'::regclass AS m) AS t",
+    ),
+    "cron_jobs": (
+        "core_cron_jobs",
+        "SELECT COUNT(*), COALESCE(SUM(hashtext(ROW(id, position, job)::text)), 0) "
+        "FROM core_cron_jobs",
+    ),
+}
+_change_signal_lock = threading.Lock()
+_change_signal_connections: Dict[str, Any] = {}
+
+
+def aux_change_signal(name: str) -> Tuple[Any, ...]:
+    """Current digest of change signal *name* in the active profile's store.
+
+    Compare values, never interpret them: equal means nothing watched moved.
+    The store's tables are never created here (a missing table is a value of
+    its own). Watchers poll every fraction of a second, so one autocommit
+    connection per DSN is kept and reused. Not on PostgreSQL authority, or on
+    any PostgreSQL failure, raises :class:`AuxStoreUnavailable` — there is no
+    file signal to fall back to.
+    """
+    try:
+        table, query = AUX_CHANGE_SIGNALS[name]
+    except KeyError:
+        raise ValueError(f"unknown change signal {name!r}") from None
+    try:
+        from hermes_state_postgres import connect_postgres, resolve_postgres_dsn
+
+        dsn = resolve_postgres_dsn()
+    except Exception as exc:
+        raise AuxStoreUnavailable(
+            f"change signal {name!r}: the PostgreSQL authority store could not be resolved"
+        ) from exc
+    if not dsn:
+        raise AuxStoreUnavailable(
+            f"change signal {name!r} exists only on PostgreSQL authority"
+        )
+    with _change_signal_lock:
+        try:
+            conn = _change_signal_connections.get(dsn)
+            if conn is None:
+                conn = _change_signal_connections[dsn] = connect_postgres(dsn)
+            if conn.execute("SELECT to_regclass(?)", (table,)).fetchone()[0] is None:
+                return (name, None)
+            return tuple(conn.execute(query).fetchone())
+        except Exception as exc:
+            stale = _change_signal_connections.pop(dsn, None)
+            if stale is not None:
+                with contextlib.suppress(Exception):
+                    stale.close()
+            raise AuxStoreUnavailable(
+                f"change signal {name!r}: the PostgreSQL authority store could not be read"
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
 # One-shot SQLite -> PostgreSQL move
 # ---------------------------------------------------------------------------
 
