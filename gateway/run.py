@@ -12172,6 +12172,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
+        await self._schedule_obligation_resweep()
         if not claimed:
             return 0
 
@@ -12239,6 +12240,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _schedule_obligation_resweep(self) -> None:
+        """Sweep the delivery ledger again once a live foreign lease runs out.
+
+        On PostgreSQL authority (levos 0063) the startup sweep skips rows
+        whose owner — an overlapping pod, or this pod's previous process —
+        still holds a lease. Without a later sweep those rows would wait for
+        the next restart. Off PostgreSQL the ledger reports no wait.
+        """
+        pending = getattr(self, "_obligation_resweep_task", None)
+        if pending is not None and not pending.done():
+            return
+        try:
+            from gateway.delivery_ledger import seconds_until_recoverable
+
+            delay = await asyncio.to_thread(seconds_until_recoverable)
+        except Exception:
+            logger.debug("delivery ledger lease query failed", exc_info=True)
+            return
+        if delay is None:
+            return
+
+        async def _resweep() -> None:
+            await asyncio.sleep(delay + 1.0)
+            self._obligation_resweep_task = None
+            if getattr(self, "_running", False):
+                await self._redeliver_pending_obligations()
+
+        task = asyncio.create_task(_resweep())
+        self._obligation_resweep_task = task
+        background = getattr(self, "_background_tasks", None)
+        if background is not None:
+            background.add(task)
+            task.add_done_callback(background.discard)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.

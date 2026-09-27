@@ -33,10 +33,14 @@ plus their one-shot move, :func:`migrate_cron_to_pg`.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
+import os
 import re
 import sqlite3
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -494,6 +498,122 @@ class AuxPostgresConnection(_PostgresWriterConnection):
 
     def cursor(self):
         raise NotImplementedError("auxiliary stores use connection.execute()")
+
+
+# ---------------------------------------------------------------------------
+# Row ownership leases (levos 0063)
+# ---------------------------------------------------------------------------
+# A row a process owns until it finishes (an outbound delivery obligation, a
+# running background delegation) used to name its owner by pid + process
+# start time, and another process judged "owner dead" by probing its own
+# kernel. A pod cannot see another pod's pids, so on PostgreSQL authority the
+# owner is a per-process instance id and it counts as dead only once its lease
+# ran out: while it lives the owner renews ``lease_expires_at``, an epoch
+# second on the PostgreSQL server clock so clock skew between pods does not
+# count. The cron execution lease of levos 0060 follows the same model.
+
+AUX_SERVER_EPOCH = "EXTRACT(EPOCH FROM clock_timestamp())::float8"
+# SQLite DDL types (``postgres_ddl`` turns REAL into DOUBLE PRECISION).
+AUX_LEASE_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("owner_instance", "TEXT"),
+    ("lease_expires_at", "REAL"),
+)
+AUX_LEASE_EXPIRED = (
+    f"(lease_expires_at IS NULL OR lease_expires_at < {AUX_SERVER_EPOCH})"
+)
+
+_owner_guard = threading.Lock()
+_owner: Tuple[int, str] = (0, "")
+
+
+def aux_owner_instance() -> str:
+    """This process's lease owner id; a forked child gets its own."""
+    global _owner
+    pid = os.getpid()
+    with _owner_guard:
+        if _owner[0] != pid:
+            _owner = (pid, uuid.uuid4().hex)
+        return _owner[1]
+
+
+def aux_add_columns(
+    conn: Any, table: str, columns: Tuple[Tuple[str, str], ...]
+) -> None:
+    """Add the *columns* PostgreSQL *table* lacks; a racing peer is harmless."""
+    present = {
+        row[0]
+        for row in conn.execute(
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema = current_schema() AND table_name = ?""",
+            (table,),
+        ).fetchall()
+    }
+    for name, sql_type in columns:
+        if name not in present:
+            conn.execute(
+                postgres_ddl(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {sql_type}"
+                )
+            )
+
+
+class AuxLeaseRenewer:
+    """One daemon thread per process renewing this process's leases.
+
+    *renew* runs every ``interval()`` seconds in the context of the first
+    :meth:`start` call; a failure is logged through *log* and retried on the
+    next round (a lease that runs out while PostgreSQL is away lets another
+    process take the row over, it never makes two owners renew it).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        renew: Callable[[], Any],
+        interval: Callable[[], float],
+        log: Any,
+    ):
+        self.name = name
+        self._renew = renew
+        self._interval = interval
+        self._log = log
+        self._guard = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._pid = 0
+
+    def start(self) -> None:
+        with self._guard:
+            if (
+                self._thread is not None
+                and self._thread.is_alive()
+                and self._pid == os.getpid()
+            ):
+                return
+            self._stop = threading.Event()
+            self._pid = os.getpid()
+            self._thread = threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(self._run, self._stop),
+                name=self.name,
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Stop renewing (tests; a stopped owner's leases run out)."""
+        with self._guard:
+            thread, self._thread = self._thread, None
+            self._stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.wait(self._interval()):
+            try:
+                self._renew()
+            except Exception as exc:
+                self._log.warning("%s: lease renewal failed: %s", self.name, exc)
 
 
 # ---------------------------------------------------------------------------

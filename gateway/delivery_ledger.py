@@ -37,6 +37,14 @@ transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
 Everything here is best-effort by design: ledger failures must never block
 or delay an actual send. Callers wrap every call in try/except.
+
+On PostgreSQL authority (levos 0063) the owner of a row may run in another
+pod, where no pid probe can see it, so ownership is a lease instead:
+``owner_instance`` names the owning process and the row counts as orphaned
+only once its ``lease_expires_at`` (PostgreSQL server clock) ran out. A live
+owner renews its undelivered rows every ``LEASE_RENEW_SECONDS``; a row skipped
+at startup because its lease was still live becomes claimable after
+``seconds_until_recoverable()``.
 """
 
 from __future__ import annotations
@@ -64,6 +72,15 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+
+# PostgreSQL authority lease (levos 0063): a live owner renews every
+# LEASE_RENEW_SECONDS; another process may claim the row once the lease is
+# LEASE_SECONDS stale (four missed renewals).
+LEASE_SECONDS = 120.0
+LEASE_RENEW_SECONDS = 30.0
+_OPEN_STATES = "('pending', 'attempting', 'failed')"
+_lease_renewer = None
+_lease_renewer_guard = threading.Lock()
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -108,9 +125,11 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS delivery_obligations (
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     if _is_postgres(conn):
+        from hermes_aux_store import AUX_LEASE_COLUMNS, aux_add_columns
         from hermes_state_writer import postgres_ddl
 
         conn.execute(postgres_ddl(_SCHEMA))
+        aux_add_columns(conn, "delivery_obligations", AUX_LEASE_COLUMNS)
         return
     from hermes_state import apply_wal_with_fallback
 
@@ -146,6 +165,12 @@ _RECORD_POSTGRES = """INSERT INTO delivery_obligations
                  owner_started_at = excluded.owner_started_at,
                  last_error = excluded.last_error"""
 
+# Columns both sweeps read; the PostgreSQL sweep adds the lease verdict (the
+# row is still owned while it is this process's own or its lease is live).
+_SWEEP_COLUMNS = """obligation_id, session_key, platform, chat_id, thread_id,
+                      content, state, attempts, created_at,
+                      owner_pid, owner_started_at"""
+
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
@@ -165,6 +190,96 @@ def _transaction() -> Iterator[sqlite3.Connection]:
             yield conn
     finally:
         conn.close()
+
+
+def _take_lease(conn: Any, obligation_id: str) -> None:
+    """Stamp this process as the row's lease owner (PostgreSQL only)."""
+    from hermes_aux_store import AUX_SERVER_EPOCH, aux_owner_instance
+
+    conn.execute(
+        f"""UPDATE delivery_obligations
+            SET owner_instance=?, lease_expires_at={AUX_SERVER_EPOCH} + ?
+            WHERE obligation_id=?""",
+        (aux_owner_instance(), float(LEASE_SECONDS), obligation_id),
+    )
+
+
+def renew_obligation_leases() -> int:
+    """Renew this process's undelivered rows; 0 off PostgreSQL authority."""
+    from hermes_aux_store import (
+        AUX_SERVER_EPOCH,
+        aux_owner_instance,
+        aux_store_authority,
+    )
+
+    if not aux_store_authority():
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return 0
+        return conn.execute(
+            f"""UPDATE delivery_obligations
+                SET lease_expires_at={AUX_SERVER_EPOCH} + ?
+                WHERE owner_instance=? AND state IN {_OPEN_STATES}""",
+            (float(LEASE_SECONDS), aux_owner_instance()),
+        ).rowcount
+
+
+def _start_lease_renewer() -> None:
+    global _lease_renewer
+    from hermes_aux_store import AuxLeaseRenewer
+
+    with _lease_renewer_guard:
+        if _lease_renewer is None:
+            _lease_renewer = AuxLeaseRenewer(
+                "delivery-obligation-lease",
+                renew_obligation_leases,
+                lambda: LEASE_RENEW_SECONDS,
+                logger,
+            )
+        renewer = _lease_renewer
+    renewer.start()
+
+
+def _stop_lease_renewer() -> None:
+    """Stop renewing (tests; a stopped owner's leases run out)."""
+    with _lease_renewer_guard:
+        renewer = _lease_renewer
+    if renewer is not None:
+        renewer.stop()
+
+
+def seconds_until_recoverable() -> Optional[float]:
+    """Seconds until the earliest live lease another process holds on an
+    undelivered row runs out; None when there is none.
+
+    Always None off PostgreSQL authority: there the pid probe of
+    ``sweep_recoverable`` is final. On PostgreSQL a startup sweep skips rows
+    whose owner (another pod, or this pod's previous process) still holds a
+    lease, so the caller sweeps again after this many seconds.
+    """
+    from hermes_aux_store import (
+        AUX_SERVER_EPOCH,
+        aux_owner_instance,
+        aux_store_authority,
+    )
+
+    if not aux_store_authority():
+        return None
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return None
+        row = conn.execute(
+            f"""SELECT MIN(lease_expires_at) - {AUX_SERVER_EPOCH}
+                FROM delivery_obligations
+                WHERE state IN {_OPEN_STATES}
+                  AND owner_instance IS DISTINCT FROM ?
+                  AND lease_expires_at >= {AUX_SERVER_EPOCH}""",
+            (aux_owner_instance(),),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
 
 
 def _owner_stamp() -> tuple[int, Optional[int]]:
@@ -249,12 +364,17 @@ def record_obligation(
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        leased = _is_postgres(conn)
         conn.execute(
-            _RECORD_POSTGRES if _is_postgres(conn) else _RECORD_SQLITE,
+            _RECORD_POSTGRES if leased else _RECORD_SQLITE,
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
              pid, started),
         )
+        if leased:
+            _take_lease(conn, obligation_id)
+    if leased:
+        _start_lease_renewer()
     _prune()
 
 
@@ -291,6 +411,9 @@ def sweep_recoverable(
     Claiming atomically re-stamps the owner to THIS process and increments
     ``attempts``, so a second gateway racing the same sweep cannot
     double-claim (the UPDATE is guarded on the previous owner stamp).
+    On PostgreSQL authority "dead" means the owner's lease ran out (levos
+    0063): a row another pod still renews is never claimed, and the guard
+    also re-checks the lease inside the UPDATE.
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
 
@@ -305,22 +428,45 @@ def sweep_recoverable(
     pid, started = _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
-                      owner_pid, owner_started_at
-               FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
-        ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
-            if _owner_alive(owner_pid, owner_started_at):
+        leased = _is_postgres(conn)
+        if leased:
+            from hermes_aux_store import (
+                AUX_LEASE_EXPIRED,
+                AUX_SERVER_EPOCH,
+                aux_owner_instance,
+            )
+
+            me = aux_owner_instance()
+            # Re-checked inside every UPDATE: the owner may renew meanwhile.
+            orphaned = f" AND owner_instance IS DISTINCT FROM ? AND {AUX_LEASE_EXPIRED}"
+            rows = conn.execute(
+                f"""SELECT {_SWEEP_COLUMNS},
+                          owner_instance IS NOT DISTINCT FROM ?
+                          OR NOT {AUX_LEASE_EXPIRED}
+                   FROM delivery_obligations
+                   WHERE state IN {_OPEN_STATES}""",
+                (me,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""SELECT {_SWEEP_COLUMNS}
+                   FROM delivery_obligations
+                   WHERE state IN {_OPEN_STATES}"""
+            ).fetchall()
+        for row in rows:
+            (oid, session_key, platform, chat_id, thread_id, content, state,
+             attempts, created_at, owner_pid, owner_started_at) = row[:11]
+            if leased:
+                if row[11]:
+                    continue  # this process, or a live lease, still owns it
+            elif _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
-                    (now, oid),
+                       SET state='abandoned', updated_at=? WHERE obligation_id=?"""
+                    + (orphaned if leased else ""),
+                    (now, oid, me) if leased else (now, oid),
                 )
                 continue
             if (
@@ -333,13 +479,23 @@ def sweep_recoverable(
             # NULL-safe guard on the previous owner: ``IS ?`` is SQLite-only
             # (PostgreSQL rejects ``IS $1``); ``IS NOT DISTINCT FROM`` is the
             # portable spelling both backends accept.
-            cursor = conn.execute(
-                """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
-                   WHERE obligation_id=? AND owner_pid IS NOT DISTINCT FROM ?""",
-                (pid, started, now, oid, owner_pid),
-            )
+            if leased:
+                cursor = conn.execute(
+                    f"""UPDATE delivery_obligations
+                       SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                           updated_at=?, owner_instance=?,
+                           lease_expires_at={AUX_SERVER_EPOCH} + ?
+                       WHERE obligation_id=?""" + orphaned,
+                    (pid, started, now, me, float(LEASE_SECONDS), oid, me),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                           updated_at=?
+                       WHERE obligation_id=? AND owner_pid IS NOT DISTINCT FROM ?""",
+                    (pid, started, now, oid, owner_pid),
+                )
             if cursor.rowcount:
                 claimed.append({
                     "obligation_id": oid,
@@ -353,6 +509,8 @@ def sweep_recoverable(
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
                 })
+    if claimed and leased:
+        _start_lease_renewer()
     return claimed
 
 

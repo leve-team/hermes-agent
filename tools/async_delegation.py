@@ -32,6 +32,13 @@ This module owns ONLY the async lifecycle. The actual child build + run is
 delegated back to ``delegate_tool._run_single_child`` via an injected
 runner, so all the credential leasing, heartbeat, timeout, and result-shaping
 logic stays in one place.
+
+On PostgreSQL authority (levos 0063) a delegation's owner may run in another
+pod, where no pid probe can see it, so ownership is a lease: ``owner_instance``
+names the owning process and a running row is abandoned only once its
+``lease_expires_at`` (PostgreSQL server clock) ran out. A live owner renews its
+running rows every ``LEASE_RENEW_SECONDS``; rows still leased when this process
+restores completions are recovered once their lease runs out.
 """
 
 from __future__ import annotations
@@ -89,6 +96,17 @@ _MAX_DELIVERY_ATTEMPTS = 8
 # deliverable while stopping weeks-old sessions from replaying after upgrades.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+
+# PostgreSQL authority lease (levos 0063): a live owner renews every
+# LEASE_RENEW_SECONDS; another process may close the delegation as unknown
+# once the lease is LEASE_SECONDS stale (four missed renewals).
+LEASE_SECONDS = 120.0
+LEASE_RENEW_SECONDS = 30.0
+_lease_renewer = None
+_lease_renewer_guard = threading.Lock()
+# One pending "recover once the live leases run out" pass per process.
+_deferred_recovery: Optional[threading.Timer] = None
+_deferred_recovery_guard = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -192,6 +210,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(postgres_ddl(
                     f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}"
                 ))
+        from hermes_aux_store import AUX_LEASE_COLUMNS, aux_add_columns
+
+        aux_add_columns(conn, "async_delegations", AUX_LEASE_COLUMNS)
         return
     from hermes_state import apply_wal_with_fallback
 
@@ -313,15 +334,71 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
+        leased = _is_postgres(conn)
         conn.execute(
-            _DISPATCH_POSTGRES if _is_postgres(conn) else _DISPATCH_SQLITE,
+            _DISPATCH_POSTGRES if leased else _DISPATCH_SQLITE,
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload),
              record.get("origin_session_id", "")),
         )
+        if leased:
+            from hermes_aux_store import AUX_SERVER_EPOCH, aux_owner_instance
+
+            conn.execute(
+                f"""UPDATE async_delegations
+                    SET owner_instance=?, lease_expires_at={AUX_SERVER_EPOCH} + ?
+                    WHERE delegation_id=?""",
+                (aux_owner_instance(), float(LEASE_SECONDS), record["delegation_id"]),
+            )
+    if leased:
+        _start_lease_renewer()
     _prune_durable_records()
+
+
+def renew_delegation_leases() -> int:
+    """Renew this process's running delegations; 0 off PostgreSQL authority."""
+    from hermes_aux_store import (
+        AUX_SERVER_EPOCH,
+        aux_owner_instance,
+        aux_store_authority,
+    )
+
+    if not aux_store_authority():
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return 0
+        return conn.execute(
+            f"""UPDATE async_delegations SET lease_expires_at={AUX_SERVER_EPOCH} + ?
+                WHERE owner_instance=? AND state IN ('running','finalizing')""",
+            (float(LEASE_SECONDS), aux_owner_instance()),
+        ).rowcount
+
+
+def _start_lease_renewer() -> None:
+    global _lease_renewer
+    from hermes_aux_store import AuxLeaseRenewer
+
+    with _lease_renewer_guard:
+        if _lease_renewer is None:
+            _lease_renewer = AuxLeaseRenewer(
+                "async-delegation-lease",
+                renew_delegation_leases,
+                lambda: LEASE_RENEW_SECONDS,
+                logger,
+            )
+        renewer = _lease_renewer
+    renewer.start()
+
+
+def _stop_lease_renewer() -> None:
+    """Stop renewing (tests; a stopped owner's leases run out)."""
+    with _lease_renewer_guard:
+        renewer = _lease_renewer
+    if renewer is not None:
+        renewer.stop()
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
@@ -389,25 +466,47 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 
 def recover_abandoned_delegations() -> int:
-    """Classify records whose owning process disappeared as outcome unknown."""
+    """Classify records whose owning process disappeared as outcome unknown.
+
+    On PostgreSQL authority "disappeared" means another process's lease ran
+    out (levos 0063); no pid is probed.
+    """
+    return len(_recover_abandoned())
+
+
+def _recover_abandoned() -> List[Dict[str, Any]]:
+    """Close abandoned running records as unknown; return their events."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
-        return 0
+        return []
     now = time.time()
-    recovered = 0
+    recovered: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
+        leased = _is_postgres(conn)
+        orphaned = ""
+        if leased:
+            from hermes_aux_store import AUX_LEASE_EXPIRED, aux_owner_instance
+
+            me = aux_owner_instance()
+            # Re-checked inside the UPDATE: the owner may renew meanwhile.
+            orphaned = (
+                " AND state IN ('running','finalizing')"
+                f" AND owner_instance IS DISTINCT FROM ? AND {AUX_LEASE_EXPIRED}"
+            )
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id
                FROM async_delegations WHERE state IN ('running','finalizing')"""
+            + orphaned,
+            (me,) if leased else (),
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
              pid, started, task_json, origin_session_id) = row
             live = False
-            if pid:
+            if pid and not leased:
                 live = _pid_exists(int(pid))
                 if live and started is not None:
                     live = get_process_start_time(int(pid)) == int(started)
@@ -435,14 +534,83 @@ def recover_abandoned_delegations() -> int:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
-            conn.execute(
+            cursor = conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                   WHERE delegation_id=?""" + orphaned,
+                (now, now, json.dumps(event), json.dumps(result), delegation_id)
+                + ((me,) if leased else ()),
             )
-            recovered += 1
+            if cursor.rowcount or not leased:
+                recovered.append(event)
     return recovered
+
+
+def _seconds_until_recoverable() -> Optional[float]:
+    """Seconds until the earliest live lease another process holds on a
+    running delegation runs out; None when there is none or off PostgreSQL."""
+    from hermes_aux_store import (
+        AUX_SERVER_EPOCH,
+        aux_owner_instance,
+        aux_store_authority,
+    )
+
+    if not aux_store_authority():
+        return None
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return None
+        row = conn.execute(
+            f"""SELECT MIN(lease_expires_at) - {AUX_SERVER_EPOCH}
+                FROM async_delegations
+                WHERE state IN ('running','finalizing')
+                  AND owner_instance IS DISTINCT FROM ?
+                  AND lease_expires_at >= {AUX_SERVER_EPOCH}""",
+            (aux_owner_instance(),),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
+
+
+def _arm_deferred_recovery(target_queue, delay: Optional[float] = None) -> None:
+    """Recover the delegations still leased by another process once their
+    lease runs out, and enqueue those completions on *target_queue*.
+
+    Restore runs once per process start; without this pass a delegation whose
+    owner pod dies after this process started would stay "running" until the
+    next restart.
+    """
+    global _deferred_recovery
+    if delay is None:
+        delay = _seconds_until_recoverable()
+        if delay is None:
+            return
+    with _deferred_recovery_guard:
+        if _deferred_recovery is not None and _deferred_recovery.is_alive():
+            return
+        timer = threading.Timer(
+            delay + 1.0,
+            propagate_context_to_thread(_run_deferred_recovery),
+            args=(target_queue,),
+        )
+        timer.daemon = True
+        _deferred_recovery = timer
+    timer.start()
+
+
+def _run_deferred_recovery(target_queue) -> None:
+    global _deferred_recovery
+    with _deferred_recovery_guard:
+        _deferred_recovery = None
+    try:
+        for event in _recover_abandoned():
+            event["restored"] = True  # a previous owner's, like restored events
+            target_queue.put(event)
+        _arm_deferred_recovery(target_queue)
+    except Exception as exc:
+        logger.warning("Deferred async delegation recovery failed: %s", exc)
+        _arm_deferred_recovery(target_queue, LEASE_SECONDS)
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -465,6 +633,7 @@ def restore_undelivered_completions(target_queue) -> int:
     on anymore; the payload stays queryable on the dropped row.
     """
     recover_abandoned_delegations()
+    _arm_deferred_recovery(target_queue)
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
@@ -1657,3 +1826,8 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    _stop_lease_renewer()
+    with _deferred_recovery_guard:
+        timer = _deferred_recovery
+    if timer is not None:
+        timer.cancel()

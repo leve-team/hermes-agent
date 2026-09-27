@@ -253,6 +253,7 @@ def _delivery_script(monkeypatch) -> dict:
     out["rows_after_fail"] = _debug_rows()
     with monkeypatch.context() as ctx:  # the owning gateway is gone
         ctx.setattr(dl, "_owner_alive", lambda *_: False)
+        _owner_gone(ctx, dl, "delivery_obligations")
         out["claimed"] = [
             {k: v for k, v in row.items() if k != "content"}
             for row in dl.sweep_recoverable(deliverable_platforms={"telegram"})
@@ -268,6 +269,18 @@ def _delivery_script(monkeypatch) -> dict:
     dl._prune(now=10 ** 12)  # retention: delivered o1 goes, pending o2 stays
     out["rows_after_prune"] = _debug_rows()
     return out
+
+
+def _owner_gone(ctx, owner, table) -> None:
+    """On PostgreSQL the owner is a lease, not a pid (levos 0063): this
+    process goes on as another lease owner and the previous leases ran out."""
+    import hermes_aux_store
+
+    with owner._transaction() as conn:
+        if not owner._is_postgres(conn):
+            return
+        conn.execute(f"UPDATE {table} SET lease_expires_at = 0")
+    ctx.setattr(hermes_aux_store, "aux_owner_instance", lambda: "successor-process")
 
 
 def _debug_rows() -> list:
@@ -297,6 +310,7 @@ def _delegation_script(monkeypatch) -> dict:
         import gateway.status as status
 
         ctx.setattr(status, "_pid_exists", lambda _pid: False)
+        _owner_gone(ctx, ad, "async_delegations")
         out["recovered"] = ad.recover_abandoned_delegations()
     restored: "queue.Queue" = queue.Queue()
     out["restored"] = ad.restore_undelivered_completions(restored)
