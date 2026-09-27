@@ -13,6 +13,11 @@ shared by the CLI (``hermes journey delete|edit``), the TUI ``/journey`` overlay
 (gateway RPCs), and the desktop GUI (REST). Deleting a skill *archives* it
 (recoverable via ``hermes curator restore``); deleting a memory rewrites its
 file. Pure stdlib + existing skill/memory helpers.
+
+On PostgreSQL authority (levos 0065) a memory "file" is its
+``core_memory_files`` row and each edit/delete reads and rewrites it inside
+``memory_postgres_section``, so a concurrent write from another pod is never
+overwritten from a stale read.
 """
 
 from __future__ import annotations
@@ -68,10 +73,10 @@ def _locate_memory(source: str, gidx: int) -> tuple[Path, list[str], int]:
     Entries come from ``MemoryStore._read_file`` — the same parser the memory
     tool uses — so journey indices stay aligned with what the graph renders.
     """
-    from tools.memory_tool import MemoryStore
+    from tools.memory_tool import MemoryStore, memory_file_exists
 
     path = _memories_dir() / _MEMORY_FILES[source]
-    if not path.exists():
+    if not memory_file_exists(path):
         raise ValueError(f"{path.name} not found")
     chunks = MemoryStore._read_file(path)
     local = _memory_local_index(source, gidx)
@@ -143,10 +148,11 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
-    path, chunks, local = _locate_memory(source, gidx)
+    with _memory_section(source):
+        path, chunks, local = _locate_memory(source, gidx)
 
-    del chunks[local]
-    _write_memory(path, chunks)
+        del chunks[local]
+        _write_memory(path, chunks)
 
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
@@ -178,15 +184,23 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(source, gidx)
+    with _memory_section(source):
+        path, chunks, local = _locate_memory(source, gidx)
 
-    chunks[local] = body
-    _write_memory(path, chunks)
+        chunks[local] = body
+        _write_memory(path, chunks)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _memory_section(source: str):
+    """The cross-pod read→write section of *source*'s file (no-op off authority)."""
+    from tools.memory_tool import memory_postgres_section
+
+    return memory_postgres_section(_MEMORY_FILES[source])
 
 
 def _write_memory(path: Path, chunks: list[str]) -> None:

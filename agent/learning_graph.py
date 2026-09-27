@@ -195,16 +195,27 @@ def _memory_cards() -> list[dict[str, Any]]:
 
     ``MEMORY.md`` / ``USER.md`` are prose split on bare ``§`` separators; each
     chunk becomes one card. Every chunk is surfaced — the graph shows everything.
+    On PostgreSQL authority (levos 0065) the text is the ``core_memory_files``
+    row and its ``updated_at`` stands in for the file mtime.
     """
+    from tools.memory_tool import memory_store_on_postgres, read_memory_document
+
     base = get_hermes_home() / "memories"
+    on_postgres = memory_store_on_postgres()
     cards: list[dict[str, Any]] = []
     for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
         path = base / fname
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-            file_ts = _to_int_ts(path.stat().st_mtime)
-        except OSError:
-            continue
+        if on_postgres:
+            document = read_memory_document(fname)
+            if document is None:
+                continue
+            text, file_ts = document[0].strip(), _to_int_ts(document[1])
+        else:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                file_ts = _to_int_ts(path.stat().st_mtime)
+            except OSError:
+                continue
         for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
             if not chunk:
                 continue

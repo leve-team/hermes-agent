@@ -26,6 +26,7 @@ Design:
 import copy
 import json
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -76,6 +77,124 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+# PostgreSQL authority (levos 0065): two pods of one profile share nothing but
+# the profile's PostgreSQL store, so there MEMORY.md / USER.md are rows of
+# ``core_memory_files`` (one row per file, the same §-joined text, drift
+# snapshots as ``<name>.bak.<ts>`` rows) and the per-file flock becomes a
+# transaction advisory lock held for the whole reload→mutate→save section.
+# Nothing under memories/ is created there and nothing falls back to the
+# files: a PostgreSQL failure raises (reads report "could not be read").
+
+_MEMORY_LOCK_TIMEOUT_SECONDS = 30.0
+_memory_section_state = threading.local()
+
+
+def memory_store_on_postgres() -> bool:
+    """True when this profile's built-in memory lives in PostgreSQL."""
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
+def _on_postgres() -> bool:
+    """Backend of this thread's memory store, fixed per open section."""
+    if getattr(_memory_section_state, "conn", None) is not None:
+        return True
+    return memory_store_on_postgres()
+
+
+def _initialize_memory_table(conn) -> None:
+    from hermes_aux_store import aux_schema_transaction
+
+    with aux_schema_transaction(conn, "memory"):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS memory_files (
+                 name TEXT PRIMARY KEY,
+                 content TEXT NOT NULL,
+                 updated_at REAL NOT NULL
+               )"""
+        )
+
+
+def _open_memory_store():
+    from hermes_aux_store import open_aux_postgres
+
+    return open_aux_postgres("memory", initialize=_initialize_memory_table)
+
+
+@contextmanager
+def memory_postgres_section(name: str):
+    """Serialize one read→modify→write of memory file *name* across pods.
+
+    On PostgreSQL authority this is one transaction holding advisory lock
+    ``memory:<name>``; memory reads and writes of this thread go through it
+    and commit (or roll back) with it. On any other backend it does nothing
+    — the file store keeps its own locking.
+    """
+    from hermes_aux_store import aux_xact_lock
+
+    lock = f"memory:{name}"
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is not None:
+        aux_xact_lock(conn, lock, timeout_seconds=_MEMORY_LOCK_TIMEOUT_SECONDS)
+        yield
+        return
+    if not memory_store_on_postgres():
+        yield
+        return
+    conn = _open_memory_store()
+    try:
+        with conn:
+            aux_xact_lock(conn, lock, timeout_seconds=_MEMORY_LOCK_TIMEOUT_SECONDS)
+            _memory_section_state.conn = conn
+            try:
+                yield
+            finally:
+                _memory_section_state.conn = None
+    finally:
+        conn.close()
+
+
+def _pg_select_memory(conn, name: str) -> Optional[Tuple[str, float]]:
+    row = conn.execute(
+        "SELECT content, updated_at FROM memory_files WHERE name = ?", (name,)
+    ).fetchone()
+    return (row["content"], row["updated_at"]) if row else None
+
+
+def read_memory_document(name: str) -> Optional[Tuple[str, float]]:
+    """``(text, updated_at)`` of memory file *name* in PostgreSQL, or None if absent."""
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is not None:
+        return _pg_select_memory(conn, name)
+    conn = _open_memory_store()
+    try:
+        return _pg_select_memory(conn, name)
+    finally:
+        conn.close()
+
+
+def write_memory_document(name: str, content: str) -> None:
+    """Replace memory file *name*'s row; only inside ``memory_postgres_section``."""
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is None:
+        raise RuntimeError("memory files are written only inside memory_postgres_section()")
+    conn.execute(
+        """INSERT INTO memory_files (name, content, updated_at)
+           VALUES (?, ?, EXTRACT(EPOCH FROM clock_timestamp()))
+           ON CONFLICT (name) DO UPDATE SET content = excluded.content,
+             updated_at = excluded.updated_at""",
+        (name, content),
+    )
+
+
+def memory_file_exists(path: Path) -> bool:
+    """Whether memory file *path* exists in this profile's memory store."""
+    if _on_postgres():
+        return read_memory_document(path.name) is not None
+    return path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +361,8 @@ class MemoryStore:
         stable for the entire session (prefix-cache invariant holds).
         """
         mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
+        if not _on_postgres():
+            mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
@@ -305,8 +425,14 @@ class MemoryStore:
         """Acquire an exclusive file lock for read-modify-write safety.
 
         Uses a separate .lock file so the memory file itself can still be
-        atomically replaced via os.replace().
+        atomically replaced via os.replace(). On PostgreSQL authority the
+        lock is the cross-pod ``memory_postgres_section`` instead.
         """
+        if _on_postgres():
+            with memory_postgres_section(path.name):
+                yield
+            return
+
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -386,7 +512,8 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        if not _on_postgres():
+            get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
@@ -786,7 +913,19 @@ class MemoryStore:
 
         No file locking needed: _write_file uses atomic rename, so readers
         always see either the previous complete file or the new complete file.
+
+        On PostgreSQL authority the text is the ``core_memory_files`` row; a
+        PostgreSQL failure is ``read_ok=False`` (never a file read).
         """
+        if _on_postgres():
+            try:
+                document = read_memory_document(path.name)
+            except Exception as exc:
+                logger.warning(
+                    "Could not read %s from PostgreSQL: %s", path.name, type(exc).__name__
+                )
+                return "", False
+            return (document[0] if document else ""), True
         if not path.exists():
             return "", True
         try:
@@ -886,6 +1025,13 @@ class MemoryStore:
         # the caller can refuse the mutation.
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        if _on_postgres():
+            # The snapshot is a row next to the document, in the same section.
+            try:
+                write_memory_document(bak_path.name, raw)
+            except Exception:
+                return f"core_memory_files/{bak_path.name} (BACKUP FAILED — row unchanged)"
+            return f"core_memory_files/{bak_path.name}"
         try:
             bak_path.write_text(raw, encoding="utf-8")
         except (OSError, IOError):
@@ -900,8 +1046,13 @@ class MemoryStore:
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one.
+        On PostgreSQL authority the text replaces the ``core_memory_files``
+        row inside the open ``memory_postgres_section``.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        if _on_postgres():
+            write_memory_document(path.name, content)
+            return
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
         except (OSError, IOError) as e:

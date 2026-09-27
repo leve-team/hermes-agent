@@ -109,6 +109,9 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     "tui_turn_markers": (
         AuxTable("tui_turn_markers", "core_tui_turn_markers", ("home", "session_key")),
     ),
+    # levos 0065: the memory tool's MEMORY.md / USER.md (no SQLite form either;
+    # one row per file name, drift snapshots as ``<name>.bak.<ts>`` rows).
+    "memory": (AuxTable("memory_files", "core_memory_files", ("name",)),),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {
@@ -849,6 +852,109 @@ def _migrate_cron_jobs(path: Path, *, dry_run: bool) -> Dict[str, Any]:
     return {"status": "dry_run" if dry_run else "migrated", "tables": {"jobs": table}}
 
 
+def migrate_memory_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
+    """Copy the active authority profile's ``memories/`` files into PostgreSQL (levos 0065).
+
+    ``MEMORY.md`` and ``USER.md`` merge by entry inside the memory tool's own
+    cross-pod section: a file PostgreSQL lacks is copied verbatim, otherwise
+    the stored entries stay first and in place and each file entry the row
+    lacks is appended — so running twice appends nothing and a memory a pod
+    wrote before the move survives it. Drift snapshots (``*.bak.<ts>``) are
+    copied only when their row is absent. Sources are only read and are
+    sha256-checked, each file is one PostgreSQL transaction, a source entry
+    missing afterwards rolls that file back (:class:`AuxMigrationError`) and
+    ``dry_run`` rolls back. The char limits are not applied: an over-limit
+    result is left for the agent to consolidate, as an over-limit file is.
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_state_postgres import _is_active_profile
+
+    if not _is_active_profile(profile):
+        raise ValueError(
+            "migrate_memory_to_pg runs in the profile's own environment "
+            f"(HERMES_PROFILE / HERMES_HOME); {profile!r} is not the active profile"
+        )
+    if not aux_store_authority():
+        raise RuntimeError(
+            f"profile {profile!r} is not on PostgreSQL authority; nothing to migrate to"
+        )
+    memories = get_hermes_home() / "memories"
+    sources = [memories / "MEMORY.md", memories / "USER.md"]
+    if memories.is_dir():
+        sources += sorted(p for p in memories.glob("*.md.bak.*") if p.is_file())
+    report: Dict[str, Any] = {"profile": profile, "dry_run": dry_run, "stores": {}}
+    for path in sources:
+        if not path.is_file():
+            report["stores"][path.name] = {"status": "missing", "path": str(path)}
+            continue
+        before = _sha256(path)
+        result = _migrate_memory_file(path, dry_run=dry_run)
+        if _sha256(path) != before:  # pragma: no cover - the file is only read
+            raise AuxMigrationError(
+                f"{path.name}: source file changed during migration"
+            )
+        result.update(path=str(path), sha256=before)
+        report["stores"][path.name] = result
+    return report
+
+
+def _migrate_memory_file(path: Path, *, dry_run: bool) -> Dict[str, Any]:
+    from tools.memory_tool import (
+        ENTRY_DELIMITER,
+        MemoryStore,
+        memory_postgres_section,
+        read_memory_document,
+        write_memory_document,
+    )
+
+    try:
+        raw = path.read_bytes().decode("utf-8-sig")  # as the memory tool reads it
+    except UnicodeDecodeError as exc:
+        raise AuxMigrationError(
+            f"memory: {path.name} is not valid UTF-8: {exc}"
+        ) from exc
+    snapshot = ".bak." in path.name
+    source = list(dict.fromkeys(MemoryStore._parse_entries(raw)))
+    table: Dict[str, Any] = {}
+    try:
+        with memory_postgres_section(path.name):
+            stored = read_memory_document(path.name)
+            held = MemoryStore._parse_entries(stored[0]) if stored else []
+            present = set(held)
+            added = [entry for entry in source if entry not in present]
+            if stored is None:
+                content = raw
+            elif snapshot or not added:
+                content, added = stored[0], []
+            else:
+                kept = [stored[0].strip()] if stored[0].strip() else []
+                content = ENTRY_DELIMITER.join(kept + added)
+            if stored is None or content != stored[0]:
+                write_memory_document(path.name, content)
+            after = read_memory_document(path.name)
+            after_entries = MemoryStore._parse_entries(after[0]) if after else []
+            missing = len(set(source) - set(after_entries))
+            if after is None or (missing and not snapshot):
+                raise AuxMigrationError(
+                    f"{path.name}: {missing} of {len(source)} source entries are not in "
+                    "PostgreSQL after the copy; rolled back"
+                )
+            table = {
+                "source_entries": len(source),
+                "target_entries_before": None if stored is None else len(held),
+                "target_entries_after": len(after_entries),
+                "inserted": len(source) if stored is None else len(added),
+            }
+            if dry_run:
+                raise _DryRun
+    except _DryRun:
+        pass
+    return {
+        "status": "dry_run" if dry_run else "migrated",
+        "tables": {"memory_files": table},
+    }
+
+
 def _store_initializer(store: str) -> Callable[[Any], None]:
     if store == "cron_executions":
         from cron.executions import _initialize_schema
@@ -1003,8 +1109,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="move the cron stores (executions, notepad, jobs.json) instead (levos 0060)",
     )
+    parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="move the memory files (memories/MEMORY.md, USER.md) instead (levos 0065)",
+    )
     args = parser.parse_args(argv)
     migrate = migrate_cron_to_pg if args.cron else migrate_aux_sqlite_to_pg
+    if args.memory:
+        migrate = migrate_memory_to_pg
     report = migrate(args.profile, dry_run=args.dry_run)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
