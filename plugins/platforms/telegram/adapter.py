@@ -3504,11 +3504,16 @@ class TelegramAdapter(BasePlatformAdapter):
             # Without this, each retry starts a new getUpdates session
             # that immediately gets 409'd by the previous one, creating
             # the very conflict we are trying to recover from (#75017).
+            #
+            # Under a PostgreSQL platform lock (levos 0061) no other gateway of
+            # this profile polls, so the competitor is the previous holder's
+            # expiring long-poll (PTB's getUpdates timeout is 10s, below every
+            # RETRY_DELAY) — dropping would only delete the queued messages.
             self._polling_conflict_recovery_generation = expected_generation
             try:
                 await self._start_polling_once(
                     app,
-                    drop_pending_updates=True,
+                    drop_pending_updates=not self._platform_lock_fences_pods,
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info(
@@ -4677,7 +4682,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # server-side getUpdates queue, so this flag is a no-op
                     # in practice. Mirror the polling path's reconnect
                     # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_on_connect(is_reconnect),
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -4734,7 +4739,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_on_connect(is_reconnect),
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
@@ -4957,6 +4962,15 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return False
 
+    def _drop_pending_on_connect(self, is_reconnect: bool) -> bool:
+        """Whether this connect discards the Bot API's queued updates.
+
+        A cold boot drops a stale queue — except under a PostgreSQL platform
+        lock (levos 0061), where a cold boot is the next pod taking over and
+        the queue holds the messages sent during the handoff.
+        """
+        return not is_reconnect and not self._platform_lock_fences_pods
+
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         # Mark disconnected first so the drop guard short-circuits any flush
@@ -4971,8 +4985,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Release the bot-token lock immediately so a wedged close cannot block
         # the reconnect watcher from acquiring it (#80598). The rest of teardown
-        # is best-effort against a half-dead transport.
-        self._release_platform_lock()
+        # is best-effort against a half-dead transport. A PostgreSQL lock
+        # (levos 0061) fences other pods, so it is released only after polling
+        # stopped below; this process's own reconnect re-enters it meanwhile.
+        if not self._platform_lock_fences_pods:
+            self._release_platform_lock()
 
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the
@@ -5108,6 +5125,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._app = None
         self._bot = None
+        self._release_platform_lock()
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:

@@ -332,6 +332,28 @@ class AuxSessionLock:
         finally:
             conn.close()
 
+    def held(self) -> bool:
+        """True while the session that took the lock still holds it (levos 0061).
+
+        Asks ``pg_locks`` for *this backend's* grant rather than only pinging:
+        the connection adapter reconnects transparently after a drop, and a
+        replacement session answers queries but holds nothing. Any failure
+        answers False — a holder that cannot prove the lock must not act on it.
+        """
+        if self._conn is None or self._key is None:
+            return False
+        unsigned = self._key & 0xFFFFFFFFFFFFFFFF
+        try:
+            row = self._conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'"
+                " AND granted AND pid = pg_backend_pid() AND objsubid = 1"
+                " AND classid::bigint = ? AND objid::bigint = ?)",
+                (unsigned >> 32, unsigned & 0xFFFFFFFF),
+            ).fetchone()
+        except Exception:
+            return False
+        return bool(row and row[0])
+
 
 @contextlib.contextmanager
 def aux_session_lock(

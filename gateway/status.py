@@ -1656,7 +1656,11 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
     Used to prevent multiple local gateways from using the same external identity
     at once (e.g. the same Telegram bot token across different HERMES_HOME dirs).
+    On a PostgreSQL-authority profile the lock is the profile's advisory lock
+    instead (:func:`acquire_postgres_scoped_lock`) and no lock file is written.
     """
+    if scoped_lock_uses_postgres():
+        return acquire_postgres_scoped_lock(scope, identity)
     lock_path = _get_scope_lock_path(scope, identity)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -1806,6 +1810,9 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
 def release_scoped_lock(scope: str, identity: str) -> None:
     """Release a previously-acquired scope lock when owned by this process."""
+    if (scope, _scope_hash(identity)) in _POSTGRES_SCOPED_LOCKS or scoped_lock_uses_postgres():
+        release_postgres_scoped_lock(scope, identity)
+        return
     lock_path = _get_scope_lock_path(scope, identity)
     existing = _read_json_file(lock_path)
     if not existing:
@@ -1865,6 +1872,117 @@ def release_all_scoped_locks(
             except OSError:
                 pass
     return removed
+
+
+# ── PostgreSQL-authority scoped locks (levos 0061) ────────────────────
+# Two pods of one profile share nothing but the profile's PostgreSQL store, so
+# a lock file (and a PID only meaningful in its own namespace) cannot keep
+# them from opening the same bot token at once. On authority the scoped lock
+# is a session advisory lock keyed by the profile schema plus scope and
+# credential hash. The server releases it when the holder's connection ends,
+# so a killed pod never wedges it. Within one process the lock is re-entrant
+# per owner, like the file lock's same-PID reacquire: a reconnecting adapter
+# can take it while the previous adapter object is still tearing down, and
+# the lock is unlocked only when its last owner releases it.
+
+
+@dataclass
+class _PostgresScopedLock:
+    lock: Any
+    owners: set[int]
+
+
+_POSTGRES_SCOPED_LOCKS: dict[tuple[str, str], _PostgresScopedLock] = {}
+_POSTGRES_SCOPED_LOCKS_GUARD = threading.Lock()
+
+
+def scoped_lock_uses_postgres() -> bool:
+    """True when scoped locks live in the profile's PostgreSQL authority store."""
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
+def _postgres_scoped_lock_name(scope: str, identity: str) -> str:
+    return f"gateway-scope:{scope}:{_scope_hash(identity)}"
+
+
+def _owner_token(owner: Any) -> int:
+    return 0 if owner is None else id(owner)
+
+
+def acquire_postgres_scoped_lock(
+    scope: str, identity: str, *, owner: Any = None
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Take the profile's advisory lock for *scope* + *identity* without waiting.
+
+    Returns ``(False, record)`` while another session (another pod) holds it.
+    A PostgreSQL failure raises ``hermes_aux_store.AuxStoreUnavailable``;
+    nothing falls back to a lock file.
+    """
+    from hermes_aux_store import AuxSessionLock
+
+    key = (scope, _scope_hash(identity))
+    with _POSTGRES_SCOPED_LOCKS_GUARD:
+        held = _POSTGRES_SCOPED_LOCKS.get(key)
+        if held is not None:
+            held.owners.add(_owner_token(owner))
+            return True, None
+        lock = AuxSessionLock(_postgres_scoped_lock_name(scope, identity))
+        if not lock.acquire():
+            return False, {
+                "scope": scope,
+                "identity_hash": key[1],
+                "backend": "postgres",
+            }
+        _POSTGRES_SCOPED_LOCKS[key] = _PostgresScopedLock(lock, {_owner_token(owner)})
+    return True, None
+
+
+def release_postgres_scoped_lock(scope: str, identity: str, *, owner: Any = None) -> None:
+    """Drop *owner*'s claim; the last owner's release unlocks the advisory lock."""
+    key = (scope, _scope_hash(identity))
+    with _POSTGRES_SCOPED_LOCKS_GUARD:
+        held = _POSTGRES_SCOPED_LOCKS.get(key)
+        if held is None:
+            return
+        held.owners.discard(_owner_token(owner))
+        if held.owners:
+            return
+        del _POSTGRES_SCOPED_LOCKS[key]
+    held.lock.release()
+
+
+def ensure_postgres_scoped_lock(scope: str, identity: str) -> bool:
+    """True while this process still holds the advisory lock for *scope* + *identity*.
+
+    A dropped session loses the lock silently (the server frees it), so a
+    lost lock is taken again at once when nobody else took it meanwhile.
+    False means another session holds it now, PostgreSQL cannot be reached,
+    or this process never held it — the caller must stop using the credential.
+    """
+    from hermes_aux_store import AuxSessionLock, AuxStoreUnavailable
+
+    key = (scope, _scope_hash(identity))
+    with _POSTGRES_SCOPED_LOCKS_GUARD:
+        held = _POSTGRES_SCOPED_LOCKS.get(key)
+        if held is None:
+            return False
+        if held.lock.held():
+            return True
+        held.lock.release()
+        lock = AuxSessionLock(_postgres_scoped_lock_name(scope, identity))
+        try:
+            reacquired = lock.acquire()
+        except AuxStoreUnavailable:
+            reacquired = False
+        if reacquired:
+            held.lock = lock
+            logger.warning(
+                "Scoped lock %s: PostgreSQL session was lost and the lock was taken again",
+                scope,
+            )
+        return reacquired
 
 
 # ── --replace takeover marker ─────────────────────────────────────────
