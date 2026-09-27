@@ -3,10 +3,16 @@
 The ledger records what is known about each attempt; it is not a retry queue.
 Interrupted attempts become ``unknown`` only after their exact owner process is
 proved gone. Terminal states are immutable.
+
+On a PostgreSQL authority profile (levos 0060) the ledger is the profile's
+``core_cron_executions`` table and the owner of another pod cannot be probed by
+pid, so "proved gone" means its lease ran out: the owning process renews
+``lease_expires_at`` on its open attempts while it lives.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -24,22 +30,64 @@ EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
+# Owner id of the attempts this process creates (``process_id`` column).
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
+
+# PostgreSQL authority lease (levos 0060). ``lease_expires_at`` is an epoch
+# second on the PostgreSQL server clock, so clock skew between pods does not
+# matter. A live owner renews every LEASE_RENEW_SECONDS; another process may
+# mark an attempt unknown once its lease is LEASE_SECONDS stale (four missed
+# renewals), which is also how long a killed pod's attempts stay "running".
+LEASE_SECONDS = 120.0
+LEASE_RENEW_SECONDS = 30.0
+_SERVER_EPOCH = "EXTRACT(EPOCH FROM clock_timestamp())::float8"
+_LEASE_EXPIRED = (
+    f" AND (lease_expires_at IS NULL OR lease_expires_at < {_SERVER_EPOCH})"
+)
+_lease_stop = threading.Event()
+_lease_thread: Optional[threading.Thread] = None
+_lease_guard = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
+    """Open the ledger on the backend the profile selects (levos 0060).
+
+    PostgreSQL authority: table ``core_cron_executions`` in the profile's
+    store, no file; a failure raises ``AuxStoreUnavailable``. Otherwise the
+    SQLite file, opened and initialized exactly as before.
+    """
+    from hermes_aux_store import open_aux_store
+
     path = EXECUTIONS_FILE or aux_db_path("cron/executions.db").resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(path, timeout=5)
+    return open_aux_store(
+        "cron_executions",
+        sqlite_path=path,
+        initialize=_initialize_schema,
+        sqlite_options={"timeout": 5},
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "is_postgres", False):
+        from hermes_aux_store import aux_schema_transaction
+
+        with aux_schema_transaction(conn, "cron_executions"):
+            _create_schema(conn)
+            conn.execute(
+                "ALTER TABLE executions ADD COLUMN IF NOT EXISTS lease_expires_at REAL"
+            )
+        return
     from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     apply_wal_with_fallback(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
+    _create_schema(conn)
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -74,13 +122,12 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     the transaction; it does not close the connection. Relying on that alone
     leaks a connection (and its WAL/SHM file descriptors) on every call,
     since closing then depends on the garbage collector. Schema init runs
-    inside the ``try`` too, so a PRAGMA/DDL failure after a successful
-    ``connect()`` still closes the connection instead of leaking it.
+    inside ``_connect`` (``open_aux_store``), which closes the connection
+    itself when a PRAGMA/DDL step fails after a successful ``connect()``.
     """
     with _lock:
         conn = _connect()
         try:
-            _initialize_schema(conn)
             with conn:
                 yield conn
         finally:
@@ -126,14 +173,72 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    # "No limit" is LIMIT -1 on SQLite and LIMIT ALL on PostgreSQL.
+    unbounded = "ALL" if getattr(conn, "is_postgres", False) else "-1"
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
+        f"""DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
-             ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
+             ORDER BY claimed_at DESC, id DESC LIMIT {unbounded} OFFSET ?
            )""",
         (limit,),
     )
+
+
+def _extend_leases(conn, execution_id: Optional[str] = None) -> int:
+    """Push the lease of this process's open attempts LEASE_SECONDS ahead."""
+    sql = (
+        f"UPDATE executions SET lease_expires_at = {_SERVER_EPOCH} + ? "
+        "WHERE process_id=? AND status IN ('claimed','running')"
+    )
+    params: List[Any] = [float(LEASE_SECONDS), _PROCESS_ID]
+    if execution_id is not None:
+        sql += " AND id=?"
+        params.append(execution_id)
+    return conn.execute(sql, params).rowcount
+
+
+def renew_execution_leases() -> int:
+    """Renew every open attempt this process owns; 0 off PostgreSQL authority."""
+    from hermes_aux_store import aux_store_authority
+
+    if not aux_store_authority():
+        return 0
+    with _transaction() as conn:
+        return _extend_leases(conn)
+
+
+def _renew_leases_until_stopped() -> None:
+    while not _lease_stop.wait(LEASE_RENEW_SECONDS):
+        try:
+            renew_execution_leases()
+        except Exception as exc:
+            # Keep trying: a lease that runs out while PostgreSQL is away lets
+            # another pod mark the attempt unknown, never run it twice.
+            logger.warning("Cron execution lease renewal failed: %s", exc)
+
+
+def _start_lease_renewer() -> None:
+    global _lease_thread
+    with _lease_guard:
+        if _lease_thread is not None and _lease_thread.is_alive():
+            return
+        _lease_stop.clear()
+        _lease_thread = threading.Thread(
+            target=_renew_leases_until_stopped,
+            name="cron-execution-lease",
+            daemon=True,
+        )
+        _lease_thread.start()
+
+
+def _stop_lease_renewer() -> None:
+    """Stop the renewal thread (tests; a stopped owner's leases run out)."""
+    with _lease_guard:
+        thread = _lease_thread
+        _lease_stop.set()
+    if thread is not None:
+        thread.join(timeout=10)
 
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
@@ -150,9 +255,14 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
              _process_start_time(pid), now),
         )
+        leased = getattr(conn, "is_postgres", False)
+        if leased:
+            _extend_leases(conn, execution_id)
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
+    if leased:
+        _start_lease_renewer()
     record = _record(row)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
@@ -201,27 +311,47 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark provably abandoned attempts unknown without scheduling retries.
+
+    PostgreSQL authority: abandoned means another process's lease ran out
+    (its owner may live in another pod, where no pid or /proc can see it).
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
-        rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
-               WHERE status IN ('claimed','running')"""
-        ).fetchall()
+        leased = getattr(conn, "is_postgres", False)
+        if leased:
+            rows = conn.execute(
+                """SELECT id FROM executions
+                   WHERE status IN ('claimed','running') AND process_id<>?"""
+                + _LEASE_EXPIRED,
+                (_PROCESS_ID,),
+            ).fetchall()
+            error = (
+                "This execution's owner stopped renewing its lease before a durable "
+                "terminal state; whether side effects ran is unknown."
+            )
+        else:
+            rows = conn.execute(
+                """SELECT id, process_id, pid, process_started_at FROM executions
+                   WHERE status IN ('claimed','running')"""
+            ).fetchall()
+            error = (
+                "Scheduler restarted after this execution's owner exited before a durable "
+                "terminal state; whether side effects ran is unknown."
+            )
         for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                continue
+            if not leased:
+                if row["process_id"] == _PROCESS_ID:
+                    continue
+                if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+                    continue
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
-                   WHERE id=? AND status IN ('claimed','running')""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
-                 row["id"]),
+                   WHERE id=? AND status IN ('claimed','running')"""
+                + (_LEASE_EXPIRED if leased else ""),
+                (now, error, row["id"]),
             )
             changed += cur.rowcount
             if cur.rowcount:

@@ -1,7 +1,8 @@
 """
 Cron job storage and management.
 
-Jobs are stored in ~/.hermes/cron/jobs.json
+Jobs are stored in ~/.hermes/cron/jobs.json (on a PostgreSQL authority
+profile: table ``core_cron_jobs`` in the profile's store, levos 0060)
 Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
@@ -269,6 +270,123 @@ def _jobs_lock_file() -> Path:
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+# PostgreSQL authority (levos 0060): the jobs live one row per job in the
+# profile's store (``core_cron_jobs``) and both cross-process locks are
+# PostgreSQL advisory locks. The files and flocks below fence one filesystem
+# only, and two pods of one profile share nothing but that store. Nothing
+# here falls back to a file: a PostgreSQL failure raises.
+
+
+def _cron_pg_authority() -> bool:
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
+def _jobs_store_is_pg() -> bool:
+    """Backend of this thread's jobs store, fixed per ``_jobs_lock()`` section."""
+    if getattr(_jobs_lock_state, "depth", 0):
+        return getattr(_jobs_lock_state, "pg", None) is not None
+    return _cron_pg_authority()
+
+
+def _initialize_jobs_table(conn) -> None:
+    from hermes_aux_store import aux_schema_transaction
+
+    with aux_schema_transaction(conn, "cron_jobs"):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS cron_jobs (
+                 id TEXT PRIMARY KEY,
+                 position INTEGER NOT NULL,
+                 job TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+               )"""
+        )
+
+
+def _open_jobs_store():
+    from hermes_aux_store import open_aux_postgres
+
+    return open_aux_postgres("cron_jobs", initialize=_initialize_jobs_table)
+
+
+@contextlib.contextmanager
+def _pg_jobs_transaction():
+    """PostgreSQL form of the jobs lock: one transaction that holds
+    ``pg_advisory_xact_lock`` for the whole load→modify→save section, so the
+    section commits or rolls back as a unit and the lock ends with it. A wait
+    beyond ``_JOBS_LOCK_TIMEOUT_SECONDS`` raises instead of degrading to an
+    in-process lock: a torn cross-pod write is not an option here."""
+    from hermes_aux_store import aux_xact_lock
+
+    conn = _open_jobs_store()
+    try:
+        with conn:
+            aux_xact_lock(conn, "cron-jobs", timeout_seconds=_JOBS_LOCK_TIMEOUT_SECONDS)
+            yield conn
+    finally:
+        conn.close()
+
+
+def _pg_read_jobs(conn) -> List[Dict[str, Any]]:
+    jobs = []
+    for row in conn.execute(
+        "SELECT id, job FROM cron_jobs ORDER BY position, id"
+    ).fetchall():
+        try:
+            jobs.append(json.loads(row["job"]))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Cron database corrupted: job {row['id']!r} is not valid JSON: {e}"
+            ) from e
+    return jobs
+
+
+def _pg_load_jobs() -> List[Dict[str, Any]]:
+    conn = getattr(_jobs_lock_state, "pg", None)
+    if conn is not None:
+        return _pg_read_jobs(conn)
+    conn = _open_jobs_store()
+    try:
+        return _pg_read_jobs(conn)
+    finally:
+        conn.close()
+
+
+def _pg_write_jobs(jobs: List[Dict[str, Any]]) -> None:
+    """Make the stored rows equal *jobs*, in order; unchanged rows keep their
+    ``updated_at``. Runs inside the section's transaction."""
+    conn = getattr(_jobs_lock_state, "pg", None)
+    if conn is None:
+        raise RuntimeError("cron jobs are written only inside _jobs_lock()")
+    documents: Dict[str, Tuple[int, str]] = {}
+    for position, job in enumerate(jobs):
+        job_id = job.get("id") if isinstance(job, dict) else None
+        if not job_id:
+            raise ValueError("a cron job without an id cannot be stored")
+        job_id = str(job_id)
+        if job_id in documents:
+            raise ValueError(f"duplicate cron job id {job_id!r}")
+        documents[job_id] = (position, json.dumps(job, ensure_ascii=False))
+    stored = {
+        row["id"]: (row["position"], row["job"])
+        for row in conn.execute("SELECT id, position, job FROM cron_jobs").fetchall()
+    }
+    for job_id in stored.keys() - documents.keys():
+        conn.execute("DELETE FROM cron_jobs WHERE id = ?", (job_id,))
+    now = _hermes_now().isoformat()
+    for job_id, (position, document) in documents.items():
+        if stored.get(job_id) == (position, document):
+            continue
+        conn.execute(
+            """INSERT INTO cron_jobs (id, position, job, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (id) DO UPDATE SET position = excluded.position,
+                 job = excluded.job, updated_at = excluded.updated_at""",
+            (job_id, position, document, now),
+        )
+
+
 @contextlib.contextmanager
 def _jobs_lock():
     """Serialize a load_jobs→modify→save_jobs critical section.
@@ -306,6 +424,16 @@ def _jobs_lock():
         # section read it. Reset on entry/exit so stale stamps from unlocked
         # loads or prior sections can never suppress a needed merge.
         _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.pg = None
+        if _cron_pg_authority():
+            try:
+                with _pg_jobs_transaction() as conn:
+                    _jobs_lock_state.pg = conn
+                    yield
+            finally:
+                _jobs_lock_state.pg = None
+                _jobs_lock_state.depth = 0
+            return
         lock_fd = None
         try:
             try:
@@ -381,6 +509,13 @@ def _fire_job_lock(job_id: str):
     Unlike the global jobs lock, this lock may be held across network delivery.
     It is scoped to one profile + job, so unrelated cron jobs keep progressing.
     Fencing fails closed when cross-process locking is unavailable.
+
+    On PostgreSQL authority the cross-process half is a session advisory lock
+    (key: profile schema + job id) on a connection dedicated to this block, so
+    it fences every pod of the profile for the whole network send. The server
+    drops it when that connection or process dies, the way the kernel drops a
+    dead holder's flock; timing out still yields False, and a PostgreSQL
+    failure raises.
     """
     cron_dir = _current_cron_store().cron_dir
     lock_key = f"{cron_dir.resolve()}::{job_id}"
@@ -388,6 +523,19 @@ def _fire_job_lock(job_id: str):
         local_lock = _fire_fence_locks.setdefault(lock_key, threading.RLock())
 
     with local_lock:
+        if _cron_pg_authority():
+            from hermes_aux_store import aux_session_lock
+
+            with aux_session_lock(
+                f"cron-fire:{job_id}", wait_seconds=_JOBS_LOCK_TIMEOUT_SECONDS
+            ) as acquired:
+                if not acquired:
+                    logger.error(
+                        "Timed out waiting for fire fence of job %s; failing closed",
+                        job_id,
+                    )
+                yield acquired
+            return
         ensure_dirs()
         lock_name = uuid.uuid5(uuid.NAMESPACE_URL, lock_key).hex
         lock_path = cron_dir / f".fire-{lock_name}.lock"
@@ -1288,6 +1436,8 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
+    if _jobs_store_is_pg():
+        return _pg_load_jobs()
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Stamp BEFORE reading (fail-safe direction — see _record_load_stamp):
@@ -1343,6 +1493,8 @@ def _peek_jobs_unlocked() -> Optional[List[Dict[str, Any]]]:
     re-entrancy-safe (a repairing read here would recurse through
     ``_save_jobs_unlocked``).
     """
+    if _jobs_store_is_pg():
+        return _pg_load_jobs()
     jobs_file = _current_cron_store().jobs_file
     if not jobs_file.exists():
         return []
@@ -1469,6 +1621,13 @@ def _save_jobs_unlocked(
     ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
     that mean to rewrite the store wholesale).
     """
+    if _jobs_store_is_pg():
+        # Same stale-writer guard as the file store; there is no load stamp,
+        # so the stored rows are always re-read inside the transaction.
+        if not replace:
+            jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+        _pg_write_jobs(jobs)
+        return
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged

@@ -1469,6 +1469,73 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _acquire_tick_file_lock():
+    """Take the tick file lock of a non-authority profile.
+
+    Returns the locked file, or None when another ticker holds it.
+    """
+    lock_dir, lock_file = _get_lock_paths()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows.
+    # Only genuine lock contention (another ticker holds the lock) skips the
+    # tick silently.  A real OSError — most importantly EMFILE/ENFILE from fd
+    # exhaustion — must NOT be swallowed as "another instance holds the
+    # lock": that previously made the scheduler appear healthy (tick returned
+    # 0, heartbeat recorded success) while no job ever ran again (#87644).
+    lock_fd = None
+    try:
+        lock_fd = open(lock_file, "w", encoding="utf-8")
+        if fcntl:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as exc:
+        if lock_fd is not None and _is_lock_contention_errno(exc):
+            logger.debug("Tick skipped — another instance holds the lock")
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+            return None
+        # Real failure: log loudly, attempt fd reclamation, and let the
+        # caller (ticker loop) see a FAILED tick so liveness degrades
+        # instead of reporting healthy-while-stalled.
+        if lock_fd is not None:
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+        if _is_fd_exhaustion(exc):
+            # Reclamation is owned by the ticker loop's except handler
+            # (scheduler_provider.py) — it classifies the raised error and
+            # runs _reclaim_fds_best_effort exactly once per failed tick.
+            # Calling it here too would double the gc.collect() pause.
+            logger.error(
+                "Cron tick could not acquire tick lock: %s — scheduler will "
+                "attempt fd reclamation and retry with backoff",
+                exc,
+            )
+        else:
+            logger.error("Cron tick could not acquire tick lock: %s", exc)
+        raise
+    return lock_fd
+
+
+def _release_tick_file_lock(lock_fd) -> None:
+    if fcntl:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except (OSError, IOError):
+            pass
+    elif msvcrt:
+        try:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except (OSError, IOError):
+            pass
+    lock_fd.close()
+
+
 # Errnos that mean "another ticker (or manual tick) holds the tick lock",
 # as opposed to a real failure opening/locking the file.  Everything else —
 # most importantly EMFILE/ENFILE (fd exhaustion, #87644) and EACCES on
@@ -6978,7 +7045,9 @@ def tick(
     Check and run all due jobs.
     
     Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
+    in-process ticker and a standalone daemon or manual tick overlap. On a
+    PostgreSQL authority profile the lock is a PostgreSQL session advisory
+    lock instead, which also holds across overlapping pods (levos 0060).
     
     Args:
         verbose: Whether to print status messages
@@ -6990,51 +7059,24 @@ def tick(
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    lock_dir, lock_file = _get_lock_paths()
-    lock_dir.mkdir(parents=True, exist_ok=True)
+    # PostgreSQL authority (levos 0060): a session advisory lock keyed on the
+    # profile schema + "cron-tick" replaces the file lock, so overlapping pods
+    # of one profile tick one at a time. Not getting it takes the same
+    # contention path as a held flock (quietly 0); a PostgreSQL failure
+    # raises like a real lock-file failure does.
+    from hermes_aux_store import AuxSessionLock, aux_store_authority
 
-    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows.
-    # Only genuine lock contention (another ticker holds the lock) skips the
-    # tick silently.  A real OSError — most importantly EMFILE/ENFILE from fd
-    # exhaustion — must NOT be swallowed as "another instance holds the
-    # lock": that previously made the scheduler appear healthy (tick returned
-    # 0, heartbeat recorded success) while no job ever ran again (#87644).
+    tick_lock = None
     lock_fd = None
-    try:
-        lock_fd = open(lock_file, "w", encoding="utf-8")
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-    except OSError as exc:
-        if lock_fd is not None and _is_lock_contention_errno(exc):
-            logger.debug("Tick skipped — another instance holds the lock")
-            try:
-                lock_fd.close()
-            except OSError:
-                pass
+    if aux_store_authority():
+        tick_lock = AuxSessionLock("cron-tick")
+        if not tick_lock.acquire():
+            logger.debug("Tick skipped — another process holds the PostgreSQL tick lock")
             return 0
-        # Real failure: log loudly, attempt fd reclamation, and let the
-        # caller (ticker loop) see a FAILED tick so liveness degrades
-        # instead of reporting healthy-while-stalled.
-        if lock_fd is not None:
-            try:
-                lock_fd.close()
-            except OSError:
-                pass
-        if _is_fd_exhaustion(exc):
-            # Reclamation is owned by the ticker loop's except handler
-            # (scheduler_provider.py) — it classifies the raised error and
-            # runs _reclaim_fds_best_effort exactly once per failed tick.
-            # Calling it here too would double the gc.collect() pause.
-            logger.error(
-                "Cron tick could not acquire tick lock: %s — scheduler will "
-                "attempt fd reclamation and retry with backoff",
-                exc,
-            )
-        else:
-            logger.error("Cron tick could not acquire tick lock: %s", exc)
-        raise
+    else:
+        lock_fd = _acquire_tick_file_lock()
+        if lock_fd is None:
+            return 0
 
     try:
         # Global emergency stop (`hermes pause`): skip dispatch entirely while
@@ -7397,17 +7439,10 @@ def tick(
 
         return sum(_results)
     finally:
-        if fcntl:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
-                pass
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
+        if tick_lock is not None:
+            tick_lock.release()
+        else:
+            _release_tick_file_lock(lock_fd)
 
 
 if __name__ == "__main__":

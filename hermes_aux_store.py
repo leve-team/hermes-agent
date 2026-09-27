@@ -23,16 +23,23 @@ the active ``config.yaml``):
 ``projects.db`` is not renamed here: it keeps the 0054 table contract and its
 own adapter (``hermes_cli.projects_postgres``), selected by the same predicate
 (:func:`aux_store_authority`).
+
+levos 0060 adds the cron stores (``cron_executions``, ``cron_notepad`` and
+``cron_jobs``, which has no SQLite form) and the advisory locks that replace
+cron's file locks across pods (:class:`AuxSessionLock`, :func:`aux_xact_lock`),
+plus their one-shot move, :func:`migrate_cron_to_pg`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from hermes_state_writer import _PostgresWriterConnection, postgres_ddl
 
@@ -79,10 +86,19 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
             "discord_recovery_cursors", "core_discord_recovery_cursors", ("channel_id",)
         ),
     ),
+    # levos 0060: the cron stores. ``cron_jobs`` has no SQLite table (the
+    # non-authority store is ``cron/jobs.json``); one row holds one job document.
+    "cron_executions": (AuxTable("executions", "core_cron_executions", ("id",)),),
+    "cron_notepad": (AuxTable("cron_notepad", "core_cron_notes", ("job_id", "key")),),
+    "cron_jobs": (AuxTable("cron_jobs", "core_cron_jobs", ("id",)),),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {
         "idx_verification_events_session_root": "idx_core_verification_events_session_root",
+    },
+    "cron_executions": {
+        "idx_executions_job_claimed": "idx_core_cron_executions_job_claimed",
+        "idx_executions_status_claimed": "idx_core_cron_executions_status_claimed",
     },
 }
 
@@ -173,6 +189,161 @@ def _open_postgres(name: str, initialize: Callable[[Any], None]):
         conn.close()
         raise
     return conn
+
+
+def open_aux_postgres(name: str, *, initialize: Callable[[Any], None]):
+    """Open auxiliary store *name* on PostgreSQL authority only (levos 0060).
+
+    For a store whose other form is not SQLite (``cron_jobs`` stays
+    ``cron/jobs.json``), so there is no ``sqlite_path`` to open instead. The
+    caller picks the backend with :func:`aux_store_authority`; on any other
+    backend this raises :class:`AuxStoreUnavailable`.
+    """
+    aux_store_tables(name)
+    if not aux_store_authority():
+        raise AuxStoreUnavailable(
+            f"auxiliary store {name!r} exists only on PostgreSQL authority"
+        )
+    return _open_postgres(name, initialize)
+
+
+# ---------------------------------------------------------------------------
+# Advisory locks (levos 0060)
+# ---------------------------------------------------------------------------
+# A file lock only fences processes that share one filesystem; two pods of a
+# profile share nothing but the profile's PostgreSQL store. Advisory lock keys
+# are database-wide while profiles share a database under their own schemas,
+# so every key is derived from the connection's current schema plus a name.
+
+
+def aux_lock_key(schema: str, name: str) -> int:
+    """Signed 64-bit advisory lock key for *name* inside profile *schema*."""
+    digest = hashlib.sha256(f"{schema}\0{name}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def _schema_lock_key(conn: Any, name: str) -> int:
+    schema = conn.execute("SELECT COALESCE(current_schema(), 'public')").fetchone()[0]
+    return aux_lock_key(schema, name)
+
+
+def aux_xact_lock(conn: Any, name: str, *, timeout_seconds: float) -> None:
+    """Take transaction advisory lock *name* inside *conn*'s open transaction.
+
+    COMMIT or ROLLBACK releases it, and so does the server when the
+    connection dies. Waiting longer than *timeout_seconds* raises
+    :class:`AuxStoreUnavailable`; the aborted transaction must be rolled back.
+    """
+    key = _schema_lock_key(conn, name)
+    conn.execute(
+        "SELECT set_config('lock_timeout', ?, true)",
+        (f"{max(1, int(timeout_seconds * 1000))}ms",),
+    )
+    try:
+        conn.execute("SELECT pg_advisory_xact_lock(?)", (key,))
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) == "55P03":  # lock_not_available
+            raise AuxStoreUnavailable(
+                f"advisory lock {name!r}: still held by another process after "
+                f"{timeout_seconds:g}s"
+            ) from exc
+        raise
+
+
+@contextlib.contextmanager
+def aux_schema_transaction(conn: Any, store: str) -> Iterator[Any]:
+    """Run a PostgreSQL store's DDL in one transaction, serialized per store.
+
+    Two pods opening a store for the first time would otherwise race their
+    ``CREATE TABLE IF NOT EXISTS`` into a ``pg_type`` unique violation.
+    """
+    with conn:
+        aux_xact_lock(conn, f"schema:{store}", timeout_seconds=30.0)
+        yield conn
+
+
+def _connect_lock_session(name: str):
+    try:
+        from hermes_state_postgres import connect_postgres, resolve_postgres_dsn
+
+        dsn = resolve_postgres_dsn()
+        if not dsn:
+            raise RuntimeError("PostgreSQL authority is not selected")
+        return connect_postgres(dsn)
+    except Exception as exc:
+        raise AuxStoreUnavailable(
+            f"advisory lock {name!r}: the PostgreSQL authority store could not be reached"
+        ) from exc
+
+
+class AuxSessionLock:
+    """A PostgreSQL session advisory lock on its own dedicated connection.
+
+    The lock lives exactly as long as that connection: :meth:`release`
+    unlocks and closes it, and when the holder process dies or the
+    connection drops the server releases the lock by itself, so a crashed
+    holder never wedges it. The flip side: a holder whose connection is cut
+    mid-section is no longer fenced and is not told so; the owner-token
+    checks the callers already do under the lock stay the correctness line.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._conn: Any = None
+        self._key: Optional[int] = None
+
+    def acquire(self, *, wait_seconds: float = 0.0, poll_seconds: float = 0.1) -> bool:
+        """Try to take the lock, polling up to *wait_seconds*.
+
+        False means another session still holds it. A PostgreSQL failure
+        raises :class:`AuxStoreUnavailable`.
+        """
+        if self._conn is not None:
+            raise RuntimeError(f"advisory lock {self.name!r} is already held")
+        conn = _connect_lock_session(self.name)
+        try:
+            key = _schema_lock_key(conn, self.name)
+            deadline = time.monotonic() + max(0.0, wait_seconds)
+            attempt = "SELECT pg_try_advisory_lock(?)"
+            while not conn.execute(attempt, (key,)).fetchone()[0]:
+                if time.monotonic() >= deadline:
+                    conn.close()
+                    return False
+                time.sleep(poll_seconds)
+        except Exception as exc:
+            conn.close()
+            raise AuxStoreUnavailable(
+                f"advisory lock {self.name!r}: PostgreSQL failed while locking"
+            ) from exc
+        except BaseException:
+            conn.close()
+            raise
+        self._conn, self._key = conn, key
+        return True
+
+    def release(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        try:
+            conn.execute("SELECT pg_advisory_unlock(?)", (self._key,))
+        except Exception:
+            pass  # closing the session below releases the lock anyway
+        finally:
+            conn.close()
+
+
+@contextlib.contextmanager
+def aux_session_lock(
+    name: str, *, wait_seconds: float = 0.0, poll_seconds: float = 0.1
+) -> Iterator[bool]:
+    """Hold :class:`AuxSessionLock` *name* for the block; yields whether it is held."""
+    lock = AuxSessionLock(name)
+    acquired = lock.acquire(wait_seconds=wait_seconds, poll_seconds=poll_seconds)
+    try:
+        yield acquired
+    finally:
+        lock.release()
 
 
 class AuxPostgresConnection(_PostgresWriterConnection):
@@ -348,11 +519,51 @@ def migrate_aux_sqlite_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
       :class:`AuxMigrationError` is raised.
     * ``dry_run`` performs the same copy and checks, then rolls back.
     """
+    return _migrate_sources(
+        "migrate_aux_sqlite_to_pg", profile, _source_files(), dry_run=dry_run
+    )
+
+
+def _cron_source_files() -> Tuple[Tuple[str, Path], ...]:
+    from hermes_constants import aux_db_path, get_hermes_home
+
+    home = get_hermes_home()
+    return (
+        ("cron_executions", aux_db_path("cron/executions.db")),
+        ("cron_notepad", home / "cron" / "notepad.db"),
+        ("cron_jobs", home / "cron" / "jobs.json"),
+    )
+
+
+def migrate_cron_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
+    """Copy the active authority profile's cron stores into PostgreSQL (levos 0060).
+
+    Same contract as :func:`migrate_aux_sqlite_to_pg` for ``cron/executions.db``,
+    ``cron/notepad.db`` and ``cron/jobs.json``: sources are only read and are
+    sha256-checked, each store is one PostgreSQL transaction, rows PostgreSQL
+    already holds win, a source row missing afterwards rolls the store back
+    (:class:`AuxMigrationError`), running twice inserts nothing, ``dry_run``
+    rolls back. ``jobs.json`` is merged by job id under the live jobs lock, so
+    a pod ticking at the same time cannot interleave with the copy. Migrated
+    attempts carry no lease, so a still-open one is later marked unknown.
+    """
+    return _migrate_sources(
+        "migrate_cron_to_pg", profile, _cron_source_files(), dry_run=dry_run
+    )
+
+
+def _migrate_sources(
+    entrypoint: str,
+    profile: str,
+    sources: Tuple[Tuple[str, Path], ...],
+    *,
+    dry_run: bool,
+) -> Dict[str, Any]:
     from hermes_state_postgres import _is_active_profile
 
     if not _is_active_profile(profile):
         raise ValueError(
-            f"migrate_aux_sqlite_to_pg runs in the profile's own environment "
+            f"{entrypoint} runs in the profile's own environment "
             f"(HERMES_PROFILE / HERMES_HOME); {profile!r} is not the active profile"
         )
     if not aux_store_authority():
@@ -360,7 +571,7 @@ def migrate_aux_sqlite_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
             f"profile {profile!r} is not on PostgreSQL authority; nothing to migrate to"
         )
     report: Dict[str, Any] = {"profile": profile, "dry_run": dry_run, "stores": {}}
-    for store, path in _source_files():
+    for store, path in sources:
         if not path.is_file():
             report["stores"][store] = {"status": "missing", "path": str(path)}
             continue
@@ -377,6 +588,8 @@ def migrate_aux_sqlite_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
 def _migrate_store(store: str, path: Path, *, dry_run: bool) -> Dict[str, Any]:
     from state_transfer import open_sqlite_snapshot
 
+    if store == "cron_jobs":
+        return _migrate_cron_jobs(path, dry_run=dry_run)
     source = open_sqlite_snapshot(path)
     try:
         if store == "projects":
@@ -435,7 +648,60 @@ def _migrate_projects(source: sqlite3.Connection, *, dry_run: bool) -> Dict[str,
         target.close()
 
 
+def _migrate_cron_jobs(path: Path, *, dry_run: bool) -> Dict[str, Any]:
+    """``jobs.json`` → ``core_cron_jobs``, by job id, inside the jobs lock."""
+    from cron import jobs as cron_jobs
+
+    try:
+        data, _ = cron_jobs._parse_jobs_file(path)  # opens read-only
+    except (OSError, ValueError) as exc:
+        raise AuxMigrationError(f"cron_jobs: {path.name} is unreadable: {exc}") from exc
+    source = data.get("jobs", []) if isinstance(data, dict) else data
+    if not isinstance(source, list) or not all(
+        isinstance(job, dict) and job.get("id") for job in source
+    ):
+        raise AuxMigrationError(f"cron_jobs: {path.name} holds a job without an id")
+    table: Dict[str, Any] = {}
+    try:
+        with cron_jobs._jobs_lock():
+            stored = cron_jobs.load_jobs()
+            present = {str(job["id"]) for job in stored}
+            added = [job for job in source if str(job["id"]) not in present]
+            if added:
+                try:
+                    cron_jobs.save_jobs(stored + added)
+                except ValueError as exc:  # e.g. a duplicate id in the file
+                    raise AuxMigrationError(f"cron_jobs: {exc}; rolled back") from exc
+            after = {str(job["id"]) for job in cron_jobs.load_jobs()}
+            missing = sum(1 for job in source if str(job["id"]) not in after)
+            if missing:
+                raise AuxMigrationError(
+                    f"jobs: {missing} of {len(source)} source jobs are not in "
+                    "PostgreSQL after the copy; rolled back"
+                )
+            table = {
+                "source_rows": len(source),
+                "target_rows_before": len(stored),
+                "target_rows_after": len(after),
+                "inserted": len(added),
+                "dropped_columns": [],
+            }
+            if dry_run:
+                raise _DryRun
+    except _DryRun:
+        pass
+    return {"status": "dry_run" if dry_run else "migrated", "tables": {"jobs": table}}
+
+
 def _store_initializer(store: str) -> Callable[[Any], None]:
+    if store == "cron_executions":
+        from cron.executions import _initialize_schema
+
+        return _initialize_schema
+    if store == "cron_notepad":
+        from cron.notepad import _initialize_schema
+
+        return _initialize_schema
     if store == "verification_evidence":
         from agent.verification_evidence import _initialize_connection
 
@@ -576,8 +842,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--profile", required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--cron",
+        action="store_true",
+        help="move the cron stores (executions, notepad, jobs.json) instead (levos 0060)",
+    )
     args = parser.parse_args(argv)
-    report = migrate_aux_sqlite_to_pg(args.profile, dry_run=args.dry_run)
+    migrate = migrate_cron_to_pg if args.cron else migrate_aux_sqlite_to_pg
+    report = migrate(args.profile, dry_run=args.dry_run)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -3,7 +3,8 @@
 A tiny KV scratchpad each cron job can use to carry state across scheduled
 wake-ups (cursors, watermarks, watchlists). Stored in its own profile-local
 SQLite file next to the executions ledger, following the same
-connection/pragma pattern as ``cron/executions.py``.
+connection/pragma pattern as ``cron/executions.py`` — or, on a PostgreSQL
+authority profile, in the profile's store (``core_cron_notes``, levos 0060).
 
 Size caps (documented contract):
 
@@ -39,16 +40,38 @@ _lock = threading.RLock()
 
 
 def _connect() -> sqlite3.Connection:
-    NOTEPAD_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(NOTEPAD_FILE, timeout=5)
+    """Open the notepad on the backend the profile selects (levos 0060).
+
+    PostgreSQL authority: table ``core_cron_notes`` in the profile's store,
+    no file; a failure raises ``AuxStoreUnavailable``. Otherwise the SQLite
+    file, opened and initialized exactly as before.
+    """
+    from hermes_aux_store import open_aux_store
+
+    return open_aux_store(
+        "cron_notepad",
+        sqlite_path=NOTEPAD_FILE,
+        initialize=_initialize_schema,
+        sqlite_options={"timeout": 5},
+    )
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "is_postgres", False):
+        from hermes_aux_store import aux_schema_transaction
+
+        with aux_schema_transaction(conn, "cron_notepad"):
+            _create_schema(conn)
+        return
     from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     apply_wal_with_fallback(conn, db_label="cron/notepad.db")
+    _create_schema(conn)
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cron_notepad (
              job_id TEXT NOT NULL,
@@ -64,14 +87,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 def _transaction() -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, always close.
 
-    Mirrors ``cron.executions._transaction``: schema init runs inside the
-    ``try`` so a PRAGMA/DDL failure still closes the connection instead of
-    leaking it.
+    Mirrors ``cron.executions._transaction``: schema init runs inside
+    ``_connect`` (``open_aux_store``), which closes the connection itself
+    when a PRAGMA/DDL step fails instead of leaking it.
     """
     with _lock:
         conn = _connect()
         try:
-            _initialize_schema(conn)
             with conn:
                 yield conn
         finally:
@@ -97,9 +119,14 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
     _validate(job_id, key, value)
     now = _hermes_now().isoformat()
     with _transaction() as conn:
+        if getattr(conn, "is_postgres", False):
+            # UTF-8 byte length, as CAST(... AS BLOB) measures it on SQLite.
+            byte_sum = "OCTET_LENGTH(key) + OCTET_LENGTH(value)"
+        else:
+            byte_sum = """LENGTH(CAST(key AS BLOB))
+                 + LENGTH(CAST(value AS BLOB))"""
         row = conn.execute(
-            """SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))
-                 + LENGTH(CAST(value AS BLOB))), 0)
+            f"""SELECT COALESCE(SUM({byte_sum}), 0)
                FROM cron_notepad WHERE job_id=? AND key<>?""",
             (job_id, key),
         ).fetchone()
@@ -153,10 +180,14 @@ def clear_notepad(job_id: str) -> int:
     """Delete every key for one job (e.g. on job removal). Returns row count.
 
     Called from ``cron.jobs.remove_job`` so deleted jobs don't orphan their
-    rows. No-ops without creating the DB when no notepad file exists yet.
+    rows. No-ops without creating the DB when no notepad file exists yet
+    (a PostgreSQL authority profile has no file and always deletes).
     """
     if not NOTEPAD_FILE.exists():
-        return 0
+        from hermes_aux_store import aux_store_authority
+
+        if not aux_store_authority():
+            return 0
     with _transaction() as conn:
         cur = conn.execute(
             "DELETE FROM cron_notepad WHERE job_id=?", (str(job_id),)
