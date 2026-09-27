@@ -2201,6 +2201,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._missed_message_backfill_task = None
 
         self._release_platform_lock()
+        recovery_store = getattr(self, "_discord_recovery_store", None)
+        if recovery_store is not None:
+            recovery_store.close()
 
         logger.info("[%s] Disconnected", self.name)
 
@@ -3035,7 +3038,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     status=CASE WHEN ? THEN 'responded' ELSE discord_messages.status END,
                     replied=CASE WHEN ? THEN 1 ELSE discord_messages.replied END,
                     outage_response=CASE WHEN ? THEN 0 ELSE discord_messages.outage_response END,
-                    response_message_id=COALESCE(?, response_message_id),
+                    response_message_id=COALESCE(?, discord_messages.response_message_id),
                     updated_at=?
                 """,
                 (
@@ -3044,9 +3047,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     1 if completed else 0,
                     result.message_id,
                     now,
-                    1 if completed else 0,
-                    1 if completed else 0,
-                    1 if completed else 0,
+                    # CASE WHEN conditions bind a bool: SQLite stores it as
+                    # 1/0 exactly as before, PostgreSQL needs a boolean there.
+                    completed,
+                    completed,
+                    completed,
                     result.message_id,
                     now,
                 ),

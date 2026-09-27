@@ -93,6 +93,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from hermes_aux_store import AuxStoreUnavailable, aux_store_authority, open_aux_store
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
@@ -859,6 +860,31 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+def _initialize_response_store(conn) -> None:
+    """Idempotent schema for the Responses API store (SQLite or PostgreSQL)."""
+    if not getattr(conn, "is_postgres", False):
+        # Use shared WAL-fallback helper so response_store.db degrades
+        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
+        # issue addressed for state.db/kanban.db — see
+        # hermes_state._WAL_INCOMPAT_MARKERS).
+        from hermes_state import apply_wal_with_fallback
+        apply_wal_with_fallback(conn, db_label="response_store.db")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS responses (
+            response_id TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            accessed_at REAL NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS conversations (
+            name TEXT PRIMARY KEY,
+            response_id TEXT NOT NULL
+        )"""
+    )
+    conn.commit()
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -869,10 +895,29 @@ class ResponseStore:
 
     Persists across gateway restarts.  Falls back to in-memory SQLite
     if the on-disk path is unavailable.
+
+    On a PostgreSQL-authority profile the store lives in that profile's
+    PostgreSQL store instead (levos 0059) so overlapping pods share one chain.
+    There is no file or ``:memory:`` fallback there: an unreachable store is
+    logged, retried on the next call, and each call raises
+    ``AuxStoreUnavailable`` (the adapter answers 503).
     """
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._conn = None
+        self._db_path = None
+        self._open_lock = threading.Lock()
+        if aux_store_authority():
+            try:
+                self._db()
+            except AuxStoreUnavailable:
+                logger.error(
+                    "Response store unavailable on the PostgreSQL authority store; "
+                    "Responses API state requests will fail until it recovers",
+                    exc_info=True,
+                )
+            return
         if db_path is None:
             try:
                 from hermes_constants import aux_db_path
@@ -887,32 +932,31 @@ class ResponseStore:
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
-        # Use shared WAL-fallback helper so response_store.db degrades
-        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
-        # issue addressed for state.db/kanban.db — see
-        # hermes_state._WAL_INCOMPAT_MARKERS).
-        from hermes_state import apply_wal_with_fallback
-        apply_wal_with_fallback(self._conn, db_label="response_store.db")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
-            )"""
-        )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
-            )"""
-        )
-        self._conn.commit()
+        _initialize_response_store(self._conn)
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
         # rather than after every commit — chmod-on-every-write is wasted
         # syscalls on a hot path.
         self._tighten_file_permissions()
+
+    def _db(self):
+        """The open connection; on PostgreSQL authority, (re)opened on demand."""
+        conn = self._conn
+        if conn is None:
+            with self._open_lock:
+                conn = self._conn
+                if conn is None:
+                    from hermes_constants import aux_db_path
+
+                    conn = open_aux_store(
+                        "response_store",
+                        sqlite_path=aux_db_path("response_store.db"),
+                        initialize=_initialize_response_store,
+                        sqlite_options={"check_same_thread": False},
+                    )
+                    self._conn = conn
+        return conn
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
@@ -935,16 +979,16 @@ class ResponseStore:
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
+        row = self._db().execute(
             "SELECT data FROM responses WHERE response_id = ?", (response_id,)
         ).fetchone()
         if row is None:
             return None
-        self._conn.execute(
+        self._db().execute(
             "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
             (time.time(), response_id),
         )
-        self._conn.commit()
+        self._db().commit()
         try:
             return json.loads(row[0])
         except (json.JSONDecodeError, TypeError):
@@ -952,26 +996,26 @@ class ResponseStore:
                 "Corrupted JSON in response store for id=%s, evicting entry",
                 response_id,
             )
-            self._conn.execute(
+            self._db().execute(
                 "DELETE FROM responses WHERE response_id = ?",
                 (response_id,),
             )
-            self._conn.commit()
+            self._db().commit()
             return None
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        self._conn.execute(
+        self._db().execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
             (response_id, json.dumps(data, default=str), time.time()),
         )
         # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+        count = self._db().execute("SELECT COUNT(*) FROM responses").fetchone()[0]
         if count > self._max_size:
             # Collect IDs that will be evicted
             evict_ids = [
                 row[0]
-                for row in self._conn.execute(
+                for row in self._db().execute(
                     "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
                     (count - self._max_size,),
                 ).fetchall()
@@ -979,53 +1023,55 @@ class ResponseStore:
             if evict_ids:
                 placeholders = ",".join("?" for _ in evict_ids)
                 # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
+                self._db().execute(
                     f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
                     evict_ids,
                 )
                 # Delete evicted responses
-                self._conn.execute(
+                self._db().execute(
                     f"DELETE FROM responses WHERE response_id IN ({placeholders})",
                     evict_ids,
                 )
-        self._conn.commit()
+        self._db().commit()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
         # Clear conversation mappings pointing to this response
-        self._conn.execute(
+        self._db().execute(
             "DELETE FROM conversations WHERE response_id = ?", (response_id,)
         )
-        cursor = self._conn.execute(
+        cursor = self._db().execute(
             "DELETE FROM responses WHERE response_id = ?", (response_id,)
         )
-        self._conn.commit()
+        self._db().commit()
         return cursor.rowcount > 0
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
+        row = self._db().execute(
             "SELECT response_id FROM conversations WHERE name = ?", (name,)
         ).fetchone()
         return row[0] if row else None
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute(
+        self._db().execute(
             "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
             (name, response_id),
         )
-        self._conn.commit()
+        self._db().commit()
 
     def close(self) -> None:
         """Close the database connection."""
+        if self._conn is None:
+            return
         try:
             self._conn.close()
         except Exception:
             pass
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+        row = self._db().execute("SELECT COUNT(*) FROM responses").fetchone()
         return row[0] if row else 0
 
 
@@ -1231,6 +1277,36 @@ if AIOHTTP_AVAILABLE:
             )
 else:
     body_limit_middleware = None  # type: ignore[assignment]
+
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def aux_store_unavailable_middleware(request, handler):
+        """Answer 503 when a PostgreSQL-authority auxiliary store is unreachable.
+
+        The response store never degrades to SQLite/``:memory:`` on authority
+        (levos 0059), so the request fails instead; the cause is logged, never
+        returned.
+        """
+        try:
+            return await handler(request)
+        except AuxStoreUnavailable:
+            logger.error(
+                "Auxiliary store unavailable while serving %s %s",
+                request.method,
+                request.path,
+                exc_info=True,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Response store temporarily unavailable.",
+                    err_type="server_error",
+                    code="store_unavailable",
+                ),
+                status=503,
+            )
+else:
+    aux_store_unavailable_middleware = None  # type: ignore[assignment]
 
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
@@ -7566,6 +7642,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,
+                    aux_store_unavailable_middleware,
                 )
                 if mw is not None
             ]

@@ -443,6 +443,7 @@ py-modules = [
   "hermes_state_dual",
   "hermes_state_read",
   "hermes_state_writer",
+  "hermes_aux_store",
   "hermes_time",
   "hermes_logging",
   "utils",
