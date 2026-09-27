@@ -1060,6 +1060,12 @@ def recover_with_credential_pool(
         # ``effective_reason`` is resolved below; this closure runs after.
         if effective_reason is not None:
             _failure_reason = effective_reason.value
+            if effective_reason == FailoverReason.rate_limit:
+                from agent.credential_pool import (
+                    FAILURE_REASON_MODEL_RATE_LIMIT, is_model_scoped_rate_limit,
+                )
+                if is_model_scoped_rate_limit(error_context):
+                    _failure_reason = FAILURE_REASON_MODEL_RATE_LIMIT
             if effective_reason == FailoverReason.billing and billing_unverified:
                 # Ambiguous billing body (#82154): persist the ambiguity so
                 # the cooldown is sized as transient, not a 1-hour bench.

@@ -143,6 +143,26 @@ FAILURE_REASON_BILLING = "billing"
 # the short transient cooldown instead of the one-hour billing bench — a
 # genuine depletion simply re-latches on the next attempt.
 FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
+# 요청한 모델만 한도에 걸린 429 (계정 전체 한도가 아니다). 계정은 멀쩡하므로 길게 벤치하면
+# 폴백이 다른 모델로 갈 자격증명까지 같이 사라진다 — 실사고 2026-09-26(fable 429 → 폴백 무력화).
+FAILURE_REASON_MODEL_RATE_LIMIT = "model_rate_limit"
+
+_MODEL_SCOPED_RATE_LIMIT_RE = re.compile(
+    r"(?i)rate limit(?:s)?[^.]{0,80}\bfor\b[^.]{0,80}(?:model|claude-|gpt-|gemini-|grok-)"
+    r"|(?:model|claude-|gpt-|gemini-|grok-)[^.]{0,80}\brate limit"
+    r"|per-model rate limit|model_rate_limit|model-scoped"
+)
+
+
+def is_model_scoped_rate_limit(error_context: Optional[Dict[str, Any]]) -> bool:
+    """오류 본문이 '이 모델만' 한도라고 말하는가. 판정 못 하면 False(= 기존 계정 소진 취급)."""
+    if not isinstance(error_context, dict):
+        return False
+    for key in ("message", "reason", "error", "detail"):
+        value = error_context.get(key)
+        if isinstance(value, str) and _MODEL_SCOPED_RATE_LIMIT_RE.search(value):
+            return True
+    return False
 
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
@@ -353,6 +373,9 @@ def _exhausted_ttl(
     # edge-throttle, 5xx server, or unknown). Billing exhaustion — whether
     # classified as such or self-evident from a 402 — is a genuine depletion
     # where a quick retry can't help, so it keeps the full bench.
+    if failure_reason == FAILURE_REASON_MODEL_RATE_LIMIT and error_code == 429:
+        # 그 모델만 막혔다 — 계정을 1시간 벤치하면 폴백이 쓸 자격증명까지 사라진다.
+        return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     is_billing = error_code == 402 or failure_reason == FAILURE_REASON_BILLING
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
@@ -2045,6 +2068,16 @@ class CredentialPool:
             available, _pending = self._available_entries()
             return available[0] if available else None
 
+    def _rotate_from(self, entry: "PooledCredential") -> Optional["PooledCredential"]:
+        """상태를 바꾸지 않고 `entry` 다음 가용 엔트리로 넘긴다(모델 스코프 429 용)."""
+        available, _pending = self._available_entries()
+        if not available:
+            return None
+        others = [e for e in available if e.id != entry.id]
+        chosen = others[0] if others else available[0]
+        self._current_id = chosen.id
+        return chosen
+
     def mark_exhausted_and_rotate(
         self,
         *,
@@ -2162,6 +2195,14 @@ class CredentialPool:
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
+            if failure_reason == FAILURE_REASON_MODEL_RATE_LIMIT and status_code == 429:
+                # 요청한 모델만 한도 — 계정은 멀쩡하다. 상태를 바꾸면(짧은 쿨다운이라도) 그 창 동안 풀이 비어
+                # 폴백이 같은 provider 의 자격증명을 못 찾는다(실사고 2026-09-26). 로테이션만 넘긴다.
+                logger.info(
+                    "credential pool: model-scoped 429 on %s — rotating without benching the account",
+                    entry.label or entry.id,
+                )
+                return self._rotate_from(entry)
             self._mark_exhausted(
                 entry, status_code, error_context, failure_reason=failure_reason
             )
