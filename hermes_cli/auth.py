@@ -1126,6 +1126,13 @@ def _load_global_auth_store() -> Dict[str, Any]:
     """
     global _global_auth_store_cache
     global_path = _global_auth_file_path()
+    if global_path is not None and _auth_pg_authority():
+        # levos 0066: the root store is a PostgreSQL row; there is no file
+        # mtime to key a memo on, so every read goes to PostgreSQL.
+        try:
+            return _load_auth_store_pg("root") or {}
+        except Exception:
+            return {}
     if global_path is None or not global_path.exists():
         _global_auth_store_cache = None
         return {}
@@ -1277,6 +1284,15 @@ def _auth_store_lock(
     against a concurrent import on the shared store.
     """
     auth_path = target_path if target_path is not None else _auth_file_path()
+    if _auth_pg_authority():
+        with _auth_pg_lock(
+            _auth_pg_name(auth_path),
+            _auth_lock_holder_for(auth_path),
+            timeout_seconds,
+            "Timed out waiting for auth store lock",
+        ):
+            yield
+        return
     lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
     with _file_lock(
         lock_path,
@@ -1287,7 +1303,155 @@ def _auth_store_lock(
         yield
 
 
+# -----------------------------------------------------------------------------
+# PostgreSQL authority (levos 0066)
+# -----------------------------------------------------------------------------
+# Two pods of one profile share nothing but the profile's PostgreSQL store, so
+# there the credential store is a row of ``core_auth_store`` (``profile`` or
+# ``root``, the document byte-equal to what auth.json would hold) and its lock
+# a session advisory lock. auth.json and auth.lock are neither read nor
+# created, and a PostgreSQL failure raises ``AuxStoreUnavailable``.
+
+_AUTH_PG_STORE = "auth_store"
+_AUTH_PG_DDL = (
+    "CREATE TABLE IF NOT EXISTS core_auth_store ("
+    "name TEXT PRIMARY KEY, document TEXT NOT NULL, "
+    "updated_at DOUBLE PRECISION NOT NULL)"
+)
+_AUTH_PG_UPSERT = (
+    "INSERT INTO core_auth_store (name, document, updated_at) "
+    "VALUES (?, ?, EXTRACT(EPOCH FROM clock_timestamp())) "
+    "ON CONFLICT (name) DO UPDATE SET document = EXCLUDED.document, "
+    "updated_at = EXCLUDED.updated_at"
+)
+_UNDEFINED_TABLE = "42P01"
+
+
+def _auth_pg_authority() -> bool:
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
+def _auth_pg_name(path: Optional[Path]) -> str:
+    """Row of the store at *path*: the profile's own or the global root's."""
+    if path is None or _same_path(path, _auth_file_path()):
+        return "profile"
+    root = _global_auth_file_path()
+    if root is not None and _same_path(path, root):
+        return "root"
+    raise ValueError("auth store path is neither the profile nor the root store")
+
+
+@contextmanager
+def _auth_pg_connection():
+    from hermes_aux_store import connect_aux_postgres
+
+    conn = connect_aux_postgres(_AUTH_PG_STORE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _load_auth_store_pg(name: str) -> Optional[Dict[str, Any]]:
+    """The stored document, or None when there is none yet."""
+    from hermes_aux_store import AuxStoreUnavailable
+
+    try:
+        with _auth_pg_connection() as conn:
+            row = conn.execute(
+                "SELECT document FROM core_auth_store WHERE name = ?", (name,)
+            ).fetchone()
+    except AuxStoreUnavailable:
+        raise
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) == _UNDEFINED_TABLE:
+            return None  # nothing was ever saved on this profile
+        raise AuxStoreUnavailable(f"auth store {name!r}: PostgreSQL read failed") from exc
+    if row is None:
+        return None
+    try:
+        raw = json.loads(row[0])
+    except ValueError:
+        # Degrading to an empty store would let the next save erase every
+        # credential (the file path keeps a .corrupt copy first; there is no
+        # place for one here).
+        raise ValueError(
+            f"auth store {name!r} in PostgreSQL is not valid JSON; refusing to "
+            "treat it as empty"
+        ) from None
+    return _auth_store_from_raw(raw)
+
+
+def _auth_pg_write(name: str, document: str) -> None:
+    from hermes_aux_store import AuxStoreUnavailable
+
+    try:
+        with _auth_pg_connection() as conn:
+            try:
+                conn.execute(_AUTH_PG_UPSERT, (name, document))
+            except Exception as exc:
+                if getattr(exc, "sqlstate", None) != _UNDEFINED_TABLE:
+                    raise
+                _auth_pg_create_table(conn)
+                conn.execute(_AUTH_PG_UPSERT, (name, document))
+    except AuxStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise AuxStoreUnavailable(f"auth store {name!r}: PostgreSQL write failed") from exc
+
+
+def _auth_pg_create_table(conn: Any) -> None:
+    """First save on a profile: DDL serialized per store, like 0060's."""
+    from hermes_aux_store import aux_xact_lock
+
+    conn.execute("BEGIN")
+    try:
+        aux_xact_lock(conn, f"schema:{_AUTH_PG_STORE}", timeout_seconds=30.0)
+        conn.execute(_AUTH_PG_DDL)
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass  # a dead connection has already rolled back
+        raise
+
+
+@contextmanager
+def _auth_pg_lock(
+    name: str,
+    holder: threading.local,
+    timeout_seconds: float,
+    timeout_message: str,
+):
+    """``_file_lock`` on a PostgreSQL session advisory lock, same contract."""
+    if getattr(holder, "depth", 0) > 0:
+        holder.depth += 1
+        try:
+            yield
+        finally:
+            holder.depth -= 1
+        return
+
+    from hermes_aux_store import AuxSessionLock
+
+    lock = AuxSessionLock(f"auth-store:{name}")
+    if not lock.acquire(wait_seconds=max(1.0, timeout_seconds), poll_seconds=0.05):
+        raise TimeoutError(timeout_message)
+    holder.depth = 1
+    try:
+        yield
+    finally:
+        holder.depth = 0
+        lock.release()
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    if _auth_pg_authority():
+        stored = _load_auth_store_pg(_auth_pg_name(auth_file))
+        return stored if stored is not None else {"version": AUTH_STORE_VERSION, "providers": {}}
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -1335,6 +1499,11 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             )
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
+    return _auth_store_from_raw(raw)
+
+
+def _auth_store_from_raw(raw: Any) -> Dict[str, Any]:
+    """Normalize a parsed auth store document (either backend)."""
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
         or isinstance(raw.get("credential_pool"), dict)
@@ -1363,14 +1532,20 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    name = _auth_pg_name(target_path) if _auth_pg_authority() else None
+    auth_store["version"] = AUTH_STORE_VERSION
+    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    payload = json.dumps(auth_store, indent=2) + "\n"
+    if name is not None:
+        _auth_pg_write(name, payload)
+        # The Nous status memo keys on the file mtime, which never moves here.
+        invalidate_nous_auth_status_cache()
+        return auth_file
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
     # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
     secure_parent_dir(auth_file)
-    auth_store["version"] = AUTH_STORE_VERSION
-    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close

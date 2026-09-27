@@ -112,6 +112,9 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     # levos 0065: the memory tool's MEMORY.md / USER.md (no SQLite form either;
     # one row per file name, drift snapshots as ``<name>.bak.<ts>`` rows).
     "memory": (AuxTable("memory_files", "core_memory_files", ("name",)),),
+    # levos 0066: the credential store (``auth.json``); one row holds one
+    # store document, ``profile`` or ``root``. No SQLite form either.
+    "auth_store": (AuxTable("auth_store", "core_auth_store", ("name",)),),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {
@@ -387,6 +390,29 @@ def aux_session_lock(
         yield acquired
     finally:
         lock.release()
+
+
+def connect_aux_postgres(name: str):
+    """A plain autocommit connection to the authority profile's store (levos 0066).
+
+    For a store whose owner runs one or two statements per operation on a hot
+    path (the credential store) and must not open a ``SessionDB`` each time.
+    PostgreSQL authority only; a failure raises :class:`AuxStoreUnavailable`,
+    whose message never carries the DSN.
+    """
+    aux_store_tables(name)
+    if not aux_store_authority():
+        raise AuxStoreUnavailable(
+            f"auxiliary store {name!r} exists only on PostgreSQL authority"
+        )
+    try:
+        from hermes_state_postgres import connect_postgres, resolve_postgres_dsn
+
+        return connect_postgres(resolve_postgres_dsn())
+    except Exception as exc:
+        raise AuxStoreUnavailable(
+            f"auxiliary store {name!r}: the PostgreSQL authority store could not be reached"
+        ) from exc
 
 
 class AuxPostgresConnection(_PostgresWriterConnection):
@@ -711,6 +737,34 @@ def migrate_cron_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
     )
 
 
+def _auth_source_files() -> Tuple[Tuple[str, Path], ...]:
+    from hermes_cli.auth import _auth_file_path, _global_auth_file_path
+
+    sources = [("auth_profile", _auth_file_path())]
+    root = _global_auth_file_path()
+    if root is not None:
+        sources.append(("auth_root", root))
+    return tuple(sources)
+
+
+def migrate_auth_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
+    """Copy the active authority profile's credential stores into PostgreSQL (levos 0066).
+
+    The profile ``auth.json`` becomes the ``profile`` row of ``core_auth_store``
+    and, in profile mode, the root ``auth.json`` the ``root`` row. Same
+    contract as :func:`migrate_cron_to_pg`: sources are only read and are
+    sha256-checked, running twice adds nothing, ``dry_run`` writes nothing.
+    A store is merged by top-level key, and by provider key inside
+    ``providers`` and ``credential_pool``; a key PostgreSQL already holds wins,
+    because a pod on this image may already have rotated that token there.
+    The merge runs under the store's live advisory lock, so it cannot
+    interleave with a refresh on a running pod.
+    """
+    return _migrate_sources(
+        "migrate_auth_to_pg", profile, _auth_source_files(), dry_run=dry_run
+    )
+
+
 def _migrate_sources(
     entrypoint: str,
     profile: str,
@@ -749,6 +803,8 @@ def _migrate_store(store: str, path: Path, *, dry_run: bool) -> Dict[str, Any]:
 
     if store == "cron_jobs":
         return _migrate_cron_jobs(path, dry_run=dry_run)
+    if store.startswith("auth_"):
+        return _migrate_auth_store(path, dry_run=dry_run)
     source = open_sqlite_snapshot(path)
     try:
         if store == "projects":
@@ -955,6 +1011,82 @@ def _migrate_memory_file(path: Path, *, dry_run: bool) -> Dict[str, Any]:
     }
 
 
+_AUTH_MERGED_BY_PROVIDER = ("providers", "credential_pool")
+_AUTH_STAMPS = ("version", "updated_at")  # rewritten by every save
+
+
+def _auth_keys(store: Mapping[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for key, value in store.items():
+        if key in _AUTH_STAMPS:
+            continue
+        if key in _AUTH_MERGED_BY_PROVIDER and isinstance(value, dict):
+            keys.extend(f"{key}.{provider}" for provider in value)
+        else:
+            keys.append(key)
+    return keys
+
+
+def _migrate_auth_store(path: Path, *, dry_run: bool) -> Dict[str, Any]:
+    """One ``auth.json`` → its ``core_auth_store`` row, under the live lock."""
+    import json
+
+    from hermes_cli import auth
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        # The type only: a decode error can quote bytes of a credential.
+        raise AuxMigrationError(
+            f"auth_store: {path.name} is unreadable ({type(exc).__name__})"
+        ) from None
+    if not isinstance(raw, dict):
+        raise AuxMigrationError(f"auth_store: {path.name} is not a JSON object")
+    source = auth._auth_store_from_raw(raw)
+    added: List[str] = []
+    with auth._auth_store_lock(target_path=path):
+        stored = auth._load_auth_store(path)
+        before = _auth_keys(stored)
+        for key, value in source.items():
+            if key in _AUTH_STAMPS:
+                continue
+            if key in _AUTH_MERGED_BY_PROVIDER and isinstance(value, dict):
+                current = stored.setdefault(key, {})
+                if not isinstance(current, dict):
+                    raise AuxMigrationError(
+                        f"auth_store: PostgreSQL {key!r} is not an object; not merging"
+                    )
+                for provider, state in value.items():
+                    if provider not in current:
+                        current[provider] = state
+                        added.append(f"{key}.{provider}")
+            elif key not in stored:
+                stored[key] = value
+                added.append(key)
+        if added and not dry_run:
+            auth._save_auth_store(stored, target_path=path)
+            stored = auth._load_auth_store(path)
+        after = _auth_keys(stored)
+    missing = sorted(set(_auth_keys(source)) - set(after))
+    if missing:
+        raise AuxMigrationError(
+            f"auth_store: {len(missing)} source keys are not in PostgreSQL after the copy"
+        )
+    return {
+        "status": "dry_run" if dry_run else "migrated",
+        "tables": {
+            "auth_store": {
+                "source_rows": len(_auth_keys(source)),
+                "target_rows_before": len(before),
+                "target_rows_after": len(after),
+                "inserted": len(added),
+                "inserted_keys": added,  # provider names only, never values
+                "dropped_columns": [],
+            }
+        },
+    }
+
+
 def _store_initializer(store: str) -> Callable[[Any], None]:
     if store == "cron_executions":
         from cron.executions import _initialize_schema
@@ -1114,10 +1246,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="move the memory files (memories/MEMORY.md, USER.md) instead (levos 0065)",
     )
+    parser.add_argument(
+        "--auth",
+        action="store_true",
+        help="move the credential stores (profile and root auth.json) instead (levos 0066)",
+    )
     args = parser.parse_args(argv)
+    exclusive = [name for name in ("cron", "memory", "auth") if getattr(args, name)]
+    if len(exclusive) > 1:
+        parser.error("--" + " / --".join(exclusive) + " are separate moves")
     migrate = migrate_cron_to_pg if args.cron else migrate_aux_sqlite_to_pg
     if args.memory:
         migrate = migrate_memory_to_pg
+    if args.auth:
+        migrate = migrate_auth_to_pg
     report = migrate(args.profile, dry_run=args.dry_run)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
