@@ -214,6 +214,41 @@ def strip_markdown(text: str) -> str:
 # ─── Thread Participation Tracking ───────────────────────────────────────────
 
 
+def kv_namespace_if_authority(namespace) -> str | None:
+    """``namespace(hermes_aux_store)`` on PostgreSQL authority, else None."""
+    try:
+        import hermes_aux_store as kv
+    except ImportError:
+        return None
+    return namespace(kv) if kv.aux_store_authority() else None
+
+
+def kv_set_mark(
+    namespace: str, members: list[str], max_tracked: int, cache: dict
+) -> None:
+    """Add *members* to a bounded PostgreSQL set, keeping the newest; *cache*
+    (this process's copy, members already added) is bounded the same way."""
+    from hermes_aux_store import aux_kv_put, aux_kv_transaction, aux_kv_trim
+
+    for stale in list(cache)[: max(0, len(cache) - max_tracked)]:
+        del cache[stale]
+
+    with aux_kv_transaction(namespace) as conn:
+        for member in members:
+            aux_kv_put(namespace, member, "", conn=conn, keep_existing=True)
+        aux_kv_trim(namespace, max_tracked, conn=conn)
+
+
+def kv_set_has(namespace: str, member: str, cache: dict) -> bool:
+    """Whether the PostgreSQL set holds *member*; a hit is cached."""
+    from hermes_aux_store import aux_kv_get
+
+    if aux_kv_get(namespace, member) is None:
+        return False
+    cache[member] = None
+    return True
+
+
 class ThreadParticipationTracker:
     """Persistent tracking of threads the bot has participated in.
 
@@ -231,6 +266,11 @@ class ThreadParticipationTracker:
 
         # Mark participation:
         self._threads.mark(thread_id)
+
+    On a PostgreSQL-authority profile (levos 0067) the set lives in the
+    profile's store (``aux_kv`` namespace ``threads:<platform>``) instead of
+    ``{platform}_threads.json``: a thread another pod joined counts here too,
+    so a new pod keeps answering unmentioned messages in it.
     """
 
     _MAX_TRACKED = 500
@@ -238,6 +278,9 @@ class ThreadParticipationTracker:
     def __init__(self, platform_name: str, max_tracked: int = 500):
         self._platform = platform_name
         self._max_tracked = max_tracked
+        self._kv_namespace = kv_namespace_if_authority(
+            lambda kv: kv.kv_threads_namespace(platform_name)
+        )
         self._threads: dict[str, None] = {
             str(thread_id): None for thread_id in self._load()
         }
@@ -247,6 +290,10 @@ class ThreadParticipationTracker:
         return get_hermes_home() / f"{self._platform}_threads.json"
 
     def _load(self) -> list[str]:
+        if self._kv_namespace is not None:
+            from hermes_aux_store import aux_kv_items
+
+            return [key for key, _ in aux_kv_items(self._kv_namespace)]
         path = self._state_path()
         if path.exists():
             try:
@@ -269,10 +316,20 @@ class ThreadParticipationTracker:
         """Mark *thread_id* as participated and persist."""
         if thread_id not in self._threads:
             self._threads[thread_id] = None
+            if self._kv_namespace is not None:
+                kv_set_mark(
+                    self._kv_namespace, [thread_id], self._max_tracked, self._threads
+                )
+                return
             self._save()
 
     def __contains__(self, thread_id: str) -> bool:
-        return thread_id in self._threads
+        if thread_id in self._threads:
+            return True
+        # Another pod may have joined the thread since this one loaded.
+        return self._kv_namespace is not None and kv_set_has(
+            self._kv_namespace, thread_id, self._threads
+        )
 
     def clear(self) -> None:
         self._threads.clear()

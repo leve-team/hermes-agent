@@ -7431,11 +7431,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a platform-namespaced key for voice mode state."""
         return f"{platform.value}:{chat_id}"
 
-    def _load_voice_modes(self) -> Dict[str, str]:
+    @staticmethod
+    def _voice_mode_kv_namespace() -> Optional[str]:
+        """``aux_kv`` namespace on PostgreSQL authority (levos 0067), else None.
+
+        There the modes are rows of the profile's store, not a file on one
+        pod's disk: a new pod starts with the modes set on the old one.
+        """
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {}
+            from hermes_aux_store import KV_VOICE_MODE, aux_store_authority
+        except ImportError:
+            return None
+        return KV_VOICE_MODE if aux_store_authority() else None
+
+    def _load_voice_modes(self) -> Dict[str, str]:
+        namespace = self._voice_mode_kv_namespace()
+        if namespace is not None:
+            from hermes_aux_store import aux_kv_items
+
+            data = dict(aux_kv_items(namespace))
+            # What this process last read or wrote: a save sends only the
+            # chats it changed, never another pod's stale copy of the rest.
+            self._voice_mode_persisted = dict(data)
+        else:
+            try:
+                data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return {}
 
         if not isinstance(data, dict):
             return {}
@@ -7458,6 +7480,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return result
 
     def _save_voice_modes(self) -> None:
+        namespace = self._voice_mode_kv_namespace()
+        if namespace is not None:
+            from hermes_aux_store import aux_kv_put, aux_kv_transaction
+
+            persisted = getattr(self, "_voice_mode_persisted", {})
+            changed = {
+                key: mode for key, mode in self._voice_mode.items()
+                if persisted.get(key) != mode
+            }
+            try:
+                if changed:
+                    with aux_kv_transaction(namespace) as conn:
+                        for key, mode in changed.items():
+                            aux_kv_put(namespace, key, mode, conn=conn)
+                self._voice_mode_persisted = {**persisted, **changed}
+            except Exception as e:
+                logger.warning("Failed to save voice modes: %s", e)
+            return
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(

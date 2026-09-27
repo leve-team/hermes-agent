@@ -20,6 +20,11 @@ The store is a small JSON file under the active profile's HERMES_HOME so each
 profile keeps its own dead set.  Reads/writes are best-effort: a corrupt or
 unwritable file degrades to an in-memory-only registry rather than raising on
 the delivery path.
+
+On a PostgreSQL-authority profile (levos 0067) the set lives in the profile's
+store instead (``aux_kv`` namespace ``dead_targets``) and every check reads it,
+so a target one pod proved dead — or revived — counts the same on every pod.
+A store failure degrades to this process's in-memory set, as a bad file does.
 """
 
 from __future__ import annotations
@@ -56,13 +61,27 @@ class DeadTargetRegistry:
     def __init__(self, path: Optional[Path] = None) -> None:
         self._lock = threading.RLock()
         self._dead: Dict[str, Dict[str, object]] = {}
+        self._kv_namespace: Optional[str] = None
         if path is not None:
             self._path = path
         else:
             self._path = get_hermes_home() / "gateway" / "dead_targets.json"
-        self._load()
+            self._kv_namespace = _kv_namespace()
+        if self._kv_namespace is None:
+            self._load()
 
     # -- persistence -------------------------------------------------------
+
+    def _kv(self, operation: str, call, fallback):
+        """Run *call* on the PostgreSQL set; on failure log and use *fallback*."""
+        try:
+            return call()
+        except Exception as exc:
+            logger.warning(
+                "dead_targets: PostgreSQL %s failed (%s) — using this process's "
+                "in-memory set", operation, type(exc).__name__,
+            )
+            return fallback()
 
     def _load(self) -> None:
         try:
@@ -98,8 +117,17 @@ class DeadTargetRegistry:
     def is_dead(self, platform: str, chat_id: Optional[str]) -> bool:
         if not chat_id:
             return False
+        key = _normalize(platform, chat_id)
         with self._lock:
-            return _normalize(platform, chat_id) in self._dead
+            if self._kv_namespace is not None:
+                from hermes_aux_store import aux_kv_get
+
+                return self._kv(
+                    "read",
+                    lambda: aux_kv_get(self._kv_namespace, key) is not None,
+                    lambda: key in self._dead,
+                )
+            return key in self._dead
 
     def mark_dead(self, platform: str, chat_id: Optional[str],
                   reason: str = "") -> bool:
@@ -115,7 +143,14 @@ class DeadTargetRegistry:
                 "reason": str(reason)[:200],
                 "marked_at": time.time(),
             }
-            self._flush_locked()
+            if self._kv_namespace is not None:
+                existed = self._kv(
+                    "write",
+                    lambda: self._kv_put(key, self._dead[key]),
+                    lambda: existed,
+                )
+            else:
+                self._flush_locked()
         if not existed:
             logger.info(
                 "dead_targets: marked %s as unreachable (%s) — future deliveries "
@@ -130,6 +165,16 @@ class DeadTargetRegistry:
             return False
         key = _normalize(platform, chat_id)
         with self._lock:
+            if self._kv_namespace is not None:
+                from hermes_aux_store import aux_kv_delete
+
+                known = self._dead.pop(key, None) is not None
+                cleared = self._kv(
+                    "write", lambda: aux_kv_delete(self._kv_namespace, key), lambda: known
+                )
+                if cleared:
+                    logger.info("dead_targets: cleared %s (delivery succeeded again)", key)
+                return cleared
             if key in self._dead:
                 del self._dead[key]
                 self._flush_locked()
@@ -140,4 +185,38 @@ class DeadTargetRegistry:
     def all_dead(self) -> Dict[str, Dict[str, object]]:
         """Snapshot of the current dead set (for diagnostics / `hermes` CLI)."""
         with self._lock:
-            return {k: dict(v) for k, v in self._dead.items()}
+            snapshot = {k: dict(v) for k, v in self._dead.items()}
+            if self._kv_namespace is not None:
+                return self._kv("read", self._kv_all, lambda: snapshot)
+            return snapshot
+
+    def _kv_put(self, key: str, entry: Dict[str, object]) -> bool:
+        """Store *entry*; True when *key* was already dead."""
+        from hermes_aux_store import aux_kv_get, aux_kv_put, aux_kv_transaction
+
+        with aux_kv_transaction(self._kv_namespace) as conn:
+            existed = aux_kv_get(self._kv_namespace, key, conn=conn) is not None
+            aux_kv_put(self._kv_namespace, key, json.dumps(entry), conn=conn)
+        return existed
+
+    def _kv_all(self) -> Dict[str, Dict[str, object]]:
+        from hermes_aux_store import aux_kv_items
+
+        result: Dict[str, Dict[str, object]] = {}
+        for key, value in aux_kv_items(self._kv_namespace):
+            try:
+                entry = json.loads(value)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                result[key] = entry
+        return result
+
+
+def _kv_namespace() -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend."""
+    try:
+        from hermes_aux_store import KV_DEAD_TARGETS, aux_store_authority
+    except ImportError:
+        return None
+    return KV_DEAD_TARGETS if aux_store_authority() else None

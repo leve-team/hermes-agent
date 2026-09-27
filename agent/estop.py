@@ -18,6 +18,12 @@ The sentinel body is optional JSON ``{"reason": ..., "engaged_at": ...}``.
 A corrupt or empty file still counts as engaged (fail safe): the pause must
 hold even if the file was created by ``touch ~/.hermes/ESTOP``.
 
+On a PostgreSQL-authority profile (levos 0067) the sentinel is a row of the
+profile's store (``aux_kv`` namespace ``estop``) instead of a file: every pod
+of the profile pauses together, and a pod started on a fresh disk is still
+paused. Each check is one indexed read; a store that cannot answer counts as
+engaged, as an unreadable sentinel does.
+
 Ported from: gastownhall/gastown estop.go (MIT). Related prior art:
 #26778 (/panic — kill/exit semantics; deliberately different, ours is
 resumable) and #44617 (interrupting in-flight cron; deliberately out of
@@ -35,6 +41,8 @@ from pathlib import Path
 from typing import Optional
 
 SENTINEL_NAME = "ESTOP"
+
+logger = logging.getLogger(__name__)
 
 # Per-component "logged already for this engagement" flags so a paused
 # dispatch loop logs once per engagement instead of once per tick.
@@ -56,6 +64,29 @@ def sentinel_path() -> Path:
     return _hermes_home() / SENTINEL_NAME
 
 
+def _kv_namespace() -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend."""
+    try:
+        from hermes_aux_store import KV_ESTOP, aux_store_authority
+    except ImportError:
+        return None
+    return KV_ESTOP if aux_store_authority() else None
+
+
+def location() -> str:
+    """Where the sentinel lives, for operator-facing messages."""
+    if _kv_namespace() is not None:
+        return "the profile's PostgreSQL store"
+    return str(sentinel_path())
+
+
+def _kv_read(namespace: str) -> Optional[str]:
+    """The stored sentinel body, None when not engaged. Raises on store failure."""
+    from hermes_aux_store import aux_kv_get
+
+    return aux_kv_get(namespace, SENTINEL_NAME)
+
+
 def is_engaged() -> bool:
     """Cheap check (one stat): is the global emergency stop engaged?
 
@@ -64,10 +95,19 @@ def is_engaged() -> bool:
     engaged. The module contract is that the pause must hold even when the
     sentinel is unreadable — a fail-open here would silently lift an
     operator's emergency stop exactly when the filesystem is misbehaving.
+    The same holds for a PostgreSQL store that cannot answer.
     """
     try:
+        namespace = _kv_namespace()
+        if namespace is not None:
+            return _kv_read(namespace) is not None
         return sentinel_path().exists()
-    except OSError:
+    except Exception as exc:
+        if not isinstance(exc, OSError):
+            logger.warning(
+                "ESTOP state unreadable (%s) — treating the pause as engaged",
+                type(exc).__name__,
+            )
         return True
 
 
@@ -78,6 +118,13 @@ def engage(reason: Optional[str] = None) -> Path:
         "engaged_at": datetime.now(timezone.utc).isoformat(),
         "reason": reason or None,
     }
+    namespace = _kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_put
+
+        # No best-effort here: a pause that did not reach the store must fail.
+        aux_kv_put(namespace, SENTINEL_NAME, json.dumps(payload, indent=2))
+        return path
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -92,6 +139,11 @@ def engage(reason: Optional[str] = None) -> Path:
 
 def disengage() -> bool:
     """Remove the ESTOP sentinel. Returns True if a pause was lifted."""
+    namespace = _kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_delete
+
+        return aux_kv_delete(namespace, SENTINEL_NAME)
     try:
         sentinel_path().unlink()
         return True
@@ -107,13 +159,24 @@ def get_state() -> Optional[dict]:
     A sentinel with an unreadable/corrupt body still reports engaged, with
     both fields None — the pause is authoritative, the metadata is not.
     """
-    path = sentinel_path()
-    if not path.exists():
-        return None
+    namespace = _kv_namespace()
+    if namespace is not None:
+        try:
+            body = _kv_read(namespace)
+        except Exception:
+            return {"reason": None, "engaged_at": None}  # fail safe, as is_engaged
+        if body is None:
+            return None
+    else:
+        path = sentinel_path()
+        if not path.exists():
+            return None
     reason = None
     engaged_at = None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(
+            body if namespace is not None else path.read_text(encoding="utf-8")
+        )
         if isinstance(raw, dict):
             reason = raw.get("reason") or None
             engaged_at = raw.get("engaged_at") or None
@@ -163,7 +226,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
             "`hermes resume` (%s)",
             component,
             suffix,
-            sentinel_path(),
+            location(),
         )
     return True
 

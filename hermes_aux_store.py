@@ -115,6 +115,10 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     # levos 0066: the credential store (``auth.json``); one row holds one
     # store document, ``profile`` or ``root``. No SQLite form either.
     "auth_store": (AuxTable("auth_store", "core_auth_store", ("name",)),),
+    # levos 0067: small operational state (pairing grants, thread participation,
+    # dead targets, voice modes, ESTOP, webhook subscriptions, ...), one row per
+    # entry. No SQLite form: every other backend keeps the owners' JSON files.
+    "aux_kv": (AuxTable("aux_kv", "core_aux_kv", ("namespace", "key")),),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {
@@ -413,6 +417,157 @@ def connect_aux_postgres(name: str):
         raise AuxStoreUnavailable(
             f"auxiliary store {name!r}: the PostgreSQL authority store could not be reached"
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Small operational state as key-value rows (levos 0067)
+# ---------------------------------------------------------------------------
+# The gateway and agent keep a few small JSON files in the profile home:
+# pairing grants, thread participation, dead delivery targets, voice modes,
+# the ESTOP sentinel, webhook subscriptions. A pod's disk is its own, so on an
+# authority profile each file becomes a *namespace* of ``core_aux_kv`` rows,
+# one row per entry: writers touch their own entries instead of replacing a
+# whole document another pod may have changed. ``updated_at`` is the
+# PostgreSQL server clock (bounded sets trim by it), never a pod clock.
+# Callers pick the backend with :func:`aux_store_authority`; these functions
+# exist only on authority and raise :class:`AuxStoreUnavailable` otherwise.
+
+AUX_KV_STORE = "aux_kv"
+_AUX_KV_NOW = "EXTRACT(EPOCH FROM clock_timestamp())"
+
+# Namespaces, one per former file (the owners and the one-shot move share them).
+KV_PAIRING = "pairing"  # one row per former pairing file, key = file name
+KV_VOICE_MODE = "voice_mode"
+KV_DEAD_TARGETS = "dead_targets"
+KV_RICH_SENT = "rich_sent"
+KV_DISCORD_NONCONVERSATIONAL = "discord_nonconversational"
+KV_ESTOP = "estop"
+KV_WEBHOOK_SUBSCRIPTIONS = "webhook_subscriptions"
+
+
+def kv_threads_namespace(platform: str) -> str:
+    """Namespace of ``{platform}_threads.json`` (thread participation)."""
+    return f"threads:{platform}"
+
+
+def _initialize_aux_kv(conn) -> None:
+    with aux_schema_transaction(conn, AUX_KV_STORE):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS aux_kv (
+                 namespace TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_at REAL NOT NULL,
+                 PRIMARY KEY (namespace, key)
+               )"""
+        )
+
+
+def open_aux_kv():
+    """Open the key-value store of the active authority profile."""
+    return open_aux_postgres(AUX_KV_STORE, initialize=_initialize_aux_kv)
+
+
+@contextlib.contextmanager
+def _aux_kv_handle(conn: Any, *, write: bool) -> Iterator[Any]:
+    """Yield *conn* (the caller's transaction) or a fresh handle; a fresh
+    handle writes in its own transaction and is closed afterwards."""
+    if conn is not None:
+        yield conn
+        return
+    own = open_aux_kv()
+    try:
+        if write:
+            with own:
+                yield own
+        else:
+            yield own
+    finally:
+        own.close()
+
+
+@contextlib.contextmanager
+def aux_kv_transaction(
+    namespace: str, *, timeout_seconds: float = 30.0
+) -> Iterator[Any]:
+    """One transaction holding *namespace*'s advisory lock, for a
+    read-modify-write of the namespace that is atomic across processes and
+    pods. Pass the yielded handle as ``conn=`` to the ``aux_kv_*`` calls."""
+    conn = open_aux_kv()
+    try:
+        with conn:
+            aux_xact_lock(conn, f"kv:{namespace}", timeout_seconds=timeout_seconds)
+            yield conn
+    finally:
+        conn.close()
+
+
+def aux_kv_get(namespace: str, key: str, *, conn: Any = None) -> Optional[str]:
+    with _aux_kv_handle(conn, write=False) as handle:
+        row = handle.execute(
+            "SELECT value FROM aux_kv WHERE namespace = ? AND key = ?",
+            (namespace, key),
+        ).fetchone()
+    return None if row is None else row[0]
+
+
+def aux_kv_items(namespace: str, *, conn: Any = None) -> List[Tuple[str, str]]:
+    """``(key, value)`` pairs of *namespace*, oldest write first."""
+    with _aux_kv_handle(conn, write=False) as handle:
+        rows = handle.execute(
+            "SELECT key, value FROM aux_kv WHERE namespace = ? "
+            "ORDER BY updated_at, key",
+            (namespace,),
+        ).fetchall()
+    return [(row[0], row[1]) for row in rows]
+
+
+def aux_kv_put(
+    namespace: str,
+    key: str,
+    value: str,
+    *,
+    conn: Any = None,
+    keep_existing: bool = False,
+) -> bool:
+    """Write one entry; True when a row was inserted or changed.
+
+    ``keep_existing`` leaves an existing entry (and its position in the
+    write order) untouched, the way a set keeps a member it already has.
+    """
+    action = (
+        "NOTHING"
+        if keep_existing
+        else "UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
+    )
+    with _aux_kv_handle(conn, write=True) as handle:
+        cursor = handle.execute(
+            "INSERT INTO aux_kv (namespace, key, value, updated_at) "
+            f"VALUES (?, ?, ?, {_AUX_KV_NOW}) "
+            f"ON CONFLICT (namespace, key) DO {action}",
+            (namespace, key, value),
+        )
+        return cursor.rowcount > 0
+
+
+def aux_kv_delete(namespace: str, key: str, *, conn: Any = None) -> bool:
+    with _aux_kv_handle(conn, write=True) as handle:
+        cursor = handle.execute(
+            "DELETE FROM aux_kv WHERE namespace = ? AND key = ?", (namespace, key)
+        )
+        return cursor.rowcount > 0
+
+
+def aux_kv_trim(namespace: str, keep: int, *, conn: Any = None) -> int:
+    """Drop all but the *keep* most recently written entries of *namespace*."""
+    with _aux_kv_handle(conn, write=True) as handle:
+        cursor = handle.execute(
+            "DELETE FROM aux_kv WHERE namespace = ? AND key NOT IN ("
+            "SELECT key FROM aux_kv WHERE namespace = ? "
+            "ORDER BY updated_at DESC, key DESC LIMIT ?)",
+            (namespace, namespace, max(0, int(keep))),
+        )
+        return cursor.rowcount
 
 
 class AuxPostgresConnection(_PostgresWriterConnection):
@@ -1226,6 +1381,266 @@ def _copy_identity_rows(target, name, columns, rows, identity, ids):
     return inserted, missing
 
 
+_VOICE_MODES = frozenset({"off", "voice_only", "all"})
+
+
+def _read_json_source(path: Path) -> Any:
+    import json
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise AuxMigrationError(f"{path.name} is unreadable: {exc}") from exc
+
+
+def _kv_set_entries(path: Path) -> List[Tuple[str, str]]:
+    data = _read_json_source(path)
+    if not isinstance(data, list):
+        raise AuxMigrationError(f"{path.name} is not a JSON list")
+    return [(str(item), "") for item in data if str(item).strip()]
+
+
+def _kv_document_entries(path: Path) -> List[Tuple[str, str]]:
+    import json
+
+    data = _read_json_source(path)
+    if not isinstance(data, dict):
+        raise AuxMigrationError(f"{path.name} is not a JSON object")
+    return [
+        (str(key), json.dumps(value, ensure_ascii=False))
+        for key, value in data.items()
+        if isinstance(value, dict)
+    ]
+
+
+def _kv_rich_sent_entries(path: Path) -> List[Tuple[str, str]]:
+    data = _read_json_source(path)
+    if not isinstance(data, dict):
+        raise AuxMigrationError(f"{path.name} is not a JSON object")
+    kept = [
+        (key, value)
+        for key, value in data.items()
+        if isinstance(value, dict) and value.get("t")
+    ]
+    kept.sort(key=lambda item: item[1].get("ts", 0))  # oldest first, like the trim
+    return [(str(key), str(value["t"])) for key, value in kept]
+
+
+def _kv_voice_entries(path: Path) -> List[Tuple[str, str]]:
+    data = _read_json_source(path)
+    if not isinstance(data, dict):
+        raise AuxMigrationError(f"{path.name} is not a JSON object")
+    return [
+        (str(key), mode)
+        for key, mode in data.items()
+        if mode in _VOICE_MODES and ":" in str(key)
+    ]
+
+
+def _kv_estop_entries(path: Path) -> List[Tuple[str, str]]:
+    import json
+
+    # Any sentinel means engaged, even an empty or corrupt one (agent.estop).
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        body = None
+    if not isinstance(body, dict):
+        body = {"engaged_at": None, "reason": None}
+    return [("ESTOP", json.dumps(body, ensure_ascii=False))]
+
+
+def _kv_sources() -> List[
+    Tuple[str, Path, str, Callable[[Path], List[Tuple[str, str]]]]
+]:
+    """``(label, file, namespace, entries)`` for every file the owners used."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    sources: List[Tuple[str, Path, str, Callable[[Path], List[Tuple[str, str]]]]] = [
+        (
+            "voice_mode",
+            home / "gateway_voice_mode.json",
+            KV_VOICE_MODE,
+            _kv_voice_entries,
+        ),
+        (
+            "dead_targets",
+            home / "gateway" / "dead_targets.json",
+            KV_DEAD_TARGETS,
+            _kv_document_entries,
+        ),
+        (
+            "rich_sent",
+            home / "state" / "rich_sent_index.json",
+            KV_RICH_SENT,
+            _kv_rich_sent_entries,
+        ),
+        (
+            "discord_nonconversational",
+            home / "gateway" / "discord_nonconversational_messages.json",
+            KV_DISCORD_NONCONVERSATIONAL,
+            _kv_set_entries,
+        ),
+        ("estop", home / "ESTOP", KV_ESTOP, _kv_estop_entries),
+        (
+            "webhook_subscriptions",
+            home / "webhook_subscriptions.json",
+            KV_WEBHOOK_SUBSCRIPTIONS,
+            _kv_document_entries,
+        ),
+    ]
+    for path in sorted(home.glob("*_threads.json")):
+        platform = path.name[: -len("_threads.json")]
+        sources.append((
+            f"threads:{platform}",
+            path,
+            kv_threads_namespace(platform),
+            _kv_set_entries,
+        ))
+    return sources
+
+
+def _pairing_source_files() -> List[Path]:
+    """Pairing files, the active layout first (its keys win, as the store's
+    own split-directory merge does)."""
+    from hermes_constants import get_hermes_dir, get_hermes_home
+
+    home = get_hermes_home()
+    active = get_hermes_dir("platforms/pairing", "pairing")
+    files: List[Path] = []
+    for directory in (active, home / "platforms" / "pairing", home / "pairing"):
+        if directory.is_dir():
+            files += [
+                path
+                for path in sorted(directory.glob("*.json"))
+                if path.is_file() and path not in files
+            ]
+    return files
+
+
+def migrate_aux_kv_to_pg(profile: str, *, dry_run: bool) -> Dict[str, Any]:
+    """Copy the active authority profile's small state files into ``aux_kv`` (levos 0067).
+
+    Same contract as :func:`migrate_aux_sqlite_to_pg`: files are only read and
+    sha256-checked, a missing file is reported, an entry PostgreSQL already
+    holds wins (a pairing file's keys merge under the ones already stored),
+    every source entry must be present afterwards or everything rolls back
+    (:class:`AuxMigrationError`), running twice inserts nothing and
+    ``dry_run`` rolls back. It is one transaction holding each namespace's
+    lock, so a pod writing the same namespace cannot interleave. The
+    ``.env`` allowlist mirror has nothing to move: on authority the pairing
+    grant rows are the record (see ``gateway.pairing``).
+    """
+    from hermes_constants import get_hermes_home
+    from hermes_state_postgres import _is_active_profile
+
+    if not _is_active_profile(profile):
+        raise ValueError(
+            f"migrate_aux_kv_to_pg runs in the profile's own environment "
+            f"(HERMES_PROFILE / HERMES_HOME); {profile!r} is not the active profile"
+        )
+    if not aux_store_authority():
+        raise RuntimeError(
+            f"profile {profile!r} is not on PostgreSQL authority; nothing to migrate to"
+        )
+    report: Dict[str, Any] = {"profile": profile, "dry_run": dry_run, "stores": {}}
+    conn = open_aux_kv()
+    try:
+        try:
+            with conn:
+                for label, path, namespace, entries in _kv_sources():
+                    report["stores"][label] = _migrate_kv_file(
+                        conn, path, namespace, entries
+                    )
+                pairing = _pairing_source_files()
+                if pairing:
+                    aux_xact_lock(conn, f"kv:{KV_PAIRING}", timeout_seconds=30.0)
+                home = get_hermes_home()
+                for path in pairing:
+                    label = f"pairing:{path.relative_to(home).as_posix()}"
+                    report["stores"][label] = _migrate_pairing_file(conn, path)
+                if dry_run:
+                    raise _DryRun
+        except _DryRun:
+            pass
+    finally:
+        conn.close()
+    for result in report["stores"].values():
+        if result.get("status") == "copied":
+            result["status"] = "dry_run" if dry_run else "migrated"
+    return report
+
+
+def _migrate_kv_file(conn, path: Path, namespace: str, entries) -> Dict[str, Any]:
+    if not path.is_file():
+        return {"status": "missing", "path": str(path)}
+    before = _sha256(path)
+    source = entries(path)
+    aux_xact_lock(conn, f"kv:{namespace}", timeout_seconds=30.0)
+    count = "SELECT COUNT(*) FROM aux_kv WHERE namespace = ?"
+    target_before = conn.execute(count, (namespace,)).fetchone()[0]
+    for key, value in source:
+        aux_kv_put(namespace, key, value, conn=conn, keep_existing=True)
+    present = {key for key, _ in aux_kv_items(namespace, conn=conn)}
+    missing = sum(1 for key, _ in source if key not in present)
+    if missing:
+        raise AuxMigrationError(
+            f"{namespace}: {missing} of {len(source)} source entries are not in "
+            "PostgreSQL after the copy; rolled back"
+        )
+    if _sha256(path) != before:  # pragma: no cover - the file is only read
+        raise AuxMigrationError(f"{namespace}: source file changed during migration")
+    target_after = conn.execute(count, (namespace,)).fetchone()[0]
+    return {
+        "status": "copied",
+        "path": str(path),
+        "sha256": before,
+        "source_rows": len(source),
+        "target_rows_before": target_before,
+        "target_rows_after": target_after,
+        "inserted": target_after - target_before,
+    }
+
+
+def _migrate_pairing_file(conn, path: Path) -> Dict[str, Any]:
+    import json
+
+    before = _sha256(path)
+    source = _read_json_source(path)
+    if not isinstance(source, dict):
+        raise AuxMigrationError(f"pairing {path.name} is not a JSON object")
+    stored_text = aux_kv_get(KV_PAIRING, path.name, conn=conn)
+    stored = json.loads(stored_text) if stored_text else {}
+    merged = {**source, **stored}  # PostgreSQL (then the active layout) wins
+    added = len(merged) - len(stored)
+    if added:
+        aux_kv_put(
+            KV_PAIRING,
+            path.name,
+            json.dumps(merged, indent=2, ensure_ascii=False),
+            conn=conn,
+        )
+    after = json.loads(aux_kv_get(KV_PAIRING, path.name, conn=conn) or "{}")
+    missing = sum(1 for key in source if key not in after)
+    if missing:  # pragma: no cover - the merge above keeps every key
+        raise AuxMigrationError(
+            f"pairing {path.name}: {missing} keys missing; rolled back"
+        )
+    if _sha256(path) != before:  # pragma: no cover - the file is only read
+        raise AuxMigrationError(f"pairing {path.name}: source changed during migration")
+    return {
+        "status": "copied",
+        "path": str(path),
+        "sha256": before,
+        "source_rows": len(source),
+        "target_rows_before": len(stored),
+        "target_rows_after": len(after),
+        "inserted": added,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import json
@@ -1251,8 +1666,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="move the credential stores (profile and root auth.json) instead (levos 0066)",
     )
+    parser.add_argument(
+        "--kv",
+        action="store_true",
+        help="move the small gateway state files (pairing, threads, dead targets, "
+        "voice modes, ESTOP, webhook subscriptions, ...) instead (levos 0067)",
+    )
     args = parser.parse_args(argv)
-    exclusive = [name for name in ("cron", "memory", "auth") if getattr(args, name)]
+    exclusive = [name for name in ("cron", "memory", "auth", "kv") if getattr(args, name)]
     if len(exclusive) > 1:
         parser.error("--" + " / --".join(exclusive) + " are separate moves")
     migrate = migrate_cron_to_pg if args.cron else migrate_aux_sqlite_to_pg
@@ -1260,6 +1681,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         migrate = migrate_memory_to_pg
     if args.auth:
         migrate = migrate_auth_to_pg
+    if args.kv:
+        migrate = migrate_aux_kv_to_pg
     report = migrate(args.profile, dry_run=args.dry_run)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

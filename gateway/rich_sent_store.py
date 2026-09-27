@@ -11,6 +11,10 @@ index.
 
 Best-effort and dependency-free: every operation swallows errors and degrades
 to a no-op / ``None`` so it can never break a send or an inbound message.
+
+On a PostgreSQL-authority profile (levos 0067) the index lives in the profile's
+store (``aux_kv`` namespace ``rich_sent``), so a reply that lands on another pod
+than the send still finds the quoted text.
 """
 
 from __future__ import annotations
@@ -36,9 +40,33 @@ def _key(chat_id, message_id) -> str:
     return f"{chat_id}:{message_id}"
 
 
+def _kv_namespace() -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend."""
+    try:
+        from hermes_aux_store import KV_RICH_SENT, aux_store_authority
+    except ImportError:
+        return None
+    return KV_RICH_SENT if aux_store_authority() else None
+
+
+def _kv_record(namespace: str, key: str, text: str) -> None:
+    from hermes_aux_store import aux_kv_put, aux_kv_transaction, aux_kv_trim
+
+    with aux_kv_transaction(namespace) as conn:
+        aux_kv_put(namespace, key, text, conn=conn)
+        aux_kv_trim(namespace, _MAX_ENTRIES, conn=conn)
+
+
 def record(chat_id, message_id, text: Optional[str]) -> None:
     """Persist ``text`` for ``(chat_id, message_id)``. No-op on any failure."""
     if not text or message_id is None or chat_id is None:
+        return
+    try:
+        namespace = _kv_namespace()
+        if namespace is not None:
+            _kv_record(namespace, _key(chat_id, message_id), text[:_MAX_TEXT_CHARS])
+            return
+    except Exception:
         return
     path = _store_path()
     try:
@@ -71,6 +99,14 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
 def lookup(chat_id, message_id) -> Optional[str]:
     """Return stored text for ``(chat_id, message_id)`` or ``None``."""
     if message_id is None or chat_id is None:
+        return None
+    try:
+        namespace = _kv_namespace()
+        if namespace is not None:
+            from hermes_aux_store import aux_kv_get
+
+            return aux_kv_get(namespace, _key(chat_id, message_id)) or None
+    except Exception:
         return None
     try:
         with open(_store_path(), "r", encoding="utf-8") as fh:

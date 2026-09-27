@@ -146,6 +146,9 @@ from gateway.platforms.helpers import (
     MessageDeduplicator,
     ThreadParticipationTracker,
     convert_table_to_bullets,
+    kv_namespace_if_authority,
+    kv_set_has,
+    kv_set_mark,
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
@@ -327,12 +330,21 @@ def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[s
 
 
 class _DiscordNonConversationalMessageTracker:
-    """Persistent bounded set of Discord message IDs that are status noise."""
+    """Persistent bounded set of Discord message IDs that are status noise.
+
+    On a PostgreSQL-authority profile (levos 0067) the set lives in the
+    profile's store (``aux_kv`` namespace ``discord_nonconversational``), so
+    every pod skips the same status messages when it reads channel history.
+    Best effort either way: a store failure is logged, never raised.
+    """
 
     _MAX_TRACKED = 2000
 
     def __init__(self, max_tracked: int = _MAX_TRACKED):
         self._max_tracked = max_tracked
+        self._kv_namespace = kv_namespace_if_authority(
+            lambda kv: kv.KV_DISCORD_NONCONVERSATIONAL
+        )
         self._ids: dict[str, None] = dict.fromkeys(self._load())
 
     def _state_path(self) -> _Path:
@@ -345,6 +357,18 @@ class _DiscordNonConversationalMessageTracker:
         )
 
     def _load(self) -> list[str]:
+        if self._kv_namespace is not None:
+            try:
+                from hermes_aux_store import aux_kv_items
+
+                return [key for key, _ in aux_kv_items(self._kv_namespace)]
+            except Exception:
+                logger.warning(
+                    "[%s] Failed to load non-conversational Discord IDs from PostgreSQL",
+                    "Discord",
+                    exc_info=True,
+                )
+                return []
         path = self._state_path()
         if not path.exists():
             return []
@@ -367,17 +391,39 @@ class _DiscordNonConversationalMessageTracker:
             logger.debug("[%s] Failed to save non-conversational Discord IDs", "Discord", exc_info=True)
 
     def mark_many(self, message_ids: List[str]) -> None:
-        changed = False
+        added = []
         for message_id in message_ids:
             key = str(message_id or "").strip()
             if key and key not in self._ids:
                 self._ids[key] = None
-                changed = True
-        if changed:
+                added.append(key)
+        if added and self._kv_namespace is not None:
+            try:
+                kv_set_mark(self._kv_namespace, added, self._max_tracked, self._ids)
+            except Exception:
+                logger.warning(
+                    "[%s] Failed to save non-conversational Discord IDs to PostgreSQL",
+                    "Discord",
+                    exc_info=True,
+                )
+        elif added:
             self._save()
 
     def __contains__(self, message_id: str) -> bool:
-        return str(message_id or "") in self._ids
+        key = str(message_id or "")
+        if key in self._ids:
+            return True
+        if self._kv_namespace is None or not key:
+            return False
+        try:
+            return kv_set_has(self._kv_namespace, key, self._ids)
+        except Exception:
+            logger.warning(
+                "[%s] Failed to read non-conversational Discord IDs from PostgreSQL",
+                "Discord",
+                exc_info=True,
+            )
+            return False
 
 
 def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> bool:
