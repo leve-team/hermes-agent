@@ -111,6 +111,10 @@ class _SchemaHarness:
         self.executed.append(sql)
         if self.fail_on and self.fail_on in sql:
             raise PermissionError("injected schema permission failure")
+        if sql == "SELECT COALESCE(current_schema(), 'public')":
+            return _Rows([("public",)])
+        if sql.startswith(("SELECT pg_try_advisory_lock(", "SELECT pg_advisory_unlock(")):
+            return _Rows([(True,)])  # levos 0070 schema lock around init/finalize
         trigger_result = self.trigger_ddl.execute(sql)
         if trigger_result is not None:
             return trigger_result
