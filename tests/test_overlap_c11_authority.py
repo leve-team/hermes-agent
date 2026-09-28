@@ -20,9 +20,7 @@ levos/pg3 (0.21.2) port: the dashboard reconcile is in
 ``hermes_cli.web_routers.status``, the session opener in
 ``hermes_cli.web_server_sessions``; the watcher signatures live in
 ``tui_gateway/change_watcher.py`` (published onto ``tui_gateway.server``) and
-mcp serve's signal is ``_read_state_db_mtime``. Cron jobs reach PostgreSQL
-only with levos 0060 (``cron.jobs._jobs_store_is_pg``); the cases that create
-a cron job skip without it.
+mcp serve's signal is ``_read_state_db_mtime``.
 """
 
 from __future__ import annotations
@@ -60,16 +58,6 @@ def _clean_backend_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     yield
     _drop_signal_connections()
-
-
-def _require_cron_on_postgres():
-    from cron import jobs as cron_jobs
-
-    if not hasattr(cron_jobs, "_jobs_store_is_pg"):
-        pytest.skip(
-            "cron jobs follow PostgreSQL authority only with levos 0060 "
-            "(cron.jobs._jobs_store_is_pg), which is not on this branch"
-        )
 
 
 def _drop_signal_connections():
@@ -269,7 +257,6 @@ def test_watchers_on_one_pod_see_writes_from_the_other_pod(authority, pods):
     """B-F16: pod A writes a turn and a cron job; pod B's tui watcher fires
     cron.changed + sessions.changed and its mcp bridge delivers the message.
     Neither pod has state.db or cron/jobs.json."""
-    _require_cron_on_postgres()
     writer_home, watcher_home = pods
     events, go, written = _SPAWN.Queue(), _SPAWN.Event(), _SPAWN.Event()
     processes = [
@@ -405,7 +392,6 @@ def test_sessions_signal_moves_on_every_write_and_rests_otherwise(authority):
 
 
 def test_cron_signal_reads_a_missing_table_without_creating_it(authority):
-    _require_cron_on_postgres()
     from cron import jobs as cron_jobs
 
     assert aux.aux_change_signal("cron_jobs") == ("cron_jobs", None)
