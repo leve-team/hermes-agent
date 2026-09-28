@@ -56,15 +56,27 @@ class DeadTargetRegistry:
         self._lock = threading.RLock()
         self._dead: Dict[str, Dict[str, object]] = {}
         self._path = path if path is not None else get_hermes_home() / "gateway" / "dead_targets.json"
-        # An explicit path pins the file; the default one follows PostgreSQL authority.
-        self._kv_namespace = _kv_namespace() if path is None else None
-        if self._kv_namespace is not None:
-            return
+        # An explicit path pins the file; the default one follows PostgreSQL authority, resolved on
+        # first use (resolving reads config.yaml, which a bare construction must not do).
+        self._kv_namespace: Optional[str] = None
+        self._resolved = path is not None
+        if self._resolved:
+            self._load_file()
+
+    def _load_file(self) -> None:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8")) if self._path.exists() else {}
             self._dead = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
         except (OSError, ValueError) as exc:
             logger.debug("dead_targets: could not load %s (%s) — starting empty", self._path, exc)
+
+    def _resolve_locked(self) -> None:
+        if self._resolved:
+            return
+        self._kv_namespace = _kv_namespace()
+        if self._kv_namespace is None:
+            self._load_file()
+        self._resolved = True
 
     def _kv(self, operation: str, call, fallback):
         """Run *call* on the PostgreSQL set; on failure log and use *fallback*."""
@@ -86,6 +98,7 @@ class DeadTargetRegistry:
 
     def is_dead(self, platform: str, chat_id: Optional[str]) -> bool:
         with self._lock:
+            self._resolve_locked()
             if chat_id and self._kv_namespace is not None:
                 from hermes_aux_store import aux_kv_get
 
@@ -100,6 +113,7 @@ class DeadTargetRegistry:
             return False
         key = _normalize(platform, chat_id)
         with self._lock:
+            self._resolve_locked()
             existed = key in self._dead
             self._dead[key] = {"platform": str(platform).strip().lower(), "chat_id": str(chat_id),
                                "reason": str(reason)[:200], "marked_at": time.time()}
@@ -119,6 +133,7 @@ class DeadTargetRegistry:
             return False
         key = _normalize(platform, chat_id)
         with self._lock:
+            self._resolve_locked()
             if self._kv_namespace is not None:
                 from hermes_aux_store import aux_kv_delete
 
