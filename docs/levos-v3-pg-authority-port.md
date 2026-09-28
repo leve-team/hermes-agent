@@ -93,3 +93,81 @@ The original tests use the fork's ephemeral Unix-socket PostgreSQL
 (`initdb` / `pg_ctl` on `PATH` or in `PG3_PERCENT_PG_BIN`, fixture
 `tests/test_pg3_writer_local_follow_backend.py::postgres_dsn`), which
 `levos/pg3` already carries unchanged; 0059's test used py-pglite.
+
+## 2. Ported items
+
+"Tests" run on the fork's ephemeral PostgreSQL (`initdb`/`pg_ctl`,
+`PG3_PERCENT_PG_BIN`); every case below ran on a real PostgreSQL 16 server.
+
+| Patch | pg3 implementation | Test | Skip |
+|---|---|---|---|
+| db60c64db read_only reaches PG | already on pg3 (`hermes_state_postgres.open_store_for_home`); contract tests only | `tests/test_pg_reader_seam.py::test_readonly_pg_profile_open_rejects_writes_on_the_server` (real PG: no DDL, 25006, no row), `::test_readonly_pg_profile_open_uses_readonly_connection` (driver fake); `tests/test_pg_parity_smoke.py::test_a7c_readonly_pg_profile_open_rejects_insert` (original, Docker) | a7c: the whole parity module skips without a Docker daemon (pg3 convention, unchanged) |
+| f1d844e30 NULL-safe CAS | `hermes_state_titles.py` (`_set_session_title`), `hermes_state_messages.py` (`set_latest_user_api_content`, `set_message_api_content`) | `tests/test_pg_reader_seam.py::test_null_safe_cas_statements_run_verbatim_on_postgres` (red on base: PG `SyntaxError at $4`) | — |
+| shared | `hermes_aux_store.py` = original after 0070 minus 0061 (`AuxSessionLock.held`), 0062 (turn/pending/tui stores), 0063 (lease helpers) | all below | — |
+| 0059 aux stores | `hermes_aux_store.open_aux_store`; `agent/verification_evidence.py` (`_connect`, `_initialize_connection`); `gateway/platforms/api_server.py` (`ResponseStore._db`, `_initialize_response_store`, 503 `aux_store_unavailable_middleware`); `hermes_cli/projects_db.py:connect` → existing `projects_postgres`/`kanban_postgres` adapter with the session DSN (no second implementation); `plugins/platforms/discord/recovery.py`, `adapter.py` (close + PG boolean binds) | `tests/test_aux_store_authority.py` (moved from py-pglite to the real PG fixture) | — |
+| 0060 cron stores/locks | `cron/executions.py` (PG ledger incl. pg3's handoff/adopt lifecycle, server-clock leases, `IS NOT DISTINCT FROM` CAS), `cron/incidents.py` (pg3 keeps incidents in `executions.db`: `core_cron_incidents`), `cron/notepad.py`, `cron/jobs.py` (`core_cron_jobs`, `_jobs_lock` xact lock, `_fire_job_lock` session lock), `cron/scheduler.py:tick` (`cron-tick` lock), `agent/curator_backup.py` | `tests/test_cron_pg_authority.py` | 1: `heartbeat_fire_claim` fenced by the fire lock — pg3 deliberately takes the heartbeat out of that fence (serialised by `_jobs_lock` on every backend) |
+| 0068 cron outputs/scripts/suggestions | `cron/durable.py` (new), `cron/jobs.py` (`remove_job`, `save_job_output`), `cron/monitor.py`, `cron/scheduler_prompt.py` (`_usable_context_output`), `cron/scheduler_script.py` (`_resolve_script_path` restore), `cron/suggestions.py`, `tools/cronjob_job_args.py` (`_store_cron_scripts`), `tools/cronjob_tools.py` | `tests/test_cron_overlap_c10.py` | — |
+| 0065 memory | `tools/memory_tool_store.py` (`MemoryStore` authority branch + PG helpers), `tools/memory_tool.py` (re-exports), `agent/learning_graph.py`, `agent/learning_mutations.py` | `tests/test_memory_pg_authority.py` | — |
+| 0066 credentials | `hermes_cli/auth.py` (`_load_auth_store`, `_save_auth_store`, `_auth_store_lock`, `_load_global_auth_store`, `_auth_pg_*`) + first-load seed `_auth_pg_seed` | `tests/test_auth_pg_authority.py` | — |
+| 0067 gateway small state | `agent/estop.py`, `gateway/dead_targets.py`, `gateway/pairing.py`, `gateway/platforms/helpers.py`, `gateway/platforms/webhook.py`, `gateway/rich_sent_store.py`, `gateway/run_voice.py` (pg3's voice mixin; `gateway/run.py` itself needed no change), `hermes_cli/subcommands/pause.py`, `hermes_cli/webhook.py` (incl. whole-set `_save_subscriptions` used by the dashboard's `web_routers/ops.py`), `plugins/platforms/discord/adapter.py` (non-conversational tracker) | `tests/test_aux_kv_pg_authority.py` | — |
+| 0069 state.db file dependency | `acp_adapter/session.py`, `hermes_cli/web_server_lifecycle.py`, `hermes_cli/web_routers/status.py`, `mcp_serve.py` (`_read_state_db_mtime`), `tui_gateway/change_watcher.py` (`_sessions_sig`, new `_cron_sig`); `tui_gateway/server.py` needed no change | `tests/test_overlap_c11_authority.py` | — |
+| 0070 core schema lock | `hermes_state_pg_schema.py` (`init_postgres_schema` / `finalize_postgres_schema` under `schema:core`, `SCHEMA_LOCK_WAIT_SECONDS = 60`, old body `_init_postgres_schema_locked`) | `tests/test_core_schema_pg_lock.py`; fakes in `tests/test_pg_schema_parity.py`, `tests/test_pg_token_counter_width.py` answer the lock statements | `test_pg_token_counter_width.py` does not collect on `levos/pg3` before or after this change (imports a helper pg3 no longer has); pre-existing, left as is |
+
+### Card additions beyond the original patches
+
+- **Credential seed (0066).** The v3 launcher copies `/run/secrets/hermes/auth.json`
+  to `HERMES_HOME/auth.json` only when that file is absent. On authority, the
+  first load of a store whose PostgreSQL row (`profile` / `root`) does not exist
+  imports the local file once (`INSERT … ON CONFLICT DO NOTHING` under the
+  store's advisory lock, same validation as `migrate_auth_to_pg`; an invalid
+  file raises instead of seeding an empty store). An existing row always wins:
+  the local file never overwrites PostgreSQL, and the file is neither written
+  nor removed. Tests: `test_authority_first_load_seeds_an_absent_row_once_from_the_local_file`,
+  `test_authority_existing_row_wins_over_the_local_file` (A in PG, B on disk →
+  A read back, document and `updated_at` unchanged),
+  `test_authority_seed_refuses_an_invalid_local_file`.
+- **First-run migration counts.** Besides "a re-run inserts 0", the one-shot
+  moves assert *source entries on the first run = entries in PostgreSQL*:
+  credentials (`test_auth_migration_first_run_reflects_every_source_key_in_postgres`),
+  memory (`tests/test_memory_pg_authority.py`), cron (executions, incidents,
+  notes, jobs in `tests/test_cron_pg_authority.py`) and the gateway key-value
+  files (`test_kv_migration_is_idempotent_and_leaves_the_sources_untouched`).
+- **Cron incidents.** pg3 added an incidents table to `executions.db`; on
+  authority it moves with the ledger (`core_cron_incidents`), otherwise a failing
+  job would still create a file under `cron/`.
+
+## 3. No SQLite / file fallback on authority
+
+Every authority branch opens through `open_aux_store`, `open_aux_postgres`,
+`connect_aux_postgres`, `aux_kv_*`, `AuxSessionLock` / `aux_xact_lock` or
+`aux_change_signal`; each raises `AuxStoreUnavailable` (message without the
+DSN) when PostgreSQL cannot serve, and none of them opens SQLite, `:memory:` or
+a file. The only deliberate fail-safe answers are the ones the original
+defines: ESTOP reads as *engaged* and the rich-send index as *absent* when the
+store cannot answer. Each test module runs authority against an unreachable
+DSN and asserts the raise plus an empty state directory
+(`test_authority_without_postgres_*`, `test_change_signal_off_authority_or_unreachable_raises`).
+Non-authority backends (`sqlite`, `probe`) keep their files, SQLite databases
+and flocks; each module has a `test_non_authority_*` case.
+
+The one-shot moves stay operator actions, as in the original:
+`python -m hermes_aux_store --profile <p> [--cron|--memory|--auth|--kv] [--dry-run]`
+(plus `cron.durable.migrate_cron_files_to_pg` for 0068's files). Only the
+credential store seeds itself (above).
+
+## 4. Out of scope / remaining
+
+- 0061 messaging single connection, 0062 turn ownership / pending messages /
+  tui markers, 0063 delivery obligations / async delegation leases, 0064
+  routing index — next cards. Their files (`gateway/status.py`,
+  `gateway/platforms/base.py`, `gateway/session.py`, `gateway/turn_owner.py`,
+  `gateway/delivery_ledger.py`, `tools/async_delegation.py`,
+  `tui_gateway/turn_marker.py`, `plugins/platforms/telegram/`) are untouched.
+- Stores that are new in 0.21.2 and were not part of any v2 patch still use the
+  pod disk on authority: `gateway/platforms/api_server_run_idempotency.py`
+  (`runs_idempotency.db`) and `cron/delivery_queue.py` (restart-safe worker
+  delivery queue, pid-based ownership).
+- `docs/quality/rule-index.md` referenced by the card does not exist in this
+  repository (no `docs/quality/`); the root `AGENTS.md` rules (tests through
+  real imports against a temp `HERMES_HOME`, no new `HERMES_*` env var,
+  behaviour-contract tests) were followed instead.
