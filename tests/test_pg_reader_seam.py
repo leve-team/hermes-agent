@@ -459,3 +459,49 @@ def test_null_safe_cas_statements_run_verbatim_on_postgres(tmp_path, postgres_ds
         assert raw.execute("SELECT title FROM sessions").fetchone()[0] == "first"
         assert raw.execute("SELECT api_content FROM messages").fetchone()[0] == "api-bytes"
         raw.execute("DROP TABLE sessions, messages")
+
+
+def test_readonly_pg_profile_open_uses_readonly_connection(monkeypatch):
+    """Docker-free half of db60c64db: the flag the seam forwards (pinned by
+    ``test_profile_readers_reach_the_configured_store``) selects the read-only
+    PostgreSQL open — ``default_transaction_read_only`` first, no schema init —
+    while the writable open initialises the schema and never sets read-only."""
+    import types
+
+    import hermes_state_pg_schema as pg_schema
+
+    executed, init_calls = [], []
+
+    class _RecordingConn:
+        def execute(self, sql, params=()):
+            executed.append(sql.strip())
+            if "information_schema.tables" in sql:
+                return types.SimpleNamespace(fetchone=lambda: (1,))
+            return types.SimpleNamespace(fetchone=lambda: None)
+
+        def commit(self):
+            executed.append("COMMIT")
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            return None
+
+    recording = _RecordingConn()
+    expected_version = max(m.version for m in pg_schema._PG_ONLY_MIGRATIONS)
+    monkeypatch.setattr(hermes_state_postgres, "connect_postgres", lambda dsn: recording)
+    monkeypatch.setattr(pg_schema, "init_postgres_schema", lambda conn, v: init_calls.append(conn))
+    monkeypatch.setattr(pg_schema, "postgres_migration_version", lambda conn: expected_version)
+    monkeypatch.setattr(pg_schema, "postgres_schema_version", lambda conn: 1)
+
+    dsn = "postgresql://user:pw@db.invalid/test"
+    assert hermes_state_postgres.maybe_open_postgres(True, 1, dsn_override=dsn) is recording
+    assert init_calls == [], "read-only profile open ran schema init"
+    assert executed and "default_transaction_read_only" in executed[0].lower()
+    assert executed[0].lower().endswith(" on")
+
+    executed.clear()
+    assert hermes_state_postgres.maybe_open_postgres(False, 1, dsn_override=dsn) is recording
+    assert init_calls == [recording]
+    assert not any("default_transaction_read_only" in s.lower() for s in executed)
