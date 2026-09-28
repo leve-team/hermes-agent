@@ -49,7 +49,18 @@ def _get_sessions_dir() -> Path:
     return _hermes_home() / "sessions"
 
 
-def _read_state_db_mtime() -> float:
+def _read_state_db_mtime():
+    """What moves when any process writes the session store.
+
+    SQLite: state.db's mtime. PostgreSQL authority (levos 0069): no writer touches that file —
+    and an overlapping pod writes another disk — so the profile store's own digest
+    (``hermes_aux_store.aux_change_signal``). A PostgreSQL failure raises; the poll loop logs
+    it and retries next tick.
+    """
+    from hermes_aux_store import aux_change_signal, aux_store_authority
+
+    if aux_store_authority():
+        return aux_change_signal("sessions")
     try:
         return (_hermes_home() / "state.db").stat().st_mtime
     except OSError:  # missing file included
@@ -358,7 +369,10 @@ class EventBridge:
         if not db:
             return
         try:
-            self._state_db_mtime = _read_state_db_mtime()
+            try:
+                self._state_db_mtime = _read_state_db_mtime()
+            except Exception:
+                self._state_db_mtime = 0.0
             try:
                 self._cached_sessions_index = _load_sessions_index()
             except Exception:

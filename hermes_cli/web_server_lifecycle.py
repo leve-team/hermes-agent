@@ -180,9 +180,18 @@ def _eager_reconcile_own_session_db() -> None:
     bootstraps a missing store and heals a stale/malformed schema through ONE
     writable open, so the #79531 contract holds. Never raises: an unfixable
     store still gets the per-poll read-probe heal.
+
+    On PostgreSQL authority there is no own state.db to reconcile (levos
+    0069): session reads already go to the profile's store, whose schema the
+    gateway's writable open owns, and the open here would only leave an empty
+    SQLite file on the pod's disk.
     """
     try:
+        from hermes_aux_store import aux_store_authority
         from hermes_state import _default_db_path
+
+        if aux_store_authority():
+            return
 
         from hermes_cli.web_server_sessions import _open_session_db_at_path
 

@@ -115,6 +115,26 @@ def _pet_changed_payload() -> dict:
     return {"enabled": False}
 
 
+def _state_authority() -> bool:
+    """True on a PostgreSQL-authority profile (levos 0069): nothing writes state.db or
+    cron/jobs.json there, and an overlapping pod writes another disk, so the signatures below
+    read the profile's store instead (``hermes_aux_store.aux_change_signal``; a PostgreSQL
+    failure raises and the watcher skips that tick)."""
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
+def _cron_sig():
+    """mtime of the profile's cron/jobs.json — moves on create/edit/pause/remove AND on
+    scheduler tick bookkeeping (last_run/next_run)."""
+    if _state_authority():
+        from hermes_aux_store import aux_change_signal
+
+        return aux_change_signal("cron_jobs")
+    return _home_mtime_ns("cron", "jobs.json")
+
+
 def _sessions_sig():
     """Newest mtime across state.db + WAL: the one thing messaging-gateway turns and cron runs
     all move. Served sibling profile homes are probed too, else a routed Bot Chat never refreshes.
@@ -123,6 +143,14 @@ def _sessions_sig():
     gateway's transports; the shared SQLite file is the one thing they all move (#58671). A backend serving
     several profiles owns one store per profile, so every served sibling home is
     """
+    if _state_authority():
+        from hermes_aux_store import aux_change_signal
+
+        # The own profile's store; served sibling homes keep their files' signal.
+        siblings = _newest_mtime_ns(
+            root / name for root in _served_profile_homes for name in ("state.db", "state.db-wal"))
+        signal = aux_change_signal("sessions")
+        return signal if siblings is None else (signal, siblings)
     return _newest_mtime_ns(
         root / name
         for root in (_watcher_home(), *_served_profile_homes)
@@ -176,7 +204,7 @@ def _bot_relay_outbox_sig():
 # persists platform connect/disconnect/health (the Messaging page's status signal).
 _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
-    "cron.changed": (1.0, lambda: _home_mtime_ns("cron", "jobs.json"), lambda: {}),
+    "cron.changed": (1.0, _cron_sig, lambda: {}),
     "sessions.changed": (0.5, _sessions_sig, lambda: {}),
     "platforms.changed": (2.0, lambda: _home_mtime_ns("gateway_state.json"), lambda: {}),
     "pairing.changed": (2.0, _pairing_sig, lambda: {}),

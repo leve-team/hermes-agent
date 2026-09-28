@@ -271,8 +271,14 @@ class SessionManager:
         ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured."""
         if self._db_instance is None:
             try:
+                from hermes_aux_store import aux_store_authority
                 from hermes_state import SessionDB
-                self._db_instance = SessionDB(db_path=get_hermes_home() / "state.db")
+                # levos 0069: an explicit db_path pins SQLite. On PostgreSQL authority
+                # the history belongs in the profile's store.
+                if aux_store_authority():
+                    self._db_instance = SessionDB()
+                else:
+                    self._db_instance = SessionDB(db_path=get_hermes_home() / "state.db")
             except Exception:
                 logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
         return self._db_instance
