@@ -38,21 +38,30 @@ _BACKEND_ENV = (
 )
 
 
+_REAL_RUN_AFTER_AGENT_READY = server._run_after_agent_ready
+
+
 class FakeTurns:
-    """``_run_after_agent_ready`` stand-in: stores the user row (the agent's flush),
-    optionally holds the turn open on ``gate``, then ends it like the real thread."""
+    """``_run_after_agent_ready`` stand-in: stores the user row (the agent's flush) — or,
+    for a resumed turn, only the reply to the stored one — optionally holds the turn
+    open on ``gate``, then ends it like the real thread."""
 
     def __init__(self, db):
         self.db = db
         self.texts: list = []
+        self.stored_rows: list = []
         self.gate: threading.Event | None = None
         self.persist = True
         self._lock = threading.Lock()
 
-    def __call__(self, rid, sid, session, text, display_kind, callback, turn_author=None):
+    def __call__(self, rid, sid, session, text, display_kind, callback, turn_author=None,
+                 stored_user_row=None):
         with self._lock:
             self.texts.append(text)
-        if self.persist:
+            self.stored_rows.append(stored_user_row)
+        if stored_user_row is not None:
+            self.db.append_message(session["session_key"], "assistant", f"reply: {text}")
+        elif self.persist:
             self.db.append_message(session["session_key"], "user", text)
         if self.gate is not None:
             assert self.gate.wait(20)
@@ -133,6 +142,32 @@ def _user_rows(db, key: str) -> list:
 
 def _ids() -> str:
     return uuid.uuid4().hex
+
+
+def _rows(db, key: str, role: str) -> list:
+    return [m["content"] for m in db.get_messages_as_conversation(key) if m.get("role") == role]
+
+
+def _kill_owner(postgres_dsn, key: str, msg: str) -> None:
+    """The owning process dies: its lease lapses and nothing of it is live here."""
+    with psycopg.connect(postgres_dsn, autocommit=True) as raw:
+        raw.execute(
+            "UPDATE core_submit_accepts SET owner = 'dead-pod:1:gone', lease_until = 0 "
+            "WHERE client_msg_id = %s", (msg,))
+    idem._unregister_live((key, msg))
+
+
+def _die_after_storing(turns, postgres_dsn, sid: str, key: str, msg: str, text: str, partial=None):
+    """Submit *text*; its turn stores the user row (and *partial*, an assistant row the
+    dead turn got out), then its process dies before the reply."""
+    turns.gate = threading.Event()
+    assert _submit(sid, text, client_msg_id=msg)["result"]["status"] == "streaming"
+    if partial is not None:
+        turns.db.append_message(key, "assistant", partial)
+    _kill_owner(postgres_dsn, key, msg)
+    turns.gate.set()
+    _settle(sid)  # the dead owner's settle is fenced off: nobody completes the record
+    turns.gate = None
 
 
 # ① same id twice -> one user turn, the second answer is the recorded state
@@ -389,3 +424,130 @@ def test_unreachable_authority_store_refuses_without_files(monkeypatch):
     finally:
         for sid in sids:
             server._sessions.pop(sid, None)
+
+
+# ⑨ persisted + owner died + no reply -> the retry answers the stored message (t_7ceb9994)
+def test_stored_message_whose_owner_died_is_resumed_once(authority, postgres_dsn):
+    db, turns, sids = authority
+    created = _create(sids)
+    sid, key, msg = created["session_id"], created["stored_session_id"], _ids()
+    _die_after_storing(turns, postgres_dsn, sid, key, msg, "answer me")
+    state = _rpc("prompt.accepted", {"client_msg_id": msg, "stored_session_id": key})["result"]["submit"]
+    assert (state["state"], state["running"], state["needs_attention"]) == ("persisted", False, "no_reply")
+
+    resumed = _submit(sid, "answer me", client_msg_id=msg)["result"]
+    assert (resumed["status"], resumed["attempts"], resumed["running"]) == ("resumed", 2, True)
+    assert resumed["user_message_id"] == state["user_message_id"]
+    _settle(sid)
+    again = _submit(sid, "answer me", client_msg_id=msg)["result"]
+    assert (again["status"], again["state"], again["running"]) == ("duplicate", "completed", False)
+    assert turns.stored_rows == [None, state["user_message_id"]]
+    assert _rows(db, key, "user") == ["answer me"]
+    assert _rows(db, key, "assistant") == ["reply: answer me"]
+
+
+# ⑩ the dead turn already got a (partial) reply or tool call out -> never re-run
+def test_stored_message_with_a_partial_reply_is_not_rerun(authority, postgres_dsn):
+    db, turns, sids = authority
+    created = _create(sids)
+    sid, key, msg = created["session_id"], created["stored_session_id"], _ids()
+    _die_after_storing(turns, postgres_dsn, sid, key, msg, "delete the tmp dir", partial="Deleting now…")
+
+    for _ in range(2):
+        reply = _submit(sid, "delete the tmp dir", client_msg_id=msg)["result"]
+        assert (reply["status"], reply["state"], reply["running"]) == ("duplicate", "persisted", False)
+        assert (reply["needs_attention"], reply["attempts"]) == ("partial_reply", 1)
+    assert turns.texts == ["delete the tmp dir"]
+    assert _rows(db, key, "user") == ["delete the tmp dir"]
+    assert _rows(db, key, "assistant") == ["Deleting now…"]
+
+
+# ⑪ concurrent retries of a dead stored turn -> one resumed turn
+def test_concurrent_retries_resume_a_dead_turn_once(authority, postgres_dsn):
+    db, turns, sids = authority
+    created = _create(sids)
+    sid, key, msg = created["session_id"], created["stored_session_id"], _ids()
+    _die_after_storing(turns, postgres_dsn, sid, key, msg, "still there?")
+    turns.gate = threading.Event()
+    start, replies = threading.Barrier(4), []
+
+    def send():
+        start.wait()
+        replies.append(_submit(sid, "still there?", client_msg_id=msg)["result"])
+
+    senders = [threading.Thread(target=send) for _ in range(4)]
+    for sender in senders:
+        sender.start()
+    for sender in senders:
+        sender.join(30)
+    assert sorted(r["status"] for r in replies) == ["duplicate", "duplicate", "duplicate", "resumed"], replies
+    assert all(r["running"] for r in replies)
+    turns.gate.set()
+    _settle(sid)
+    assert len([row for row in turns.stored_rows if row is not None]) == 1
+    assert _rows(db, key, "user") == ["still there?"]
+    assert _rows(db, key, "assistant") == ["reply: still there?"]
+
+
+def _model_agent(db, session_key: str, answer: str):
+    """A real AIAgent on the profile's store whose model is a stand-in recording each request."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1", model="test/model",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            session_db=db, session_id=session_key, platform="tui")
+    agent._disable_streaming = True
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=answer, tool_calls=None), finish_reason="stop")],
+        model="test/model",
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8))
+    return agent
+
+
+# ⑫ the resumed turn runs the real core: the model gets the stored message exactly once
+def test_resumed_turn_sends_the_stored_message_to_the_model_once(authority, postgres_dsn, monkeypatch):
+    db, turns, sids = authority
+    create_id = _ids()
+    created = _create(sids, client_create_id=create_id)
+    sid, key, msg = created["session_id"], created["stored_session_id"], _ids()
+    assert _submit(sid, "earlier question", client_msg_id=_ids())["result"]["status"] == "streaming"
+    _settle(sid)
+    db.append_message(key, "assistant", "earlier answer")
+    _die_after_storing(turns, postgres_dsn, sid, key, msg, "what is next?")
+
+    server._sessions.clear()  # the pod is replaced
+    monkeypatch.setattr(idem, "OWNER", "replacement-pod:1:new")
+    resumed_session = _create(sids, client_create_id=create_id)
+    assert resumed_session["idempotency"] == "resumed"
+    session = server._sessions[sid]
+    agent = _model_agent(db, key, "the answer")
+    session["agent"], session["agent_ready"] = agent, threading.Event()
+    session["agent_ready"].set()
+    monkeypatch.setattr(server, "_run_after_agent_ready", _REAL_RUN_AFTER_AGENT_READY)
+    for name in ("_wire_callbacks", "_sync_agent_model_with_config", "_sync_agent_compression_with_config",
+                 "_apply_pending_model_switch", "_sync_bot_capabilities", "_emit_settled_session_info"):
+        monkeypatch.setattr(server, name, lambda *_a, **_k: None)
+
+    reply = _submit(sid, "what is next?", client_msg_id=msg)["result"]
+    assert reply["status"] == "resumed"
+    _settle(sid)
+
+    sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    conversation = [(m["role"], m["content"]) for m in sent if m["role"] != "system"]
+    assert conversation == [
+        ("user", "earlier question"), ("assistant", "earlier answer"), ("user", "what is next?")]
+    assert _rows(db, key, "user") == ["earlier question", "what is next?"]
+    assert _rows(db, key, "assistant") == ["earlier answer", "the answer"]
+    final = _rpc("prompt.accepted", {"client_msg_id": msg, "stored_session_id": key})["result"]["submit"]
+    assert (final["state"], final["running"], final["attempts"]) == ("completed", False, 2)

@@ -122,7 +122,10 @@ keeps moving `updated_at`.
 | situation | reply |
 |---|---|
 | new id | `{"status": "streaming", "client_msg_id", "state": "accepted", "running": true, "stored_session_id", "attempts": 1, ...}` |
-| same id, same text, record `persisted`/`completed`, or its owner is live | `{"status": "duplicate", "state", "running", "stored_session_id", "user_message_id", "accepted_at", "completed_at", "attempts"}` — no new turn |
+| same id, same text, record `completed`, or its owner is live | `{"status": "duplicate", "state", "running", "stored_session_id", "user_message_id", "accepted_at", "completed_at", "attempts", "needs_attention"}` — no new turn |
+| `persisted`, no live owner, **nothing** after its user row (`needs_attention: "no_reply"`) | the turn runs once more **on the stored user row** (no second user row; the model gets the stored conversation + that message once): `{"status": "resumed", "state": "persisted", "running": true, "user_message_id", "attempts": n+1, ...}` |
+| `persisted`, no live owner, an `assistant`/`tool` row after its user row (a partial reply or tool call got out) | `{"status": "duplicate", "state": "persisted", "running": false, "needs_attention": "partial_reply", ...}` — never re-run (a tool side effect would repeat) |
+| `persisted`, no live owner, only later `user` rows after it | `{"status": "duplicate", ..., "needs_attention": "later_messages"}` — never re-run (the conversation moved on) |
 | same id, other text | error **4141**, `data.reason = "client_msg_id_conflict"` + the record |
 | `accepted`, no user row above the watermark, no live owner | the turn runs again: `{"status": "streaming", ..., "attempts": n+1}` |
 | id malformed | error **4140**, `data.reason = "invalid_client_id"` |
@@ -133,16 +136,28 @@ keeps moving `updated_at`.
 another process whose lease (`lease_until`, 60 s, refreshed every 20 s by a
 per-process heartbeat while its turn runs) has not lapsed.
 
+`needs_attention` (every record payload, including `prompt.accepted`) is
+`null` unless the record is `persisted` with no live owner — a turn that died
+after storing the message — and then says what follows its user row in the
+session lineage: `no_reply` (nothing: a same-id re-send resumes it),
+`partial_reply` (an `assistant`/`tool` row: a human or operator decides) or
+`later_messages` (only later `user` rows). Resumes and restarts of one id are
+serialized by the same advisory lock, so concurrent re-sends run at most one
+turn; the others answer `duplicate` with `running: true`.
+
 ### State transitions
 
 | from | event | to |
 |---|---|---|
 | — | claim (new id) | `accepted`, owner = this process, lease running |
 | `accepted` | a `user` row above the watermark appears in the session lineage (seen by any read: duplicate, `prompt.accepted`, settle) | `persisted`, `user_message_id` set |
-| `accepted`/`persisted` | the owner's turn thread ends and the user row exists | `completed`, owner cleared |
+| `accepted`/`persisted` | the owner's (or resumer's) turn thread ends and the user row exists | `completed`, owner cleared |
 | `accepted` | the owner's turn thread ends without a user row (agent init failed, cancelled before start) | `accepted`, owner cleared → the next retry restarts |
 | `accepted` | owner died (lease lapsed), no user row | unchanged until a retry: restart, `attempts + 1` |
-| `persisted` | owner died | stays `persisted` (never re-run: the message is stored) |
+| `persisted` | owner died | stays `persisted`, `needs_attention` set on read |
+| `persisted` + `no_reply` | same-id, same-text re-send | `persisted`, owner = this process, lease running, `attempts + 1`; the turn runs on the stored row (reply `resumed`), then `completed` |
+| `persisted` + `partial_reply`/`later_messages` | re-send | unchanged (reply `duplicate`) |
+| `persisted` (resumed) | the resuming turn could not start | `persisted`, owner cleared |
 | `accepted` (fresh) | the turn could not start after the claim (session row write failed) | record deleted |
 
 ### `session.create` + `client_create_id` (string, 1–128 chars)
@@ -181,18 +196,29 @@ conversation it creates):
    (it is safe to call on every reconnect). Use the returned `session_id`
    for this connection; keep `stored_session_id`.
 2. Before re-sending: `prompt.accepted {client_msg_id, stored_session_id}`.
-   * `submit.state` `persisted`/`completed` → delivered; drop it from
+   * `submit.state` `completed` → delivered and answered; drop it from
      `pending_input`.
    * `submit.running` → the owner is still working (or its lease has not
      lapsed yet); wait and ask again (≥ 60 s covers a dead owner's lease).
+   * `submit.state` `persisted`, not running:
+     * `needs_attention: "no_reply"` → the input is delivered (it is never
+       written again) but its turn died before any reply; go to 3 to get
+       the reply.
+     * `needs_attention: "partial_reply"` / `"later_messages"` → delivered,
+       and the core will not re-run it; drop it from `pending_input` and
+       surface it (the human sees a cut-off reply) instead of re-sending.
    * `found: false`, or `accepted` and not running → go to 3.
 3. `prompt.submit {session_id, text, client_msg_id}` with the **same text
-   and id**. `streaming` → wait for `message.complete`; `duplicate` → act on
-   its `state` as in 2; 4143 → retry after the current turn; 4141 → a
-   broker bug (two texts under one id), do not retry; 5140 → the store is
-   down, keep the message parked.
-4. Drop the message from `pending_input` only after `persisted`/`completed`
-   was observed (reply or `prompt.accepted`).
+   and id**. `streaming` (a new or restarted turn) or `resumed` (the turn
+   runs on the stored message) → wait for `message.complete`; `duplicate`
+   → act on its `state`/`running`/`needs_attention` as in 2; 4143 → retry
+   after the current turn; 4141 → a broker bug (two texts under one id), do
+   not retry; 5140 → the store is down, keep the message parked.
+4. `persisted` means **delivered**: the input is stored and never written
+   again. Keep the text (it is the re-send's fingerprint) until
+   `completed`, or `persisted` with `partial_reply`/`later_messages`, was
+   observed (reply or `prompt.accepted`); a `persisted` + `no_reply` record
+   still needs the re-send of 3 to get its answer.
 
 ## 4. Remaining limits
 
@@ -200,7 +226,19 @@ conversation it creates):
   steer/redirect/queue live in memory. The broker re-sends after the turn.
 * **"Accepted, no row, lease running"**: after an owner dies, its record
   reads `running` until the 60 s lease lapses; only then does a retry
-  restart the turn.
+  restart (or resume) the turn.
+* **A resume needs a re-send.** Nothing in the core resumes a dead
+  `persisted` turn by itself; the broker's same-id re-send does. A resumed
+  turn that fails with a model error still ends `completed` (its error
+  frame is the answer), like any other turn.
+* **"After the user row"** is any `assistant`/`tool` (partial reply) or
+  `user` row with a higher id in the session lineage. A compression that ran
+  inside the dead turn writes rows after it too, so such a turn is reported
+  (`partial_reply`/`later_messages`), not re-run.
+* A resumed turn drops the stored message from its in-memory history
+  snapshot only when the snapshot ends with it (same `_row_id`, or same
+  text without one); a live session whose history does not end with it
+  sends history + the message, i.e. still once.
 * The user row is identified as the **first `user` row above the
   watermark** in the session lineage. A different writer adding a `user` row
   to the same session between the claim and the agent's flush (another
@@ -217,3 +255,51 @@ conversation it creates):
   create params (title, cwd, model) with the same `client_create_id`.
 * Two pods serving one profile at once can each hold a live copy of a
   replayed session; the ids and the PostgreSQL rows stay single.
+
+### Stored user row, and where a turn can reuse it (t_7ceb9994)
+
+Line numbers are `levos/pg3` at `18d191f398`, before t_7ceb9994.
+
+When the user row is written, for a TUI turn:
+
+1. `_run_prompt_submit` (`tui_gateway/prompt_turn.py:791`) → turn thread
+   `run()` (`:817`) → `_prepare_turn_input` (`:435`) snapshots
+   `session["history"]` as the turn's `conversation_history` (`:476`) and
+   builds the run message → `_invoke_agent` (`:511`) passes
+   `persist_user_message` (`:539-540`) and calls `agent.run_conversation`
+   (`:558`).
+2. `build_turn_context` (`agent/turn_context.py:852`):
+   `_stage_turn_user_message` (`:538`, called `:920`) builds the turn's user
+   dict, appended after the history at `:928`; `_ensure_session_row` (`:648`,
+   called `:962`) creates the `sessions` row; `_persist_turn_start` (`:835`,
+   called `:999`) flushes the user row **before the first model call**.
+3. The flush (`agent/session_persistence.py:187` `_db_flush_collect`) skips
+   every dict carrying `_DB_PERSISTED_MARKER` (`:201`); rows loaded from the
+   store are born with it (`hermes_state_messages.py:1001`) and carry
+   `_row_id` when loaded with `include_row_ids` (a cold resume's model
+   history does: `tui_gateway/server.py:2643`,
+   `hermes_state_messages.py:1068`).
+
+So "user row stored, turn died before the reply" is the window between step 2's
+`_persist_turn_start` and the first assistant flush.
+
+Reuse points:
+
+* `_stage_turn_user_message` (`agent/turn_context.py:547-562`) adopts a
+  pre-staged `agent._pending_cli_user_message` dict whose content equals this
+  turn's persist text, and only swaps in the API-facing content; a staged
+  dict that already carries `_DB_PERSISTED_MARKER` is never written again
+  (flush skip above) and is dropped from the agent after the turn-start
+  persist (`_persist_under_lock`, `agent/turn_context.py:399-415`). With
+  `_row_id` on it, the api_content sidecar addresses the stored row
+  (`agent/turn_context.py:819-825`). This is the core's existing "continue
+  from an already-durable user message" path (the CLI's close persistence
+  uses it).
+* The TUI turn needs one argument to use it: `_run_prompt_submit` gets the
+  stored row id, drops that row from the history snapshot (a resumed
+  session's history ends with it) and stages the durable dict before
+  `run_conversation`. The model input is then "stored conversation + that
+  user message" exactly once, like the original turn.
+* Not reusable: crash-marker auto-continue
+  (`tui_gateway/session_auto_continue.py:78`, `:114`) runs a turn whose user
+  message is a new recovery note, i.e. a second user row.

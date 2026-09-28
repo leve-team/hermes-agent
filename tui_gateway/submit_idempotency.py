@@ -14,6 +14,12 @@ this module keeps the acceptance records next to the profile's core tables:
 * ``session_creates`` — (profile, ``client_create_id``) → runtime session id
   and stored session key.
 
+A ``persisted`` record whose owner died before any reply row was written is
+*resumed* by the next same-text request (t_7ceb9994): the turn runs once more
+on the stored user row, which is never written again. A reply row (even a
+partial one, or a tool call) after it means the turn already had effects, so it
+is not re-run; the record reports ``needs_attention`` instead.
+
 Every decision about one id runs in one transaction under a PostgreSQL
 advisory transaction lock, so two concurrent requests with the same id
 start at most one turn — across threads and across pods. Off authority the
@@ -58,9 +64,15 @@ STATE_ACCEPTED = "accepted"
 STATE_PERSISTED = "persisted"
 STATE_COMPLETED = "completed"
 
+# ``needs_attention`` of a ``persisted`` record with no live owner (a dead turn).
+NO_REPLY = "no_reply"  # nothing after the user row: a same-id re-send resumes the turn
+PARTIAL_REPLY = "partial_reply"  # an assistant/tool row follows it: never re-run
+LATER_MESSAGES = "later_messages"  # only later user rows follow it: never re-run
+
 # Claim outcomes.
 NEW = "new"
 RESTART = "restart"
+RESUME = "resumed"  # the user row is stored, its reply is not: run the turn on that row
 DUPLICATE = "duplicate"
 CONFLICT = "conflict"
 REFUSED = "refused"
@@ -280,6 +292,7 @@ class Acceptance:
     updated_at: float
     completed_at: Optional[float]
     running: bool = False
+    needs_attention: Optional[str] = None
 
     @property
     def key(self) -> Tuple[str, str]:
@@ -296,6 +309,7 @@ class Acceptance:
             "accepted_at": self.accepted_at,
             "completed_at": self.completed_at,
             "attempts": self.attempts,
+            "needs_attention": self.needs_attention,
         }
 
 
@@ -307,7 +321,12 @@ class Claim:
 
     @property
     def owns_turn(self) -> bool:
-        return self.outcome in (NEW, RESTART)
+        return self.outcome in (NEW, RESTART, RESUME)
+
+    @property
+    def stored_user_row(self) -> Optional[int]:
+        """The stored user row a ``RESUME`` claim's turn answers (never written again)."""
+        return self.record.user_message_id if self.outcome == RESUME and self.record else None
 
 
 def _acceptance(row) -> Acceptance:
@@ -356,6 +375,17 @@ def _first_user_row(conn, record: Acceptance) -> Optional[int]:
     return None if row is None else int(row[0])
 
 
+def _after_user_row(conn, record: Acceptance) -> str:
+    """What the lineage holds after the stored user row of a dead turn."""
+    row = conn.execute(
+        _LINEAGE_DOWN + "SELECT COALESCE(MAX(CASE WHEN m.role IN ('assistant', 'tool') THEN 2 "
+        "WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) FROM messages m "
+        "WHERE m.session_id IN (SELECT id FROM down) AND m.id > ?",
+        (record.session_key, record.user_message_id),
+    ).fetchone()
+    return (NO_REPLY, LATER_MESSAGES, PARTIAL_REPLY)[int(row[0] or 0)]
+
+
 def _is_live(record: Acceptance, now: float) -> bool:
     if not record.owner:
         return False
@@ -365,7 +395,8 @@ def _is_live(record: Acceptance, now: float) -> bool:
 
 
 def _reconcile(conn, record: Acceptance, now: float) -> Acceptance:
-    """Move ``accepted`` to ``persisted`` once the user row exists; set ``running``."""
+    """Move ``accepted`` to ``persisted`` once the user row exists; set ``running``
+    and, for a ``persisted`` record nobody runs, ``needs_attention``."""
     if record.state == STATE_ACCEPTED and record.user_message_id is None:
         message_id = _first_user_row(conn, record)
         if message_id is not None:
@@ -377,6 +408,8 @@ def _reconcile(conn, record: Acceptance, now: float) -> Acceptance:
             record.state, record.user_message_id, record.updated_at = (
                 STATE_PERSISTED, message_id, now)
     record.running = record.state != STATE_COMPLETED and _is_live(record, now)
+    if record.state == STATE_PERSISTED and not record.running:
+        record.needs_attention = _after_user_row(conn, record)
     return record
 
 
@@ -406,7 +439,9 @@ def claim_submit(
     claim is ``REFUSED`` with that value. ``DUPLICATE``: an earlier request
     with the same text owns (or finished) the turn. ``CONFLICT``: the id was
     used for different text. ``RESTART`` only happens for an ``accepted``
-    record with no user row above its watermark and no live owner.
+    record with no user row above its watermark and no live owner; ``RESUME``
+    only for a ``persisted`` record with no live owner and nothing after its
+    user row (:data:`NO_REPLY`) — the turn then runs on the stored row.
     """
     conn = open_store()
     registered = None
@@ -417,7 +452,8 @@ def claim_submit(
                 if record.fingerprint != text_fingerprint:
                     return Claim(CONFLICT, record)
                 record = _reconcile(conn, record, now)
-                if record.state != STATE_ACCEPTED or record.running:
+                if record.running or record.state == STATE_COMPLETED or (
+                        record.state == STATE_PERSISTED and record.needs_attention != NO_REPLY):
                     return Claim(DUPLICATE, record)
             refusal = admit()
             if refusal is not None:
@@ -440,7 +476,7 @@ def claim_submit(
                     (OWNER, now + LEASE_SECONDS, ui_session_id or record.ui_session_id, now,
                      record.session_key, client_msg_id),
                 )
-                outcome = RESTART
+                outcome = RESUME if record.state == STATE_PERSISTED else RESTART
                 record = _find(conn, record.session_key, client_msg_id)
             registered = record.key
             _register_live(registered)
@@ -459,8 +495,8 @@ def claim_submit(
 def release_submit(claim: Claim) -> None:
     """Undo a claim whose turn never started (a synchronous failure after the claim).
 
-    A fresh record is deleted so the retry starts clean; a restarted one goes
-    back to ownerless ``accepted``. Only this owner's record is touched.
+    A fresh record is deleted so the retry starts clean; a restarted or resumed
+    one only loses its owner. Only this owner's record is touched.
     """
     record = claim.record
     if record is None or not claim.owns_turn:

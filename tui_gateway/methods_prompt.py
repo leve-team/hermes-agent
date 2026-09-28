@@ -475,9 +475,11 @@ def _release_unstarted_turn(session):
         _release_active_session_slot(session)
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None):
+def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None,
+                           stored_user_row=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
-    accepted in-flight message), then run."""
+    accepted in-flight message), then run. ``stored_user_row``: a resumed ``client_msg_id``
+    turn answers that stored user row instead of writing one."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
@@ -505,7 +507,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        stored_user_row=stored_user_row)
 
 
 _TRUNCATION_PARAMS = (
@@ -619,6 +622,10 @@ def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id,
         logger.info(
             "prompt.submit: client_msg_id %r of session %s restarts an accepted turn that never "
             "stored its message (attempt %d)", client_msg_id, sid, claim.record.attempts)
+    elif claim.outcome == idem.RESUME:
+        logger.info(
+            "prompt.submit: client_msg_id %r of session %s resumes a turn that died after storing "
+            "its message (row %s)", client_msg_id, sid, claim.stored_user_row)
     return claim, None
 
 
@@ -632,12 +639,14 @@ def _release_submit_claim(claim):
 
 
 def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author):
-    """Turn thread body for a claimed ``client_msg_id``: run the turn, wait for the agent
-    thread it hands off to, then settle the record (``completed`` once the user row
-    exists, else ownerless ``accepted`` so a retry runs the turn once more)."""
+    """Turn thread body for a claimed ``client_msg_id``: run the turn (a resumed claim on
+    its stored user row), wait for the agent thread it hands off to, then settle the
+    record (``completed`` once the user row exists, else ownerless ``accepted`` so a retry
+    runs the turn once more)."""
     from tui_gateway import submit_idempotency
     try:
-        _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author)
+        _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+                               stored_user_row=claim.stored_user_row)
         turn_thread = session.get("_run_thread")
         if turn_thread is not None and turn_thread is not threading.current_thread():
             turn_thread.join()
@@ -838,7 +847,10 @@ def _(rid, params: dict) -> dict:
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming", **survivor_fields, **(claim.record.payload() if claim else {})})
+    # "resumed": the turn answers the message stored by a turn whose process died (no new user row).
+    from tui_gateway.submit_idempotency import RESUME
+    status = RESUME if claim is not None and claim.outcome == RESUME else "streaming"
+    return _ok(rid, {"status": status, **survivor_fields, **(claim.record.payload() if claim else {})})
 
 
 # ── attachments ─────────────────────────────────────────────────────────────

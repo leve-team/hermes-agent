@@ -508,11 +508,30 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     return prompt, _prepend_note(run_message, _hud_surface_note(session)), cols, streamer
 
 
+def _stage_stored_user_row(agent, st: _TurnRun, persist: Any, row_id: int) -> dict:
+    """A resumed turn answers a user row that is already stored (t_7ceb9994): drop it from
+    the history snapshot (a resumed session's history ends with it) and stage it for the
+    agent as a durable dict. The core adopts a staged dict carrying this turn's persist
+    text and never writes a persisted-marked dict again, so the model sees the message
+    once and no second row is written; ``_row_id`` addresses the stored row for the
+    api_content sidecar."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    tail = st.history[-1] if st.history else None
+    if isinstance(tail, dict) and tail.get("role") == "user" and (
+            tail.get("_row_id") == row_id
+            or (tail.get("_row_id") is None and tail.get("content") == persist)):
+        st.history = st.history[:-1]
+    staged = {"role": "user", "content": persist, "_row_id": row_id, _DB_PERSISTED_MARKER: True}
+    agent._pending_cli_user_message = staged
+    return staged
+
+
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
     images: list[str], display_kind: str | None, display_metadata: dict | None,
-    turn_author: dict | None = None) -> None:
-    """Wire the streaming callbacks and run the conversation into ``st.result``."""
+    turn_author: dict | None = None, stored_user_row: int | None = None) -> None:
+    """Wire the streaming callbacks and run the conversation into ``st.result``.
+    ``stored_user_row``: the turn answers that stored user row instead of writing one."""
     agent = st.agent
 
     def _stream(delta):
@@ -531,13 +550,15 @@ def _invoke_agent(
         _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
         _interim_assistant_cb if _load_interim_assistant_messages() else None)
+    persist = _build_persist_user_message(prompt, images, run_message) if images else prompt
+    staged = (None if stored_user_row is None
+              else _stage_stored_user_row(agent, st, persist, stored_user_row))
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
     # not a raw user bubble; the post-turn stamp is the fallback for an older agent.
     st.run_kwargs = run_kwargs = {
         "conversation_history": list(st.history),
         "stream_callback": _stream,
-        "persist_user_message": (
-            _build_persist_user_message(prompt, images, run_message) if images else prompt)}
+        "persist_user_message": persist}
     try:
         run_params = inspect.signature(agent.run_conversation).parameters
     except (TypeError, ValueError):
@@ -557,6 +578,10 @@ def _invoke_agent(
     try:
         st.result = agent.run_conversation(run_message, **st.run_kwargs)
     finally:
+        if staged is not None and getattr(agent, "_pending_cli_user_message", None) is staged:
+            # Never adopted (the turn failed first): a later turn with the same text must
+            # write its own row.
+            agent._pending_cli_user_message = None
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
@@ -793,7 +818,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, stored_user_row: int | None = None) -> bool:
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -836,7 +861,7 @@ def _run_prompt_submit(
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata, turn_author)
+                display_metadata, turn_author, stored_user_row)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
