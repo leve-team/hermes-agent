@@ -671,7 +671,7 @@ def _(rid, params: dict) -> dict:
     try:
         if not idem.active():
             return _ok(rid, {"enabled": False, "found": False})
-        result = {"enabled": True}
+        result: dict = {"enabled": True}
         if msg_raw is not None:
             record = idem.lookup_submit(
                 idem.normalize_client_id(msg_raw, "client_msg_id"), _accepted_session_key(params))
