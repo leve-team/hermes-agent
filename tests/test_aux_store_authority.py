@@ -527,3 +527,19 @@ def test_migration_rolls_back_a_store_when_a_row_cannot_land(pg_dsn, monkeypatch
     assert _pg_count(pg_dsn, "projects") == 1
     assert _pg_count(pg_dsn, "project_folders") == 1
     assert _sha256(source) == digest
+
+
+def test_unparseable_config_selects_files_only_without_a_postgres_dsn(monkeypatch):
+    """pg3 refuses to resolve the backend from an existing config.yaml it cannot
+    parse. The side stores keep that refusal whenever a PostgreSQL DSN is in the
+    environment (how authority pods get it); without one the profile cannot be on
+    authority, so they keep their files like every other backend (a corrupt
+    config must not break e.g. the credential pool; resolve_provider reports it)."""
+    (get_hermes_home() / "config.yaml").write_text(
+        "sessions:\n  state_backend: authority\n bad: [\n", encoding="utf-8")
+    assert aux.aux_store_authority() is False
+    monkeypatch.setenv("HERMES_STATE_POSTGRES_DSN", UNREACHABLE_DSN)
+    with pytest.raises(RuntimeError, match="config.yaml"):
+        aux.aux_store_authority()
+    monkeypatch.setenv("HERMES_STATE_BACKEND", "authority")
+    assert aux.aux_store_authority() is True  # an explicit env selection needs no file

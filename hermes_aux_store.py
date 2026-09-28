@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import re
 import sqlite3
 import threading
@@ -149,12 +150,24 @@ def aux_store_authority() -> bool:
     """True when the active profile's session store is PostgreSQL authority.
 
     ``probe`` keeps SQLite authority and therefore answers False.
+
+    An existing ``config.yaml`` that cannot be parsed makes the selector refuse
+    (it may be the only file selecting PostgreSQL). That refusal stands while a
+    PostgreSQL DSN is in the environment, the way authority deployments inject
+    it; without one the profile cannot be on authority at all, so the stores
+    keep the files they use on every other backend instead of failing callers
+    that report the corrupt config themselves.
     """
     try:
         import hermes_state_postgres as seam
     except ImportError:
         return False  # base install without the PostgreSQL module
-    return seam.resolve_state_backend() == "authority"
+    try:
+        return seam.resolve_state_backend() == "authority"
+    except RuntimeError:
+        if any((os.environ.get(key) or "").strip() for key in seam._ENV_DSN_KEYS):
+            raise
+        return False
 
 
 def open_aux_store(
