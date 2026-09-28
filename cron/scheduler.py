@@ -3693,8 +3693,10 @@ def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
 def tick(
     verbose: bool = True, adapters=None, loop=None, sync: bool = True, *, can_dispatch=None):
     """Check and run all due jobs. File-locked so only one tick runs at a time (gateway ticker vs
-    standalone daemon / manual tick). ``can_dispatch``: optional gate; false leaves due jobs for the
-    next allowed tick. Returns the number of jobs executed (0 if another tick holds the lock)."""
+    standalone daemon / manual tick); on a PostgreSQL authority profile the lock is a PostgreSQL
+    session advisory lock instead, which also holds across overlapping pods (levos 0060).
+    ``can_dispatch``: optional gate; false leaves due jobs for the next allowed tick. Returns the
+    number of jobs executed (0 if another tick holds the lock)."""
     # Stale-code yield gate — BEFORE the lock race. A process whose checkout was updated under it
     # serves mixed sys.modules (jobs die on ImportErrors); if a fresher gateway holds the runtime
     # lock, ITS ticker dispatches. With no fresh holder (desktop-standalone) the tick proceeds.
@@ -3703,11 +3705,24 @@ def tick(
         _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
         raise CronTickYielded(_skew[0], _skew[1])
 
-    lock_dir, lock_file = _get_lock_paths()
-    _ensure_cron_dir(lock_dir)
-    lock_fd = _acquire_tick_lock(lock_file)
-    if lock_fd is None:
-        return 0
+    # PostgreSQL authority (levos 0060): a session advisory lock keyed on the profile schema +
+    # "cron-tick" replaces the file lock, so overlapping pods of one profile tick one at a time.
+    # Not getting it takes the same contention path as a held flock (quietly 0); a PostgreSQL
+    # failure raises like a real lock-file failure does.
+    from hermes_aux_store import AuxSessionLock, aux_store_authority
+
+    tick_lock = lock_fd = None
+    if aux_store_authority():
+        tick_lock = AuxSessionLock("cron-tick")
+        if not tick_lock.acquire():
+            logger.debug("Tick skipped — another process holds the PostgreSQL tick lock")
+            return 0
+    else:
+        lock_dir, lock_file = _get_lock_paths()
+        _ensure_cron_dir(lock_dir)
+        lock_fd = _acquire_tick_lock(lock_file)
+        if lock_fd is None:
+            return 0
 
     try:
         # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
@@ -3786,7 +3801,10 @@ def tick(
         _sweep_mcp_orphans_when_all_done(_all_futures)
         return sum(_results)
     finally:
-        _release_tick_lock(lock_fd)
+        if tick_lock is not None:
+            tick_lock.release()
+        else:
+            _release_tick_lock(lock_fd)
 
 
 # ---------------------------------------------------------------------------

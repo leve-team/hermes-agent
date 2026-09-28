@@ -89,7 +89,11 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     ),
     # levos 0060: the cron stores. ``cron_jobs`` has no SQLite table (the
     # non-authority store is ``cron/jobs.json``); one row holds one job document.
-    "cron_executions": (AuxTable("executions", "core_cron_executions", ("id",)),),
+    # pg3 keeps cron/incidents.py's table in the same ledger file, so it is part of this store.
+    "cron_executions": (
+        AuxTable("executions", "core_cron_executions", ("id",)),
+        AuxTable("cron_incidents", "core_cron_incidents", ("id",)),
+    ),
     "cron_notepad": (AuxTable("cron_notepad", "core_cron_notes", ("job_id", "key")),),
     # levos 0068: cron state a run hands to the next one; files, not SQLite,
     # off authority (see ``cron/durable.py`` and ``cron/suggestions.py``).
@@ -117,6 +121,9 @@ _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "cron_executions": {
         "idx_executions_job_claimed": "idx_core_cron_executions_job_claimed",
         "idx_executions_status_claimed": "idx_core_cron_executions_status_claimed",
+        "idx_executions_occurrence": "idx_core_cron_executions_occurrence",
+        "idx_cron_incidents_job": "idx_core_cron_incidents_job",
+        "idx_cron_incidents_state": "idx_core_cron_incidents_state",
     },
 }
 

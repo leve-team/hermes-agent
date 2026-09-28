@@ -1,5 +1,6 @@
 """Per-job durable KV notepad (cursors, watermarks) carried across cron wake-ups; profile-local
-SQLite next to the executions ledger (same connection/pragma pattern as ``cron/executions.py``).
+SQLite next to the executions ledger (same connection/pragma pattern as ``cron/executions.py``) —
+or, on a PostgreSQL authority profile, the profile's store (``core_cron_notes``, levos 0060).
 
 Caps are a documented contract: ``MAX_VALUE_BYTES`` (16 KB per value, UTF-8) and
 ``MAX_JOB_TOTAL_BYTES`` (64 KB per job, key+value). Oversized writes raise ``ValueError`` and leave
@@ -34,26 +35,54 @@ def _current_notepad_file() -> Path:
     return NOTEPAD_FILE or (get_hermes_home().resolve() / "cron" / "notepad.db")
 
 
+def _authority() -> bool:
+    from hermes_aux_store import aux_store_authority
+
+    return aux_store_authority()
+
+
 def _connect() -> sqlite3.Connection:
+    """Open the notepad on the backend the profile selects (levos 0060).
+
+    PostgreSQL authority: table ``core_cron_notes`` in the profile's store, no file; a failure
+    raises ``AuxStoreUnavailable``. Otherwise the SQLite file, exactly as before.
+    """
+    if _authority():
+        from hermes_aux_store import open_aux_postgres
+
+        return open_aux_postgres("cron_notepad", initialize=_initialize_schema)
     return open_ledger(_current_notepad_file())
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    prepare_ledger(conn, db_label="cron/notepad.db", synchronous_full=False)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS cron_notepad (
+_CREATE_NOTEPAD = """CREATE TABLE IF NOT EXISTS cron_notepad (
              job_id TEXT NOT NULL,
              key TEXT NOT NULL,
              value TEXT NOT NULL,
              updated_at TEXT NOT NULL,
              PRIMARY KEY (job_id, key)
            )"""
-    )
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "is_postgres", False):
+        from hermes_aux_store import aux_schema_transaction
+
+        with aux_schema_transaction(conn, "cron_notepad"):
+            conn.execute(_CREATE_NOTEPAD)
+        return
+    prepare_ledger(conn, db_label="cron/notepad.db", synchronous_full=False)
+    conn.execute(_CREATE_NOTEPAD)
+
+
+def _prepare_connection(conn: sqlite3.Connection) -> None:
+    """Schema step of ``ledger_transaction``; ``open_aux_postgres`` already ran it on PostgreSQL."""
+    if not getattr(conn, "is_postgres", False):
+        _initialize_schema(conn)
 
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    with ledger_transaction(_lock, _connect, _initialize_schema) as conn:
+    with ledger_transaction(_lock, _connect, _prepare_connection) as conn:
         yield conn
 
 
@@ -74,9 +103,14 @@ def set_note(job_id: str, key: str, value: str) -> Dict[str, Any]:
     _validate(job_id, key, value)
     now = _hermes_now().isoformat()
     with _transaction() as conn:
+        if getattr(conn, "is_postgres", False):
+            # UTF-8 byte length, as CAST(... AS BLOB) measures it on SQLite.
+            byte_sum = "OCTET_LENGTH(key) + OCTET_LENGTH(value)"
+        else:
+            byte_sum = """LENGTH(CAST(key AS BLOB))
+                 + LENGTH(CAST(value AS BLOB))"""
         row = conn.execute(
-            """SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))
-                 + LENGTH(CAST(value AS BLOB))), 0)
+            f"""SELECT COALESCE(SUM({byte_sum}), 0)
                FROM cron_notepad WHERE job_id=? AND key<>?""",
             (job_id, key),
         ).fetchone()
@@ -128,8 +162,9 @@ def list_notes(job_id: str) -> List[Dict[str, Any]]:
 
 def clear_notepad(job_id: str) -> int:
     """Delete every key for one job (called from ``cron.jobs.remove_job``). Returns row count;
-    no-ops without creating the DB when no notepad file exists yet."""
-    if not _current_notepad_file().exists():
+    no-ops without creating the DB when no notepad file exists yet (a PostgreSQL authority profile
+    has no file and always deletes)."""
+    if not _current_notepad_file().exists() and not _authority():
         return 0
     with _transaction() as conn:
         cur = conn.execute(

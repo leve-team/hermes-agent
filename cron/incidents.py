@@ -5,7 +5,8 @@ by ``(job_id, error signature)`` so the same job failing with the same error doe
 operator every run once acknowledged. Lifecycle: ``detected`` → ``alerted`` → ``closed``. The same
 job + same normalized error resolves to the SAME incident id, so a closed incident stays closed
 until the error text changes and mints a new one. ``alerted`` means a failure ping actually reached
-the operator. Incidents share ``cron/executions.db`` with ``cron.executions`` (one ledger file).
+the operator. Incidents share ``cron/executions.db`` with ``cron.executions`` (one ledger file) —
+on a PostgreSQL authority profile its store instead (``core_cron_incidents``, levos 0060).
 """
 
 from __future__ import annotations
@@ -53,11 +54,20 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
+    # PostgreSQL authority (levos 0060): the ledger's store; its initializer creates this table.
+    if _executions._authority():
+        return _executions._connect()
     return open_ledger(_db_path())
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "is_postgres", False):
+        return  # created with the ledger (cron.executions._initialize_postgres_schema)
     prepare_ledger(conn, db_label="cron/executions.db")
+    _create_incidents_schema(conn)
+
+
+def _create_incidents_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cron_incidents (
              id            TEXT PRIMARY KEY,

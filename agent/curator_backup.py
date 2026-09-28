@@ -63,6 +63,26 @@ def _backup_cron_jobs_into(dest: Path) -> Dict[str, Any]:
     file yields ``backed_up=False`` plus a reason, and the snapshot proceeds."""
     src = get_hermes_home() / "cron" / "jobs.json"
     info: Dict[str, Any] = {"backed_up": False, "jobs_count": 0}
+    try:
+        from hermes_aux_store import aux_store_authority
+
+        authority = aux_store_authority()
+    except Exception as e:  # e.g. an unparseable config.yaml
+        logger.debug("Could not resolve the cron store backend for backup: %s", e)
+        return {**info, "reason": f"backend check failed: {type(e).__name__}"}
+    if authority:
+        # levos 0060: the jobs live in the profile's PostgreSQL store; snapshot them in the
+        # jobs.json shape so a rollback reads them the same way.
+        try:
+            from cron.jobs import load_jobs
+
+            jobs = load_jobs()
+            (dest / CRON_JOBS_FILENAME).write_text(
+                json.dumps({"jobs": jobs}, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Failed to back up cron jobs from PostgreSQL: %s", e)
+            return {**info, "reason": f"read error: {type(e).__name__}"}
+        return {**info, "backed_up": True, "jobs_count": len(jobs)}
     if not src.exists():
         return {**info, "reason": "no cron/jobs.json present"}
     try:
