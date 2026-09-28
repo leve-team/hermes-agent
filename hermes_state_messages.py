@@ -684,7 +684,7 @@ class SessionMessagesMixin:
         return self._write_rowcount(
             "UPDATE messages SET api_content = ? WHERE id = (SELECT id FROM messages "
             "WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1"
-            ") AND content IS ?",
+            ") AND content IS NOT DISTINCT FROM ?",
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
     def set_message_api_content(
@@ -711,7 +711,7 @@ class SessionMessagesMixin:
             return 0
         return self._write_rowcount(
             "UPDATE messages SET api_content = ? WHERE id = ? AND session_id = ? "
-            "AND role = 'user' AND active = 1 AND content IS ?",
+            "AND role = 'user' AND active = 1 AND content IS NOT DISTINCT FROM ?",
             (_scrub_surrogates(api_content), row_id, session_id, self._encode_content(content)))
 
     def _display_dedupe_key(self, row) -> Tuple[Any, ...]:

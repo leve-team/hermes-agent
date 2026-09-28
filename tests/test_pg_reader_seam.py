@@ -14,6 +14,7 @@ import pytest
 import hermes_state
 import hermes_state_postgres
 from hermes_state_registry import release_or_close
+from tests.test_pg3_writer_local_follow_backend import postgres_dsn as postgres_dsn
 
 
 @pytest.fixture
@@ -343,3 +344,118 @@ def test_explicit_sqlite_registry_paths_share_while_active_postgres_stays_privat
         registry.release_or_close(second)
         registry.close_all_under(home)
     assert calls == [(dsn, True), (dsn, False), (dsn, False)]
+
+
+# ---------------------------------------------------------------------------
+# levos db60c64db / f1d844e30, on a real PostgreSQL (the fork's ephemeral
+# Unix-socket cluster: ``initdb`` / ``pg_ctl`` on PATH or in PG3_PERCENT_PG_BIN)
+# ---------------------------------------------------------------------------
+
+
+def _authority_peer(peer, dsn):
+    (peer / "config.yaml").write_text("sessions:\n  state_backend: authority\n", encoding="utf-8")
+    (peer / ".env").write_text(f"HERMES_STATE_POSTGRES_DSN={dsn}\n", encoding="utf-8")
+
+
+def test_readonly_pg_profile_open_rejects_writes_on_the_server(profile_homes, postgres_dsn):
+    """``open_store_for_profile(read_only=True)`` reaches PostgreSQL read-only:
+    it reads the peer's rows, runs no DDL, and the SERVER refuses an INSERT
+    (SQLSTATE 25006) so no row lands; the writable open still writes."""
+    import psycopg
+
+    _home, peer = profile_homes
+    _authority_peer(peer, postgres_dsn)
+    with psycopg.connect(postgres_dsn, autocommit=True) as raw:
+        raw.execute("DROP SCHEMA public CASCADE")
+        raw.execute("CREATE SCHEMA public")
+
+    # A read-only open never provisions the schema it is asked to read.
+    with pytest.raises(Exception):
+        release_or_close(hermes_state_postgres.open_store_for_profile("peer", read_only=True))
+    with psycopg.connect(postgres_dsn) as raw:
+        assert raw.execute("SELECT to_regclass('sessions')").fetchone()[0] is None
+
+    writer = hermes_state_postgres.open_store_for_profile("peer", read_only=False)
+    try:
+        assert writer._is_postgres is True
+        writer.create_session("ro-seed", source="cli")
+    finally:
+        release_or_close(writer)
+
+    reader = hermes_state_postgres.open_store_for_profile("peer", read_only=True)
+    try:
+        assert reader._is_postgres is True
+        assert reader.get_session("ro-seed") is not None
+        with pytest.raises(Exception) as excinfo:
+            reader._conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                ("ro-smuggled", "cli", 1.0),
+            )
+        assert getattr(excinfo.value, "sqlstate", None) == "25006", excinfo.value
+    finally:
+        try:
+            reader._conn.rollback()
+        except Exception:
+            pass
+        release_or_close(reader)
+    with psycopg.connect(postgres_dsn) as raw:
+        assert raw.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'ro-smuggled'"
+        ).fetchone()[0] == 0
+    assert not (peer / "state.db").exists()
+
+
+def test_null_safe_cas_statements_run_verbatim_on_postgres(tmp_path, postgres_dsn):
+    """The title / api_content CAS statements are journalled as SQLite text and
+    replayed by dual-write, so the text itself must be NULL-safe PostgreSQL
+    (``col IS ?`` is a syntax error there), not rely on a rewrite layer."""
+    import psycopg
+
+    db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
+    recorded = []
+
+    class _Recording:
+        def __init__(self, conn):
+            self._inner = conn
+
+        def execute(self, sql, params=()):
+            recorded.append((sql, tuple(params)))
+            return self._inner.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __enter__(self):
+            return self._inner.__enter__() and self
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    try:
+        db.create_session("cas", source="cli")
+        db.append_message("cas", "user", "hello")
+        db._conn = _Recording(db._conn)
+        assert db.set_session_title("cas", "first") is True
+        assert db.set_latest_user_api_content("cas", "hello", "api-bytes") == 1
+        db._conn = db._conn._inner
+    finally:
+        db.close()
+    cas = [(sql, params) for sql, params in recorded
+           if sql.lstrip().upper().startswith("UPDATE") and " AND " in sql.upper()]
+    assert {sql.split()[1] for sql, _ in cas} == {"sessions", "messages"}, recorded
+
+    with psycopg.connect(postgres_dsn, autocommit=True) as raw:
+        raw.execute("DROP TABLE IF EXISTS sessions, messages CASCADE")
+        raw.execute("CREATE TABLE sessions (id TEXT, title TEXT, title_source TEXT)")
+        raw.execute(
+            "CREATE TABLE messages (id BIGINT, session_id TEXT, role TEXT, "
+            "active INTEGER, content TEXT, api_content TEXT)"
+        )
+        raw.execute("INSERT INTO sessions VALUES ('cas', NULL, NULL)")
+        raw.execute("INSERT INTO messages VALUES (1, 'cas', 'user', 1, 'hello', NULL)")
+        for sql, params in cas:
+            # Verbatim text; only the placeholder style differs between drivers.
+            assert raw.execute(sql.replace("?", "%s"), params).rowcount == 1, sql
+        assert raw.execute("SELECT title FROM sessions").fetchone()[0] == "first"
+        assert raw.execute("SELECT api_content FROM messages").fetchone()[0] == "api-bytes"
+        raw.execute("DROP TABLE sessions, messages")
