@@ -460,15 +460,19 @@ def _persist_session_row_for_submit(rid, session):
         else:
             logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
             error = _err(rid, 5071, f"session storage could not be written: {exc}")
-    # No turn thread will start, so neither resume nor the busy queue may see
-    # this rejected prompt as live. Release the slot a turn would normally own.
+    _release_unstarted_turn(session)
+    return error
+
+
+def _release_unstarted_turn(session):
+    """No turn thread will start, so neither resume nor the busy queue may see
+    this rejected prompt as live. Release the slot a turn would normally own."""
     with session["history_lock"]:
         session["running"] = False
         session["last_active"] = time.time()
         session.pop("_hosted_room_task", None)
         _clear_inflight_turn(session)
         _release_active_session_slot(session)
-    return error
 
 
 def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None):
@@ -509,11 +513,15 @@ _TRUNCATION_PARAMS = (
 
 
 def _lock_in_submit_turn(
-    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task):
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task,
+    busy_error=None):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
-    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
+    cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``.
+    ``busy_error`` (id-carrying submits): returned instead when a turn is running."""
     fields = {}
     with session["history_lock"]:
+        if busy_error is not None and session.get("running"):
+            return busy_error, fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -537,6 +545,151 @@ def _lock_in_submit_turn(
     return None, fields
 
 
+# ── client request ids (levos v3; tui_gateway/submit_idempotency.py) ──────────
+
+def _idempotency_store_error(rid, exc):
+    """5140 for a PostgreSQL-authority store that cannot serve a request id: the
+    request is refused whole (no turn, no session), never served from a file."""
+    from hermes_aux_store import AuxStoreUnavailable
+    logger.warning("client request id store unavailable: %s", exc, exc_info=True)
+    message = str(exc) if isinstance(exc, AuxStoreUnavailable) else "the request id store failed"
+    return _err(rid, 5140, f"request id store unavailable: {message}", {
+        "reason": "aux_store_unavailable", "exception": type(exc).__name__, "retryable": True})
+
+
+def _idempotency_store_failure(exc) -> bool:
+    """The request id store itself failed (as opposed to a bug in the code it wraps)."""
+    from hermes_aux_store import AuxStoreUnavailable
+    return isinstance(exc, AuxStoreUnavailable) or type(exc).__module__.split(".")[0] == "psycopg"
+
+
+def _client_request_id(rid, params, name):
+    """``(id, err)``. The id is honoured only on a PostgreSQL-authority profile;
+    elsewhere it is accepted and ignored (None), so the request behaves exactly
+    as one without it."""
+    if (raw := params.get(name)) is None:
+        return None, None
+    from tui_gateway import submit_idempotency
+    try:
+        if not submit_idempotency.active():
+            return None, None
+        return submit_idempotency.normalize_client_id(raw, name), None
+    except submit_idempotency.ClientIdError as exc:
+        return None, _err(rid, 4140, str(exc), {"reason": "invalid_client_id", "param": name})
+    except Exception as exc:
+        return None, _idempotency_store_error(rid, exc)
+
+
+def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id, hosted_task):
+    """Claim ``client_msg_id`` and, inside the same advisory-locked PostgreSQL
+    transaction, lock in the turn: ``(claim, None)`` when this request owns a turn,
+    else ``(None, reply)`` — the recorded state of a duplicate, a conflict (4141),
+    the busy refusal (4143) or an unavailable store (5140)."""
+    from tui_gateway import submit_idempotency as idem
+    busy = _err(
+        rid, 4143, "session busy: resubmit the same client_msg_id after the current turn",
+        {"reason": "session_busy", "retryable": True})
+    admitted = []
+
+    def admit():
+        err, _fields = _lock_in_submit_turn(
+            rid, sid, session, text, params, False, None, hosted_task, busy_error=busy)
+        if err is None:
+            admitted.append(True)
+        return err
+
+    try:
+        claim = idem.claim_submit(
+            str(session.get("session_key") or sid), client_msg_id, idem.fingerprint(raw_text),
+            ui_session_id=sid, admit=admit)
+    except Exception as exc:
+        if admitted:  # the turn was locked in but the record never committed
+            _release_unstarted_turn(session)
+        if not _idempotency_store_failure(exc):
+            raise
+        return None, _idempotency_store_error(rid, exc)
+    if claim.outcome == idem.CONFLICT:
+        return None, _err(rid, 4141, "client_msg_id was already used for a different message", {
+            "reason": "client_msg_id_conflict", **claim.record.payload()})
+    if claim.outcome == idem.DUPLICATE:
+        return None, _ok(rid, {"status": "duplicate", **claim.record.payload()})
+    if claim.outcome == idem.REFUSED:
+        return None, claim.refusal
+    if claim.outcome == idem.RESTART:
+        logger.info(
+            "prompt.submit: client_msg_id %r of session %s restarts an accepted turn that never "
+            "stored its message (attempt %d)", client_msg_id, sid, claim.record.attempts)
+    return claim, None
+
+
+def _release_submit_claim(claim):
+    """Best-effort undo of a claim whose turn never started (a lapsed lease does the same)."""
+    from tui_gateway import submit_idempotency
+    try:
+        submit_idempotency.release_submit(claim)
+    except Exception:
+        logger.warning("prompt.submit: releasing client_msg_id claim failed", exc_info=True)
+
+
+def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author):
+    """Turn thread body for a claimed ``client_msg_id``: run the turn, wait for the agent
+    thread it hands off to, then settle the record (``completed`` once the user row
+    exists, else ownerless ``accepted`` so a retry runs the turn once more)."""
+    from tui_gateway import submit_idempotency
+    try:
+        _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author)
+        turn_thread = session.get("_run_thread")
+        if turn_thread is not None and turn_thread is not threading.current_thread():
+            turn_thread.join()
+    finally:
+        try:
+            submit_idempotency.finish_submit(claim)
+        except Exception:
+            logger.warning("prompt.submit: settling client_msg_id record failed", exc_info=True)
+
+
+def _accepted_session_key(params) -> str:
+    """Stored key for ``prompt.accepted``: a live runtime ``session_id`` first, else the
+    ``stored_session_id`` / ``session_key`` the client kept across a pod replacement."""
+    if (live := _sessions.get(params.get("session_id") or "")) is not None:
+        return str(live.get("session_key") or "")
+    for name in ("stored_session_id", "session_key"):
+        if isinstance(value := params.get(name), str) and value:
+            return value
+    return ""
+
+
+@method("prompt.accepted")
+def _(rid, params: dict) -> dict:
+    """Acceptance record of a client request id, for a broker to ask before re-sending a
+    parked message (``client_msg_id``) or re-creating a session (``client_create_id``).
+    Off PostgreSQL authority the ids are not recorded: ``{"enabled": false}``."""
+    from tui_gateway import submit_idempotency as idem
+    msg_raw, create_raw = params.get("client_msg_id"), params.get("client_create_id")
+    if msg_raw is None and create_raw is None:
+        return _err(rid, 4140, "client_msg_id or client_create_id required", {"reason": "invalid_client_id"})
+    try:
+        if not idem.active():
+            return _ok(rid, {"enabled": False, "found": False})
+        result = {"enabled": True}
+        if msg_raw is not None:
+            record = idem.lookup_submit(
+                idem.normalize_client_id(msg_raw, "client_msg_id"), _accepted_session_key(params))
+            result["submit"] = None if record is None else record.payload()
+        if create_raw is not None:
+            created = idem.lookup_create(
+                _create_request_profile(params), idem.normalize_client_id(create_raw, "client_create_id"))
+            result["create"] = None if created is None else {
+                **created.payload(),
+                "live": (_sessions.get(created.session_id) or {}).get("session_key") == created.session_key}
+    except idem.ClientIdError as exc:
+        return _err(rid, 4140, str(exc), {"reason": "invalid_client_id"})
+    except Exception as exc:
+        return _idempotency_store_error(rid, exc)
+    result["found"] = bool(result.get("submit") or result.get("create"))
+    return _ok(rid, result)
+
+
 # Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
 _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 
@@ -558,6 +711,9 @@ def _(rid, params: dict) -> dict:
         mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
+        return err
+    client_msg_id, err = _client_request_id(rid, params, "client_msg_id")
+    if err is not None:
         return err
     from tools.bot_relay import DeliveryAuthor
 
@@ -594,6 +750,12 @@ def _(rid, params: dict) -> dict:
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
+    if client_msg_id is not None and (has_truncation or turn_isolation):
+        # A rewind re-inserts survivor rows above the record's watermark, and a compute-host
+        # turn settles out of this process: neither can be told apart from a stored message.
+        unsupported = "truncation" if has_truncation else "compute_isolation"
+        return _err(rid, 4142, f"client_msg_id is not supported with {unsupported.replace('_', ' ')}",
+                    {"reason": "client_msg_id_unsupported", "with": unsupported})
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio.
     with _session_resume_lock:
@@ -606,8 +768,9 @@ def _(rid, params: dict) -> dict:
     # through once ``running`` is observed False).  The provider interrupt happens after
     # history_lock is released (a non-interruptible tool may hold it); if the old turn
     # finished between the two acquisitions, retry the claim rather than strand this
-    # prompt in a queue whose drain already ran.
-    while True:
+    # prompt in a queue whose drain already ran.  An id-carrying submit skips this: the
+    # steer/redirect/queue it would get are in-memory, so its claim refuses a busy session.
+    while client_msg_id is None:
         with session["history_lock"]:
             if not session.get("running"):
                 break
@@ -622,10 +785,18 @@ def _(rid, params: dict) -> dict:
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
-    if err is not None:
-        return err
+    claim = None
+    if client_msg_id is None:
+        err, survivor_fields = _lock_in_submit_turn(
+            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
+        if err is not None:
+            return err
+    else:
+        claim, reply = _claim_submit_turn(
+            rid, sid, session, raw_text, text, params, client_msg_id, hosted_task)
+        if claim is None:
+            return reply
+        survivor_fields = {}
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
@@ -648,18 +819,26 @@ def _(rid, params: dict) -> dict:
             "compute-host dispatch failed for session %s; falling back inline: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
     if (err := _persist_session_row_for_submit(rid, session)) is not None:
+        if claim is not None:
+            _release_submit_claim(claim)
         return err
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
         _start_agent_build(sid, session)
-    run_thread = threading.Thread(
-        target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
-        daemon=True)
+    if claim is None:
+        run_thread = threading.Thread(
+            target=lambda: _run_after_agent_ready(
+                rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+            daemon=True)
+    else:
+        run_thread = threading.Thread(
+            target=lambda: _run_claimed_submit(
+                claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+            daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming", **survivor_fields})
+    return _ok(rid, {"status": "streaming", **survivor_fields, **(claim.record.payload() if claim else {})})
 
 
 # ── attachments ─────────────────────────────────────────────────────────────

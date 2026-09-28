@@ -323,7 +323,18 @@ def _create_overrides(params: dict) -> tuple:
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    client_create_id, err = _client_request_id(rid, params, "client_create_id")
+    if err is not None:
+        return err
+    if client_create_id is not None:
+        return _idempotent_session_create(rid, params, client_create_id)
     (sid, source), key = _new_runtime_ids(params), _new_session_key()
+    return _create_session(rid, params, sid, source, key)
+
+
+def _create_session(rid, params: dict, sid: str, source: str, key: str) -> dict:
+    """session.create's body for already-minted ids (a replayed ``client_create_id`` re-creates a
+    draft under the ids it was first given)."""
     history = _coerce_seed_history(params.get("messages"))
     # Branch: links back so list_sessions_rich keeps it visible and the sidebar nests it.
     parent_session_id = _str_param(params, "parent_session_id") or None
@@ -392,6 +403,82 @@ def _(rid, params: dict) -> dict:
                  "tools": {}, "skills": {}, "cwd": cwd, "branch": git_probe.branch(cwd),
                  "project": _project_info_for_cwd(cwd), "lazy": True, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                  "profile_name": _response_profile_name(profile)}})
+
+
+class _CreateRefused(Exception):
+    """Rolls back a ``client_create_id`` record whose create/resume answered with an error."""
+
+    def __init__(self, response: dict):
+        super().__init__("session.create refused")
+        self.response = response
+
+
+def _create_request_profile(params: dict) -> str:
+    """Profile half of a ``client_create_id`` key: the request's ``profile`` (app-global remote
+    mode), else the launch profile."""
+    return (params.get("profile") or "").strip() or str(_current_profile_name() or "default")
+
+
+def _idempotent_session_create(rid, params: dict, client_create_id: str) -> dict:
+    """session.create carrying ``client_create_id`` on PostgreSQL authority. The first request
+    records (profile, id) -> (runtime sid, stored key) in the advisory-locked transaction that
+    registers the session; a repeat answers with the SAME ids: live here, resumed from the stored
+    row, or — a draft with no row yet whose process is gone — re-created under them."""
+    from tui_gateway import submit_idempotency
+    created = None
+    try:
+        with submit_idempotency.create_claim(_create_request_profile(params), client_create_id) as claim:
+            if claim.existing is None:
+                (sid, source), key = _new_runtime_ids(params), _new_session_key()
+                claim.record(sid, key)
+                response, replay, created = _create_session(rid, params, sid, source, key), "created", sid
+            else:
+                response, replay, created = _replay_session_create(rid, params, claim)
+            if "error" in response:
+                raise _CreateRefused(response)
+    except _CreateRefused as refused:
+        return refused.response
+    except Exception as exc:
+        if not _idempotency_store_failure(exc):
+            raise
+        if created:  # registered in memory, but the record never committed: a retry must not find two
+            with _sessions_lock:
+                _sessions.pop(created, None)
+        return _idempotency_store_error(rid, exc)
+    result = response["result"]
+    result.setdefault("stored_session_id", result.get("session_key") or result.get("resumed"))
+    result.update(client_create_id=client_create_id, idempotency=replay)
+    return response
+
+
+def _replay_session_create(rid, params: dict, claim) -> tuple:
+    """``(response, replay, created_sid)`` for a ``client_create_id`` seen before."""
+    sid, key = claim.existing.session_id, claim.existing.session_key
+    with _sessions_lock:
+        live = _sessions.get(sid)
+    stored = False
+    if live is None or live.get("session_key") != key:
+        with _profile_db(params) as db:
+            stored = db is not None and bool(db.get_session(key))
+    profile_home = _profile_home((params.get("profile") or "").strip() or None)
+    if (live is not None and live.get("session_key") == key) or stored or _find_live_unpersisted(key, profile_home):
+        # Every live or stored case is session.resume's: it reattaches this caller's transport.
+        resume_params = {"session_id": key, **{
+            name: params[name] for name in ("cols", "profile", "close_on_disconnect", "source") if name in params}}
+        response = _session_resume(rid, resume_params, runtime_sid=sid)
+        if (resumed_sid := (response.get("result") or {}).get("session_id")) and resumed_sid != sid:
+            claim.rebind(resumed_sid)
+        else:
+            claim.touch()
+        return response, "duplicate" if live is not None and live.get("session_key") == key else "resumed", None
+    # A draft that never reached its first turn went away with its process: same ids again.
+    source = _new_runtime_ids(params)[1]
+    if sid in _sessions:
+        sid = _new_runtime_ids(params)[0]
+        claim.rebind(sid)
+    else:
+        claim.touch()
+    return _create_session(rid, params, sid, source, key), "recreated", sid
 
 
 def _session_list_by_title(rid, db, title_lookup: str) -> dict:
@@ -490,10 +577,14 @@ class _Resume:
         self.lazy, self.defer_history = _flag(params, "lazy"), _flag(params, "defer_history")
         # Desktop hydrates over REST; suppress the duplicate WS copy only when asked.
         self.omit_messages, self.eager_build = _flag(params, "omit_messages"), _flag(params, "eager_build")
+        # A replayed ``client_create_id`` resumes under the runtime sid it was first given (when free).
+        self.runtime_sid = ""
 
     def mint(self, prompts: bool = True) -> tuple:
         """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on)."""
         ids = _new_runtime_ids(self.params)
+        if self.runtime_sid and self.runtime_sid not in _sessions:
+            ids = (self.runtime_sid, ids[1])
         if prompts:
             _enable_gateway_prompts()
         return *ids, self.profile_resume_cwd or _default_session_cwd()
@@ -823,9 +914,14 @@ def _resume_eager(ctx: _Resume) -> dict:
 
 @method("session.resume")
 def _(rid, params: dict) -> dict:
+    return _session_resume(rid, params)
+
+
+def _session_resume(rid, params: dict, runtime_sid: str = "") -> dict:
     if not (target := params.get("session_id", "")):
         return _err(rid, 4006, "session_id required")
     ctx = _Resume(rid, params, target)
+    ctx.runtime_sid = runtime_sid
     # Profile scope: a DEDICATED handle we own until the agent takes it; else the shared launch db.
     ctx.db, ctx.owns_db = _profile_session_db(ctx.profile_home)
     try:
