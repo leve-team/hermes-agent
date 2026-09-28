@@ -3,7 +3,8 @@
 - ``ProviderConfig`` / ``PROVIDER_REGISTRY`` describe every known inference provider.
 - The auth store (``~/.hermes/auth.json``) holds per-provider state, the credential pool and
   suppression markers; ``_auth_store_lock`` / ``_load_auth_store`` / ``_save_auth_store`` are the
-  only I/O primitives (cross-process flock, atomic 0o600 writes).
+  only I/O primitives (cross-process flock, atomic 0o600 writes; on PostgreSQL authority a
+  ``core_auth_store`` row and an advisory lock, levos 0066).
 - ``resolve_provider()`` picks the active provider via the documented priority chain.
 - ``OAUTH_PROVIDER_FLOWS`` maps each OAuth provider to its resolver/status builder; the flows live in
   ``auth_nous``/``auth_codex``/``auth_xai``/``auth_qwen``/``auth_minimax``/``auth_spotify`` and are
@@ -498,6 +499,13 @@ def _load_global_auth_store() -> Dict[str, Any]:
     unreadable — a malformed global store must never break profile reads."""
     global _global_auth_store_cache
     global_path = _global_auth_file_path()
+    if global_path is not None and _auth_pg_authority():
+        # levos 0066: the root store is a PostgreSQL row; there is no file mtime to key a memo on,
+        # so every read goes to PostgreSQL.
+        try:
+            return _load_auth_store_pg("root") or {}
+        except Exception:
+            return {}
     if global_path is None or not global_path.exists():
         _global_auth_store_cache = None
         return {}
@@ -636,19 +644,203 @@ def _auth_store_lock(
 
     ``target_path`` is required for profile-to-global write-throughs: each path has its own
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
-    ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
+    ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import.
+    On PostgreSQL authority the kernel lock is a session advisory lock per store (levos 0066)."""
     auth_path = target_path if target_path is not None else _auth_file_path()
+    if _auth_pg_authority():
+        with _auth_pg_lock(
+            _auth_pg_name(auth_path), _auth_lock_holder_for(auth_path), timeout_seconds,
+            "Timed out waiting for auth store lock"):
+            yield
+        return
     with _file_lock(
         auth_path.with_suffix(".lock"), _auth_lock_holder_for(auth_path), timeout_seconds,
         "Timed out waiting for auth store lock"):
         yield
 
 
+# ── PostgreSQL authority (levos 0066) ────────────────────────────────────────────────────────────
+# Two pods of one profile share nothing but the profile's PostgreSQL store, so there the credential
+# store is a row of ``core_auth_store`` (``profile`` or ``root``, the document byte-equal to what
+# auth.json would hold) and its lock a session advisory lock. auth.json and auth.lock are never
+# written and no .corrupt copy is made; a PostgreSQL failure raises ``AuxStoreUnavailable``. The only
+# file read is the one-time seed: a store PostgreSQL does not hold yet is imported once from the
+# pod's local auth.json (the launcher's copy of the mounted secret); once the row exists the file is
+# ignored, so a stale seed on a new pod never re-enters over a rotated token.
+
+_AUTH_PG_STORE = "auth_store"
+_AUTH_PG_DDL = (
+    "CREATE TABLE IF NOT EXISTS core_auth_store ("
+    "name TEXT PRIMARY KEY, document TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)")
+_AUTH_PG_UPSERT = (
+    "INSERT INTO core_auth_store (name, document, updated_at) "
+    "VALUES (?, ?, EXTRACT(EPOCH FROM clock_timestamp())) "
+    "ON CONFLICT (name) DO UPDATE SET document = EXCLUDED.document, updated_at = EXCLUDED.updated_at")
+_AUTH_PG_INSERT_IF_ABSENT = (
+    "INSERT INTO core_auth_store (name, document, updated_at) "
+    "VALUES (?, ?, EXTRACT(EPOCH FROM clock_timestamp())) ON CONFLICT (name) DO NOTHING")
+_UNDEFINED_TABLE = "42P01"
+
+
+def _auth_pg_authority() -> bool:
+    from hermes_aux_store import aux_store_authority
+    return aux_store_authority()
+
+
+def _auth_pg_name(path: Optional[Path]) -> str:
+    """Row of the store at *path*: the profile's own or the global root's."""
+    if path is None or _same_path(path, _auth_file_path()):
+        return "profile"
+    root = _global_auth_file_path()
+    if root is not None and _same_path(path, root):
+        return "root"
+    raise ValueError("auth store path is neither the profile nor the root store")
+
+
+@contextmanager
+def _auth_pg_connection():
+    from hermes_aux_store import connect_aux_postgres
+    conn = connect_aux_postgres(_AUTH_PG_STORE)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _auth_pg_select(name: str) -> Optional[str]:
+    """The stored document text, or None when there is none yet."""
+    from hermes_aux_store import AuxStoreUnavailable
+    try:
+        with _auth_pg_connection() as conn:
+            row = conn.execute("SELECT document FROM core_auth_store WHERE name = ?", (name,)).fetchone()
+    except AuxStoreUnavailable:
+        raise
+    except Exception as exc:
+        if getattr(exc, "sqlstate", None) == _UNDEFINED_TABLE:
+            return None  # nothing was ever saved on this profile
+        raise AuxStoreUnavailable(f"auth store {name!r}: PostgreSQL read failed") from exc
+    return None if row is None else row[0]
+
+
+def _load_auth_store_pg(name: str, *, seed_from_file: bool = True) -> Optional[Dict[str, Any]]:
+    """The stored document (seeded once from the local file when absent), or None."""
+    document = _auth_pg_select(name)
+    if document is None and seed_from_file:
+        document = _auth_pg_seed(name)
+    if document is None:
+        return None
+    try:
+        raw = json.loads(document)
+    except ValueError:
+        # Degrading to an empty store would let the next save erase every credential (the file
+        # path keeps a .corrupt copy first; there is no place for one here).
+        raise ValueError(
+            f"auth store {name!r} in PostgreSQL is not valid JSON; refusing to treat it as empty"
+        ) from None
+    return _auth_store_from_raw(raw)
+
+
+def _auth_pg_seed(name: str) -> Optional[str]:
+    """Import the local auth.json of store *name* into its absent row, once; the PG document after.
+
+    Insert-if-absent under the store's lock: a row another pod (or ``migrate_auth_to_pg``) wrote
+    first wins and the file is ignored. The file is validated as the migration validates it — an
+    unreadable or non-object file raises instead of seeding (or reading as) an empty store — and is
+    neither written nor removed."""
+    path = _auth_file_path() if name == "profile" else _global_auth_file_path()
+    if path is None or not path.is_file():
+        return None
+    with _auth_store_lock(target_path=path):
+        document = _auth_pg_select(name)
+        if document is not None:
+            return document
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            raw = json.loads(text)
+        except (OSError, ValueError) as exc:
+            # The type only: a decode error can quote bytes of a credential.
+            raise ValueError(
+                f"auth store {name!r}: local {path.name} is unreadable ({type(exc).__name__}); "
+                "refusing to seed PostgreSQL from it") from None
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"auth store {name!r}: local {path.name} is not a JSON object; "
+                "refusing to seed PostgreSQL from it")
+        _auth_pg_write(name, text, _AUTH_PG_INSERT_IF_ABSENT)
+        document = _auth_pg_select(name)
+    if document == text:
+        logger.info("auth: seeded the PostgreSQL %r auth store from %s (first load)", name, path)
+    return document
+
+
+def _auth_pg_write(name: str, document: str, statement: str = _AUTH_PG_UPSERT) -> None:
+    from hermes_aux_store import AuxStoreUnavailable
+    try:
+        with _auth_pg_connection() as conn:
+            try:
+                conn.execute(statement, (name, document))
+            except Exception as exc:
+                if getattr(exc, "sqlstate", None) != _UNDEFINED_TABLE:
+                    raise
+                _auth_pg_create_table(conn)
+                conn.execute(statement, (name, document))
+    except AuxStoreUnavailable:
+        raise
+    except Exception as exc:
+        raise AuxStoreUnavailable(f"auth store {name!r}: PostgreSQL write failed") from exc
+
+
+def _auth_pg_create_table(conn: Any) -> None:
+    """First write on a profile: DDL serialized per store, like 0060's."""
+    from hermes_aux_store import aux_xact_lock
+    conn.execute("BEGIN")
+    try:
+        aux_xact_lock(conn, f"schema:{_AUTH_PG_STORE}", timeout_seconds=30.0)
+        conn.execute(_AUTH_PG_DDL)
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass  # a dead connection has already rolled back
+        raise
+
+
+@contextmanager
+def _auth_pg_lock(name: str, holder: threading.local, timeout_seconds: float, timeout_message: str):
+    """``_file_lock`` on a PostgreSQL session advisory lock, same contract: per-thread reentrant
+    via ``holder.depth``, one lock per store, ``TimeoutError`` on timeout; the server releases it
+    when the holder dies."""
+    if getattr(holder, "depth", 0) > 0:
+        holder.depth += 1
+        try:
+            yield
+        finally:
+            holder.depth -= 1
+        return
+    from hermes_aux_store import AuxSessionLock
+    lock = AuxSessionLock(f"auth-store:{name}")
+    if not lock.acquire(wait_seconds=max(1.0, timeout_seconds), poll_seconds=0.05):
+        raise TimeoutError(timeout_message)
+    holder.depth = 1
+    try:
+        yield
+    finally:
+        holder.depth = 0
+        lock.release()
+
+
 def _empty_auth_store() -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+def _load_auth_store(auth_file: Optional[Path] = None, *, seed_from_file: bool = True) -> Dict[str, Any]:
+    """The store at *auth_file* (default: the profile's). On PostgreSQL authority its row, seeded
+    once from the local file when absent unless *seed_from_file* is False (the migration merges the
+    file itself)."""
+    if _auth_pg_authority():
+        stored = _load_auth_store_pg(_auth_pg_name(auth_file), seed_from_file=seed_from_file)
+        return stored if stored is not None else _empty_auth_store()
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return _empty_auth_store()
@@ -680,7 +872,11 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             "Corrupt file preserved at" if preserved else "A copy could NOT be preserved at",
             corrupt_path)
         return _empty_auth_store()
+    return _auth_store_from_raw(raw)
 
+
+def _auth_store_from_raw(raw: Any) -> Dict[str, Any]:
+    """Normalize a parsed auth store document (either backend)."""
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict) or isinstance(raw.get("credential_pool"), dict)):
         raw.setdefault("providers", {})
@@ -739,9 +935,15 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # Tighten parent dir to 0o700 so siblings can't traverse to creds. No-op on Windows (POSIX mode bits not
     # enforced); ignore failures. secure_parent_dir refuses to chmod /, top-level dirs, or the hermes-agent
     # install tree (#25821, #93050).
+    name = _auth_pg_name(target_path) if _auth_pg_authority() else None
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_private_file_atomic(auth_file, json.dumps(auth_store, indent=2) + "\n", fsync_dir=True)
+    payload = json.dumps(auth_store, indent=2) + "\n"
+    if name is not None:
+        _auth_pg_write(name, payload)
+        invalidate_nous_auth_status_cache()  # its memo keys on the file mtime, which never moves here
+        return auth_file
+    _write_private_file_atomic(auth_file, payload, fsync_dir=True)
     if target_path is not None:
         # A write-through to the global root must not be masked by the mtime memo: on coarse-mtime
         # filesystems a read-after-write in the same tick would keep serving the pre-write store.

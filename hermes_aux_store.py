@@ -1185,7 +1185,8 @@ def _migrate_auth_store(path: Path, *, dry_run: bool) -> Dict[str, Any]:
     source = auth._auth_store_from_raw(raw)
     added: List[str] = []
     with auth._auth_store_lock(target_path=path):
-        stored = auth._load_auth_store(path)
+        # The file is merged below; the load must not seed the absent row from it first.
+        stored = auth._load_auth_store(path, seed_from_file=False)
         before = _auth_keys(stored)
         for key, value in source.items():
             if key in _AUTH_STAMPS:
