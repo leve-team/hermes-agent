@@ -171,3 +171,21 @@ credential store seeds itself (above).
   repository (no `docs/quality/`); the root `AGENTS.md` rules (tests through
   real imports against a temp `HERMES_HOME`, no new `HERMES_*` env var,
   behaviour-contract tests) were followed instead.
+
+## 5. Verification (2026-09-28, this branch)
+
+- Port tests on a real PostgreSQL 16.4 (`initdb`/`pg_ctl` binaries,
+  `PG3_PERCENT_PG_BIN`):
+  `python -m pytest tests/test_aux_store_authority.py tests/test_cron_pg_authority.py tests/test_cron_overlap_c10.py tests/test_memory_pg_authority.py tests/test_auth_pg_authority.py tests/test_aux_kv_pg_authority.py tests/test_overlap_c11_authority.py tests/test_core_schema_pg_lock.py tests/test_pg_reader_seam.py -q -p no:warnings`
+  → 140 passed, 1 skipped (the `heartbeat_fire_claim` case above), 0 failed.
+- No regression against `origin/levos/pg3`: `scripts/run_tests.sh -j 3`
+  (per-file isolation) over `tests/cron tests/gateway tests/test_hermes_state*.py
+  tests/tools tests/hermes_cli tests/tui_gateway tests/acp tests/acp_adapter
+  tests/agent` on both trees: 36636 passed / 119 failed / 333 skipped on
+  each, the same failing files except two timing tests
+  (`test_terminal_timeout_output`, `test_browser_use_cli`) that fail
+  identically on both trees when run alone. The root `tests/test_pg*.py` /
+  `tests/test_hermes_state_pg*.py` files: the same 85 failing cases on both.
+  Two regressions this comparison found were fixed on the branch
+  (`DeadTargetRegistry` resolving the backend in its constructor;
+  a corrupt `config.yaml` breaking the credential pool on SQLite installs).
