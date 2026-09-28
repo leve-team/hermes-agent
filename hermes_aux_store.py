@@ -1112,7 +1112,8 @@ def _migrate_memory_file(path: Path, *, dry_run: bool) -> Dict[str, Any]:
     try:
         with memory_postgres_section(path.name):
             stored = read_memory_document(path.name)
-            held = MemoryStore._parse_entries(stored[0]) if stored else []
+            # Entry counts are of distinct entries, as the memory tool loads them.
+            held = list(dict.fromkeys(MemoryStore._parse_entries(stored[0]))) if stored else []
             present = set(held)
             added = [entry for entry in source if entry not in present]
             if stored is None:
@@ -1125,7 +1126,9 @@ def _migrate_memory_file(path: Path, *, dry_run: bool) -> Dict[str, Any]:
             if stored is None or content != stored[0]:
                 write_memory_document(path.name, content)
             after = read_memory_document(path.name)
-            after_entries = MemoryStore._parse_entries(after[0]) if after else []
+            after_entries = (
+                list(dict.fromkeys(MemoryStore._parse_entries(after[0]))) if after else []
+            )
             missing = len(set(source) - set(after_entries))
             if after is None or (missing and not snapshot):
                 raise AuxMigrationError(

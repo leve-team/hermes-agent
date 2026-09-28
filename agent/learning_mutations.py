@@ -5,7 +5,10 @@ Node ids (from ``agent.learning_graph``): skills → the skill name; memories �
 for USER.md; ``index`` = position in the combined card list, MEMORY.md first).
 Shared by CLI ``hermes journey``, the TUI ``/journey`` overlay and the desktop.
 Deleting a skill *archives* it (``hermes curator restore`` recovers it);
-deleting a memory rewrites its file.
+deleting a memory rewrites its file. On PostgreSQL authority (levos 0065) a
+memory "file" is its ``core_memory_files`` row and each edit/delete reads and
+rewrites it inside ``memory_postgres_section``, so a concurrent write from
+another pod is never overwritten from a stale read.
 """
 
 from __future__ import annotations
@@ -38,11 +41,11 @@ def _locate_memory(node_id: str) -> tuple[Path, list[str], int]:
     local index is its global index minus the MEMORY.md card count."""
     from hermes_constants import get_hermes_home
     from agent.learning_graph import _memory_cards
-    from tools.memory_tool import MemoryStore
+    from tools.memory_tool import MemoryStore, memory_file_exists
 
     source, gidx = _parse_memory_id(node_id)
     path = get_hermes_home() / "memories" / _MEMORY_FILES[source]
-    if not path.exists():
+    if not memory_file_exists(path):
         raise ValueError(f"{path.name} not found")
     chunks = MemoryStore._read_file(path)
     cards = _memory_cards()
@@ -61,6 +64,12 @@ def _write_memory(path: Path, chunks: list[str]) -> None:
     never sees a half-written file (and the §-join stays single-sourced)."""
     from tools.memory_tool import MemoryStore
     MemoryStore._write_file(path, [c.strip() for c in chunks if c.strip()])
+
+
+def _memory_section(node_id: str):
+    """The cross-pod read→write section of the node's memory file (no-op off authority)."""
+    from tools.memory_tool import memory_postgres_section
+    return memory_postgres_section(_MEMORY_FILES[_parse_memory_id(node_id)[0]])
 
 
 def _clear_skill_cache() -> None:
@@ -125,9 +134,10 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 
 def _delete_memory(node_id: str) -> dict[str, Any]:
-    path, chunks, local = _locate_memory(node_id)
-    del chunks[local]
-    _write_memory(path, chunks)
+    with _memory_section(node_id):
+        path, chunks, local = _locate_memory(node_id)
+        del chunks[local]
+        _write_memory(path, chunks)
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
 
@@ -151,7 +161,8 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(node_id)
-    chunks[local] = body
-    _write_memory(path, chunks)
+    with _memory_section(node_id):
+        path, chunks, local = _locate_memory(node_id)
+        chunks[local] = body
+        _write_memory(path, chunks)
     return {"ok": True, "message": f"updated memory in {path.name}"}

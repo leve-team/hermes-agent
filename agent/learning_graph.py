@@ -128,15 +128,25 @@ def density_stats(nodes: dict[str, SkillNode], edges: list[tuple[str, str]]) -> 
 
 def _memory_cards() -> list[dict[str, Any]]:
     """``MEMORY.md`` / ``USER.md`` prose split on bare ``§`` separators; every
-    non-empty chunk becomes one card (MEMORY.md cards first, then USER.md)."""
+    non-empty chunk becomes one card (MEMORY.md cards first, then USER.md). On PostgreSQL
+    authority (levos 0065) the text is the ``core_memory_files`` row and its ``updated_at``
+    stands in for the file mtime."""
+    from tools.memory_tool import memory_store_on_postgres, read_memory_document
+
     base = get_hermes_home() / "memories"
+    on_postgres = memory_store_on_postgres()
     cards: list[dict[str, Any]] = []
     for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
         path = base / fname
-        try:
-            text, file_ts = path.read_text(encoding="utf-8").strip(), _to_int_ts(path.stat().st_mtime)
-        except OSError:
-            continue
+        if on_postgres:
+            if (document := read_memory_document(fname)) is None:
+                continue
+            text, file_ts = document[0].strip(), _to_int_ts(document[1])
+        else:
+            try:
+                text, file_ts = path.read_text(encoding="utf-8").strip(), _to_int_ts(path.stat().st_mtime)
+            except OSError:
+                continue
         for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
             if chunk:
                 first = chunk.splitlines()[0].strip().lstrip("# ").strip()

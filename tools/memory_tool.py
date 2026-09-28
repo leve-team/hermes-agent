@@ -41,7 +41,9 @@ def get_memory_dir() -> Path:
 
 
 from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
-    ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore, _scan_memory_content)
+    ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore, _scan_memory_content,
+    memory_file_exists, memory_postgres_section, memory_store_on_postgres,
+    read_memory_document, write_memory_document)
 
 
 def load_on_disk_store() -> "MemoryStore":

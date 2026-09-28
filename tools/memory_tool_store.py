@@ -4,6 +4,7 @@ Module state that tests monkeypatch (``get_memory_dir``, ``fcntl``/``msvcrt``) s
 in ``tools.memory_tool`` and is read lazily."""
 
 import logging
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -20,6 +21,101 @@ MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 ENTRY_DELIMITER = "\n§\n"
+
+# PostgreSQL authority (levos 0065): two pods of one profile share nothing but the profile's
+# PostgreSQL store, so there MEMORY.md / USER.md are rows of ``core_memory_files`` (one row per
+# file, the same §-joined text, drift snapshots as ``<name>.bak.<ts>`` rows) and the per-file
+# flock becomes a transaction advisory lock held for the whole reload→mutate→save section.
+# Nothing under memories/ is created there and nothing falls back to the files: a PostgreSQL
+# failure raises (reads report "could not be read").
+_MEMORY_LOCK_TIMEOUT_SECONDS = 30.0
+_memory_section_state = threading.local()
+
+
+def memory_store_on_postgres() -> bool:
+    """True when this profile's built-in memory lives in PostgreSQL."""
+    from hermes_aux_store import aux_store_authority
+    return aux_store_authority()
+
+
+def _on_postgres() -> bool:
+    """Backend of this thread's memory store, fixed per open section."""
+    return getattr(_memory_section_state, "conn", None) is not None or memory_store_on_postgres()
+
+
+def _initialize_memory_table(conn) -> None:
+    from hermes_aux_store import aux_schema_transaction
+    with aux_schema_transaction(conn, "memory"):
+        conn.execute("CREATE TABLE IF NOT EXISTS memory_files ("
+                     "name TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at REAL NOT NULL)")
+
+
+def _open_memory_store():
+    from hermes_aux_store import open_aux_postgres
+    return open_aux_postgres("memory", initialize=_initialize_memory_table)
+
+
+@contextmanager
+def memory_postgres_section(name: str):
+    """Serialize one read→modify→write of memory file *name* across pods. On PostgreSQL
+    authority: one transaction holding advisory lock ``memory:<name>``; this thread's memory
+    reads and writes go through it and commit (or roll back) with it. Elsewhere a no-op —
+    the file store keeps its own flock."""
+    from hermes_aux_store import aux_xact_lock
+    lock = f"memory:{name}"
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is not None:
+        aux_xact_lock(conn, lock, timeout_seconds=_MEMORY_LOCK_TIMEOUT_SECONDS)
+        yield
+        return
+    if not memory_store_on_postgres():
+        yield
+        return
+    conn = _open_memory_store()
+    try:
+        with conn:
+            aux_xact_lock(conn, lock, timeout_seconds=_MEMORY_LOCK_TIMEOUT_SECONDS)
+            _memory_section_state.conn = conn
+            try:
+                yield
+            finally:
+                _memory_section_state.conn = None
+    finally:
+        conn.close()
+
+
+def _pg_select_memory(conn, name: str) -> Optional[Tuple[str, float]]:
+    row = conn.execute("SELECT content, updated_at FROM memory_files WHERE name = ?", (name,)).fetchone()
+    return (row["content"], row["updated_at"]) if row else None
+
+
+def read_memory_document(name: str) -> Optional[Tuple[str, float]]:
+    """``(text, updated_at)`` of memory file *name* in PostgreSQL, or None if absent."""
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is not None:
+        return _pg_select_memory(conn, name)
+    conn = _open_memory_store()
+    try:
+        return _pg_select_memory(conn, name)
+    finally:
+        conn.close()
+
+
+def write_memory_document(name: str, content: str) -> None:
+    """Replace memory file *name*'s row; only inside ``memory_postgres_section``."""
+    conn = getattr(_memory_section_state, "conn", None)
+    if conn is None:
+        raise RuntimeError("memory files are written only inside memory_postgres_section()")
+    conn.execute(
+        "INSERT INTO memory_files (name, content, updated_at) "
+        "VALUES (?, ?, EXTRACT(EPOCH FROM clock_timestamp())) "
+        "ON CONFLICT (name) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+        (name, content))
+
+
+def memory_file_exists(path: Path) -> bool:
+    """Whether memory file *path* exists in this profile's memory store."""
+    return read_memory_document(path.name) is not None if _on_postgres() else path.exists()
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -126,7 +222,8 @@ class MemoryStore:
 
         for target in ("memory", "user"):
             path = self._path_for(target)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if not _on_postgres():
+                path.parent.mkdir(parents=True, exist_ok=True)
             # Deduplicate (order-preserving, first occurrence wins).
             entries = list(dict.fromkeys(self._read_file(path)))
             self._set_entries(target, entries)
@@ -143,7 +240,12 @@ class MemoryStore:
     @contextmanager
     def _file_lock(path: Path):
         """Exclusive lock on a separate .lock file so the memory file itself can
-        still be atomically replaced."""
+        still be atomically replaced. On PostgreSQL authority the lock is the
+        cross-pod ``memory_postgres_section`` instead."""
+        if _on_postgres():
+            with memory_postgres_section(path.name):
+                yield
+            return
         from tools import memory_tool as _mt  # fcntl/msvcrt live (and are patched) there
         fcntl, msvcrt = _mt.fcntl, _mt.msvcrt
         lock_path = path.with_suffix(path.suffix + ".lock")
@@ -214,7 +316,8 @@ class MemoryStore:
             if isinstance(result, dict):
                 return result
             self._set_entries(target, result[0])
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if not _on_postgres():
+                path.parent.mkdir(parents=True, exist_ok=True)
             self._write_file(path, result[0])
             return self._success_response(target, result[1])
 
@@ -373,7 +476,16 @@ class MemoryStore:
     def _read_raw_checked(path: Path) -> Tuple[str, bool]:
         """``(raw, read_ok)``; ``read_ok`` is False ONLY when the file EXISTS but can't be
         read. Decoding stays STRICT (``errors="replace"`` would hand callers a lossy view
-        a save then persists); ``utf-8-sig`` strips a Notepad BOM off the first entry."""
+        a save then persists); ``utf-8-sig`` strips a Notepad BOM off the first entry.
+        On PostgreSQL authority the text is the ``core_memory_files`` row; a PostgreSQL
+        failure is ``read_ok=False`` (never a file read)."""
+        if _on_postgres():
+            try:
+                document = read_memory_document(path.name)
+            except Exception as exc:
+                logger.warning("Could not read %s from PostgreSQL: %s", path.name, type(exc).__name__)
+                return "", False
+            return (document[0] if document else ""), True
         if not path.exists():
             return "", True
         try:
@@ -401,7 +513,11 @@ class MemoryStore:
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
         """Atomic temp-file + rename: readers never see a truncated file. Also used by
-        agent/learning_mutations.py."""
+        agent/learning_mutations.py. On PostgreSQL authority the text replaces the
+        ``core_memory_files`` row inside the open ``memory_postgres_section``."""
+        if _on_postgres():
+            write_memory_document(path.name, ENTRY_DELIMITER.join(entries))
+            return
         try:
             atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_")
         except OSError as e:
@@ -417,6 +533,12 @@ class MemoryStore:
             return None
         path = self._path_for(target)
         bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
+        if _on_postgres():  # the snapshot is a row next to the document, in the same section
+            try:
+                write_memory_document(bak_path.name, raw)
+            except Exception:
+                return f"core_memory_files/{bak_path.name} (BACKUP FAILED — row unchanged)"
+            return f"core_memory_files/{bak_path.name}"
         try:
             bak_path.write_text(raw, encoding="utf-8")
         except OSError:
