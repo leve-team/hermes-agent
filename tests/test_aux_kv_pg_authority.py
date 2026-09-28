@@ -252,6 +252,28 @@ def test_authority_sets_targets_voice_estop_webhooks_without_files(authority, _h
     assert _state_files(_home) == []
 
 
+def test_authority_whole_set_webhook_save_replaces_rows_without_a_file(authority, _home):
+    """The dashboard's webhook routes load the whole set, edit it and save it back through
+    ``_save_subscriptions``; on authority that save is the namespace's rows, never the file."""
+    from hermes_cli import webhook
+
+    webhook._store_subscription("keep", _route("keep"))
+    webhook._store_subscription("drop", _route("drop"))
+    subs = webhook._load_subscriptions()
+    del subs["drop"]
+    subs["keep"]["enabled"] = False
+    subs["added"] = _route("added")
+    webhook._save_subscriptions(subs)
+
+    assert webhook._load_subscriptions() == subs
+    assert sorted(key for key, _ in _kv_rows(authority, aux.KV_WEBHOOK_SUBSCRIPTIONS)) == [
+        "added", "keep"]
+    adapter = _webhook_adapter()
+    adapter._reload_dynamic_routes()
+    assert sorted(adapter._routes) == ["added", "keep"]
+    assert _state_files(_home) == []
+
+
 # --------------------------------------------------------------------------
 # (e) authority without PostgreSQL: loud, or fail-safe where the module says so
 # --------------------------------------------------------------------------

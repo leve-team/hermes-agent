@@ -69,6 +69,19 @@ def _load_subscriptions() -> Dict[str, dict]:
 
 
 def _save_subscriptions(subs: Dict[str, dict]) -> None:
+    namespace = subscriptions_kv_namespace()
+    if namespace is not None:
+        # Whole-set callers (the dashboard's webhook routes) replace the namespace, as they
+        # replaced the file; never a file write on authority.
+        from hermes_aux_store import aux_kv_delete, aux_kv_items, aux_kv_put, aux_kv_transaction
+
+        with aux_kv_transaction(namespace) as conn:
+            for name, _value in aux_kv_items(namespace, conn=conn):
+                if name not in subs:
+                    aux_kv_delete(namespace, name, conn=conn)
+            for name, route in subs.items():
+                aux_kv_put(namespace, name, json.dumps(route, ensure_ascii=False), conn=conn)
+        return
     # The file holds per-route HMAC secrets: atomic_json_write fchmods the temp file 0o600 BEFORE the
     # rename (no umask window) and re-asserts the mode on the destination afterwards.
     atomic_json_write(_subscriptions_path(), subs, mode=_SUBSCRIPTIONS_FILE_MODE)
