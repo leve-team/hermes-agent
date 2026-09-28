@@ -1,4 +1,10 @@
-"""hermes webhook — manage dynamic webhook subscriptions from the CLI."""
+"""hermes webhook — manage dynamic webhook subscriptions from the CLI.
+
+Subscriptions persist to ``webhook_subscriptions.json`` in the profile home. On a
+PostgreSQL-authority profile (levos 0067) they are rows of the profile's store instead
+(``aux_kv`` namespace ``webhook_subscriptions``, one per route), so every pod serves the
+same routes and a new pod does not lose them.
+"""
 
 import hashlib
 import hmac
@@ -8,7 +14,7 @@ import secrets
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from hermes_constants import display_hermes_home
 from utils import atomic_json_write
@@ -24,7 +30,34 @@ def _subscriptions_path() -> Path:
     return get_hermes_home() / _SUBSCRIPTIONS_FILENAME
 
 
+def subscriptions_kv_namespace() -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend."""
+    try:
+        from hermes_aux_store import KV_WEBHOOK_SUBSCRIPTIONS, aux_store_authority
+    except ImportError:
+        return None
+    return KV_WEBHOOK_SUBSCRIPTIONS if aux_store_authority() else None
+
+
+def load_kv_subscriptions(namespace: str) -> Dict[str, dict]:
+    """Subscriptions stored in PostgreSQL; malformed rows are skipped."""
+    from hermes_aux_store import aux_kv_items
+
+    subs: Dict[str, dict] = {}
+    for name, value in aux_kv_items(namespace):
+        try:
+            route = json.loads(value)
+        except ValueError:
+            continue
+        if isinstance(route, dict):
+            subs[name] = route
+    return subs
+
+
 def _load_subscriptions() -> Dict[str, dict]:
+    namespace = subscriptions_kv_namespace()
+    if namespace is not None:
+        return load_kv_subscriptions(namespace)
     path = _subscriptions_path()
     if not path.exists():
         return {}
@@ -39,6 +72,32 @@ def _save_subscriptions(subs: Dict[str, dict]) -> None:
     # The file holds per-route HMAC secrets: atomic_json_write fchmods the temp file 0o600 BEFORE the
     # rename (no umask window) and re-asserts the mode on the destination afterwards.
     atomic_json_write(_subscriptions_path(), subs, mode=_SUBSCRIPTIONS_FILE_MODE)
+
+
+def _store_subscription(name: str, route: dict) -> None:
+    """Create or replace one subscription (a single row on authority, so a concurrent
+    change to another subscription is never overwritten)."""
+    namespace = subscriptions_kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_put
+
+        aux_kv_put(namespace, name, json.dumps(route, ensure_ascii=False))
+        return
+    subs = _load_subscriptions()
+    subs[name] = route
+    _save_subscriptions(subs)
+
+
+def _delete_subscription(name: str) -> None:
+    namespace = subscriptions_kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_delete
+
+        aux_kv_delete(namespace, name)
+        return
+    subs = _load_subscriptions()
+    subs.pop(name, None)
+    _save_subscriptions(subs)
 
 
 def _get_webhook_config() -> dict:
@@ -135,8 +194,7 @@ def _cmd_subscribe(args):
         route["script"] = script
     if args.deliver_chat_id:
         route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
-    subs[name] = route
-    _save_subscriptions(subs)
+    _store_subscription(name, route)
 
     print(f"\n  {'Updated' if is_update else 'Created'} webhook subscription: {name}")
     print(f"  URL:    {_get_webhook_base_url()}/webhooks/{name}")
@@ -188,8 +246,7 @@ def _cmd_remove(args):
         print(f"  No subscription named '{name}'.")
         print("  Note: Static routes from config.yaml cannot be removed here.")
         return
-    del subs[name]
-    _save_subscriptions(subs)
+    _delete_subscription(name)
     print(f"  Removed webhook subscription: {name}")
 
 

@@ -353,7 +353,17 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     def _reload_dynamic_routes(self) -> None:
-        """Reload agent-created subscriptions from disk if the file changed."""
+        """Reload agent-created subscriptions from disk if the file changed.
+
+        On a PostgreSQL-authority profile (levos 0067) they come from the profile's store instead,
+        re-read on every call: a subscription made or removed on another pod applies here on the
+        next request."""
+        from hermes_cli.webhook import subscriptions_kv_namespace
+
+        namespace = subscriptions_kv_namespace()
+        if namespace is not None:
+            self._reload_dynamic_routes_from_postgres(namespace)
+            return
         from hermes_constants import get_hermes_home
         subs_path = get_hermes_home() / _DYNAMIC_ROUTES_FILENAME
         if not subs_path.exists():
@@ -368,14 +378,31 @@ class WebhookAdapter(BasePlatformAdapter):
             data = json.loads(subs_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return
-            self._dynamic_routes = {  # static routes take precedence
-                k: v for k, v in data.items() if k not in self._static_routes and self._dynamic_route_allowed(k, v)}
-            self._routes = {**self._dynamic_routes, **self._static_routes}
+            self._apply_dynamic_routes(data)
             self._dynamic_routes_mtime = mtime
-            logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
-                        ", ".join(self._dynamic_routes.keys()) or "(none)")
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+
+    def _reload_dynamic_routes_from_postgres(self, namespace: str) -> None:
+        from hermes_cli.webhook import load_kv_subscriptions
+
+        try:
+            data = load_kv_subscriptions(namespace)
+            if data == getattr(self, "_dynamic_routes_source", None):
+                return  # No change
+            self._apply_dynamic_routes(data)
+            self._dynamic_routes_source = data
+        except Exception as e:
+            # Keep serving the routes last read; nothing falls back to a file.
+            logger.error("[webhook] Failed to reload dynamic routes: %s", e)
+
+    def _apply_dynamic_routes(self, data: Dict[str, dict]) -> None:
+        """Merge agent-created subscriptions under the static routes (validated per route)."""
+        self._dynamic_routes = {  # static routes take precedence
+            k: v for k, v in data.items() if k not in self._static_routes and self._dynamic_route_allowed(k, v)}
+        self._routes = {**self._dynamic_routes, **self._static_routes}
+        logger.info("[webhook] Reloaded %d dynamic route(s): %s", len(self._dynamic_routes),
+                    ", ".join(self._dynamic_routes.keys()) or "(none)")
 
     async def _handle_profile_ingress(self, request: "web.Request") -> "web.StreamResponse":
         profile = self._resolve_request_profile(request)

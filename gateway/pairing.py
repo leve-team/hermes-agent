@@ -4,7 +4,9 @@ Unknown users receive a one-time pairing code that the bot owner approves via th
 CLI, instead of static user-ID allowlists. Security properties (OWASP + NIST SP
 800-63-4): 8-char codes from a 32-char unambiguous alphabet via ``secrets``, 1-hour
 expiry, max 3 pending per platform, 1 request per user per 10 min, lockout after 5
-failed approvals, chmod 0600 data files, codes never logged. Storage: ~/.hermes/pairing/
+failed approvals, chmod 0600 data files, codes never logged. Storage: ~/.hermes/pairing/ —
+or, on a PostgreSQL-authority profile, one ``aux_kv`` row per file in the profile's store
+(levos 0067), so every pod of the profile sees the same grants.
 """
 
 import contextlib
@@ -242,6 +244,75 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
     _sync_live_adapter_allowlist_remove(platform, user_id)
 
 
+def _pairing_kv_namespace(profile: Optional[str]) -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend.
+
+    The authority store is the active profile's; an explicit other profile (a
+    multiplex gateway) gets its own namespace so grants never cross profiles.
+    """
+    try:
+        from hermes_aux_store import KV_PAIRING, aux_store_authority
+    except ImportError:
+        return None
+    if not aux_store_authority():
+        return None
+    if profile:
+        from hermes_state_postgres import _is_active_profile
+
+        if not _is_active_profile(profile):
+            return f"{KV_PAIRING}@{profile}"
+    return KV_PAIRING
+
+
+class _PairingLock:
+    """``PairingStore._lock`` on PostgreSQL authority.
+
+    The in-process RLock plus, for the outermost section, one transaction holding
+    the pairing namespace's advisory lock: a read-modify-write of the grants is
+    then atomic across pods, not only across adapter threads. The section's
+    handle serves only the thread that holds it.
+    """
+
+    def __init__(self, namespace: str):
+        self._rlock = threading.RLock()
+        self._namespace = namespace
+        self._depth = 0
+        self._owner: Optional[int] = None
+        self._section = None
+        self._conn = None
+
+    def __enter__(self):
+        self._rlock.acquire()
+        if self._depth == 0:
+            try:
+                from hermes_aux_store import aux_kv_transaction
+
+                section = aux_kv_transaction(self._namespace)
+                self._conn = section.__enter__()
+            except BaseException:
+                self._rlock.release()
+                raise
+            self._section = section
+            self._owner = threading.get_ident()
+        self._depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._depth -= 1
+        try:
+            if self._depth == 0:
+                section, self._section = self._section, None
+                self._conn = self._owner = None
+                section.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._rlock.release()
+        return False
+
+    def connection(self):
+        """The open section's handle for its own thread, else None."""
+        return self._conn if self._owner == threading.get_ident() else None
+
+
 def _load_json_file(path: Path) -> dict:
     """Read a JSON object; {} when missing, malformed, unreadable, or not a dict.
 
@@ -343,16 +414,22 @@ class PairingStore:
     """
 
     def __init__(self, profile: Optional[str] = None):
+        # PostgreSQL authority (levos 0067): the files below become rows of this
+        # namespace; ``self._dir`` only names them and is never created.
+        self._kv_namespace = _pairing_kv_namespace(profile)
         profile_home = None
         if profile:
             root = get_default_hermes_root()
             profile_home = root if profile == "default" else root / "profiles" / profile
         self._dir = get_hermes_dir("platforms/pairing", "pairing", home=profile_home) if profile else _default_pairing_dir()
+        self._profile = profile  # for diagnostics / log lines
+        if self._kv_namespace is not None:
+            self._lock = _PairingLock(self._kv_namespace)
+            return
         self._dir.mkdir(parents=True, exist_ok=True)
         # Merge the alternate old/new layout so upgrades cannot split approvals.
         _migrate_split_pairing_dirs(home=profile_home, active=self._dir)
         self._lock = threading.RLock()  # adapters run concurrently in threads sharing one store
-        self._profile = profile  # for diagnostics / log lines
 
     @property
     def profile(self) -> Optional[str]:
@@ -380,8 +457,25 @@ class PairingStore:
         if len(live) != len(pending):
             self._save_json(path, live)
 
-    _load_json = staticmethod(_load_json_file)
-    _save_json = staticmethod(_save_json_file)
+    def _load_json(self, path: Path) -> dict:
+        if self._kv_namespace is None:
+            return _load_json_file(path)
+        from hermes_aux_store import aux_kv_get
+
+        text = aux_kv_get(self._kv_namespace, path.name, conn=self._lock.connection())
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_json(self, path: Path, data: dict) -> None:
+        if self._kv_namespace is None:
+            return _save_json_file(path, data)
+        from hermes_aux_store import aux_kv_put
+
+        aux_kv_put(self._kv_namespace, path.name, json.dumps(data, indent=2, ensure_ascii=False),
+                   conn=self._lock.connection())
 
     def _platforms(self, platform: Optional[str], suffix: str) -> list:
         return [platform] if platform else self._all_platforms(suffix)
@@ -408,8 +502,12 @@ class PairingStore:
             del approved[approved_user_id]
         approved[normalized_user_id] = {"user_name": user_name, "approved_at": time.time()}
         self._save_json(self._approved_path(platform), approved)
-        # Mirror the grant into the operator's allowlist when one is configured.
-        _sync_allowlist_add(platform, normalized_user_id)
+        # Mirror the grant into the operator's allowlist when one is configured. Not on
+        # PostgreSQL authority: ``.env`` there is one pod's disk, so the mirror would
+        # authorize on that pod only and outlive a revoke made on another; the grant
+        # row just written is the record every pod honors.
+        if self._kv_namespace is None:
+            _sync_allowlist_add(platform, normalized_user_id)
 
     def revoke(self, platform: str, user_id: str) -> bool:
         """Remove a user from the approved list. Returns True if found."""
@@ -422,8 +520,13 @@ class PairingStore:
             for approved_user_id in matching_ids:
                 del approved[approved_user_id]
             self._save_json(path, approved)
-            # Keep the allowlist mirror in sync (no-op if added by other means).
-            _sync_allowlist_remove(platform, user_id)
+            # Keep the allowlist mirror in sync (no-op if added by other means). On
+            # PostgreSQL authority there is no pod-local mirror to undo; only this
+            # process's live adapter snapshots are cleared.
+            if self._kv_namespace is None:
+                _sync_allowlist_remove(platform, user_id)
+            else:
+                _sync_live_adapter_allowlist_remove(platform, user_id)
             return True
 
     # ----- Pending codes -----
@@ -569,11 +672,14 @@ class PairingStore:
         )
 
     def _record_rate_limit(self, platform: str, user_id: str) -> None:
-        limits = self._limits()
-        now = time.time()
-        for alias in _user_id_aliases(platform, user_id):
-            limits[f"{platform}:{alias}"] = now
-        self._save_limits(limits)
+        # The gateway also calls this outside generate_code; the lock keeps the
+        # read-modify-write from dropping a concurrent lockout record.
+        with self._lock:
+            limits = self._limits()
+            now = time.time()
+            for alias in _user_id_aliases(platform, user_id):
+                limits[f"{platform}:{alias}"] = now
+            self._save_limits(limits)
 
     def _is_locked_out(self, platform: str) -> bool:
         return time.time() < self._limits().get(f"_lockout:{platform}", 0)
@@ -602,5 +708,11 @@ class PairingStore:
     def _all_platforms(self, suffix: str) -> list:
         """Platforms that have a ``-<suffix>.json`` data file (``_``-prefixed files are shared state)."""
         tail = f"-{suffix}.json"
-        platforms = (f.name.replace(tail, "") for f in self._dir.iterdir() if f.name.endswith(tail))
+        if self._kv_namespace is not None:
+            from hermes_aux_store import aux_kv_items
+
+            names = [name for name, _ in aux_kv_items(self._kv_namespace, conn=self._lock.connection())]
+        else:
+            names = [f.name for f in self._dir.iterdir()]
+        platforms = (name.replace(tail, "") for name in names if name.endswith(tail))
         return [p for p in platforms if not p.startswith("_")]

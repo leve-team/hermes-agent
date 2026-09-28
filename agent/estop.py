@@ -6,6 +6,11 @@ turns skip work; in-flight work is never killed. The check is one or two uncache
 ``os.stat`` calls (process home + fleet root when they differ). The body is optional
 JSON ``{"reason", "engaged_at"}``; a corrupt/empty file still counts as engaged
 (fail safe, e.g. ``touch ~/.hermes/ESTOP``). Ported from gastownhall/gastown estop.go (MIT).
+
+On a PostgreSQL-authority profile (levos 0067) the sentinel is a row of the profile's store
+(``aux_kv`` namespace ``estop``) instead of a file: every pod of the profile pauses together, and
+a pod started on a fresh disk is still paused. Each check is one indexed read; a store that cannot
+answer counts as engaged, as an unreadable sentinel does.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_pa
 
 SENTINEL_NAME = "ESTOP"
 
+logger = logging.getLogger(__name__)
+
 # Per-component "logged already for this engagement" flags: log once per engagement, not per tick.
 _log_lock = threading.Lock()
 _logged_components: set[str] = set()
@@ -31,6 +38,29 @@ _logged_components: set[str] = set()
 def sentinel_path() -> Path:
     """Path of the ESTOP sentinel this process would write on `hermes pause`."""
     return _hermes_home() / SENTINEL_NAME
+
+
+def _kv_namespace() -> Optional[str]:
+    """``aux_kv`` namespace on PostgreSQL authority, None on every other backend."""
+    try:
+        from hermes_aux_store import KV_ESTOP, aux_store_authority
+    except ImportError:
+        return None
+    return KV_ESTOP if aux_store_authority() else None
+
+
+def location() -> str:
+    """Where the sentinel lives, for operator-facing messages."""
+    if _kv_namespace() is not None:
+        return "the profile's PostgreSQL store"
+    return str(sentinel_path())
+
+
+def _kv_read(namespace: str) -> Optional[str]:
+    """The stored sentinel body, None when not engaged. Raises on store failure."""
+    from hermes_aux_store import aux_kv_get
+
+    return aux_kv_get(namespace, SENTINEL_NAME)
 
 
 def _candidate_sentinel_paths() -> list:
@@ -50,7 +80,15 @@ def _candidate_sentinel_paths() -> list:
 
 
 def is_engaged() -> bool:
-    """True if ANY candidate sentinel exists; fail SAFE (True) on stat errors."""
+    """True if ANY candidate sentinel exists; fail SAFE (True) on stat errors — and, on PostgreSQL
+    authority, on a store that cannot answer."""
+    try:
+        namespace = _kv_namespace()
+        if namespace is not None:
+            return _kv_read(namespace) is not None
+    except Exception as exc:
+        logger.warning("ESTOP state unreadable (%s) — treating the pause as engaged", type(exc).__name__)
+        return True
     saw_stat_error = False
     for path in _candidate_sentinel_paths():
         try:
@@ -65,6 +103,13 @@ def engage(reason: Optional[str] = None) -> Path:
     """Create the ESTOP sentinel. Idempotent; re-engaging updates the file."""
     path = sentinel_path()
     payload = {"engaged_at": datetime.now(timezone.utc).isoformat(), "reason": reason or None}
+    namespace = _kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_put
+
+        # No best-effort here: a pause that did not reach the store must fail.
+        aux_kv_put(namespace, SENTINEL_NAME, json.dumps(payload, indent=2))
+        return path
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -76,6 +121,11 @@ def engage(reason: Optional[str] = None) -> Path:
 
 def disengage() -> bool:
     """Remove every visible sentinel (process-local and fleet-root)."""
+    namespace = _kv_namespace()
+    if namespace is not None:
+        from hermes_aux_store import aux_kv_delete
+
+        return aux_kv_delete(namespace, SENTINEL_NAME)
     lifted = False
     for path in _candidate_sentinel_paths():
         try:
@@ -89,6 +139,20 @@ def disengage() -> bool:
 def get_state() -> Optional[dict]:
     """Return ``{"reason", "engaged_at"}`` or None when not engaged; an unreadable/corrupt
     body still reports engaged with both fields None."""
+    namespace = _kv_namespace()
+    if namespace is not None:
+        try:
+            body = _kv_read(namespace)
+        except Exception:
+            return {"reason": None, "engaged_at": None}  # fail safe, as is_engaged
+        if body is None:
+            return None
+        state = {"reason": None, "engaged_at": None}
+        with suppress(ValueError):
+            raw = json.loads(body)
+            if isinstance(raw, dict):
+                state = {"reason": raw.get("reason") or None, "engaged_at": raw.get("engaged_at") or None}
+        return state
     if not is_engaged():
         return None
     state = {"reason": None, "engaged_at": None}
@@ -133,7 +197,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
         suffix = f" (reason: {reason})" if reason else ""
         logger.info(
             "%s dispatch paused by global emergency stop%s — remove with `hermes resume` (%s)",
-            component, suffix, sentinel_path(),
+            component, suffix, location(),
         )
     return True
 
