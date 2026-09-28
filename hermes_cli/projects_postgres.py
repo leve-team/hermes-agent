@@ -25,7 +25,9 @@ class ProjectsPostgresConnection(KanbanPostgresConnection):
     projects_dialect = kanban_dialect = ProjectsPostgresDialect()
 
 
-def open_projects_postgres(schema_sql, migrate):
+def open_projects_postgres(schema_sql, migrate, *, dsn=None):
+    """Open projects on PostgreSQL: ``dsn`` (the authority profile's session
+    DSN) when given, else ``HERMES_PROJECTS_POSTGRES_DSN``."""
     if hermes_home_key(get_hermes_home()) != hermes_home_key(get_process_hermes_home()):
         raise ValueError(
             "PostgreSQL projects DSN cannot serve another profile override"
@@ -34,6 +36,7 @@ def open_projects_postgres(schema_sql, migrate):
         return open_postgres(
             schema_sql,
             migrate,
+            dsn=dsn,
             env_var="HERMES_PROJECTS_POSTGRES_DSN",
             connection_type=ProjectsPostgresConnection,
         )

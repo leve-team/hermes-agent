@@ -120,21 +120,32 @@ def _ledger_enabled() -> bool:
 
 
 def _connect() -> sqlite3.Connection:
+    """Open the ledger on the profile's backend (PostgreSQL authority or SQLite).
+
+    ``open_aux_store`` closes the just-opened connection when a PRAGMA/DDL
+    failure happens after connect(), so it never leaks back to the caller. On
+    PostgreSQL authority an unreachable store raises ``AuxStoreUnavailable``;
+    it never degrades to the SQLite file.
+    """
+    from hermes_aux_store import open_aux_store
+
+    return open_aux_store(
+        "verification_evidence",
+        sqlite_path=_db_path(),
+        initialize=_initialize_connection,
+    )
+
+
+def _initialize_connection(conn: sqlite3.Connection) -> None:
+    if getattr(conn, "is_postgres", False):
+        _ensure_schema(conn)
+        return
     from hermes_state_wal import apply_wal_with_fallback
 
-    path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    try:
-        apply_wal_with_fallback(conn, db_label="verification_evidence.db")
-        conn.execute("PRAGMA busy_timeout=5000")
-        _ensure_schema(conn)
-    except Exception:
-        # A PRAGMA/DDL failure after connect() must not leak the open connection.
-        conn.close()
-        raise
-    return conn
+    apply_wal_with_fallback(conn, db_label="verification_evidence.db")
+    conn.execute("PRAGMA busy_timeout=5000")
+    _ensure_schema(conn)
 
 
 @contextmanager

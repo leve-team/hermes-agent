@@ -119,8 +119,11 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     WAL with DELETE fallback for network filesystems (``hermes_state`` helper). Schema init is
     idempotent (``CREATE TABLE IF NOT EXISTS`` + additive migrations) and cached per-path per-process.
 
-    ``HERMES_PROJECTS_BACKEND=postgres`` opts into the projects DSN. Explicit
-    SQLite paths cannot be mixed with PostgreSQL selection.
+    ``HERMES_PROJECTS_BACKEND=postgres`` opts into the projects DSN. A
+    PostgreSQL-authority profile (``sessions.state_backend: authority``) uses
+    its own session-store DSN with the same adapter and tables, and never
+    opens ``projects.db``. Explicit SQLite paths cannot be mixed with
+    PostgreSQL selection.
     """
     if _resolve_backend(env_var="HERMES_PROJECTS_BACKEND") == "postgres":
         if db_path is not None:
@@ -128,6 +131,22 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         from hermes_cli.projects_postgres import open_projects_postgres
 
         return open_projects_postgres(SCHEMA_SQL, _migrate_add_optional_columns)
+    from hermes_aux_store import aux_store_authority
+
+    if aux_store_authority():
+        if os.environ.get("HERMES_PROJECTS_BACKEND"):
+            raise ValueError(
+                "HERMES_PROJECTS_BACKEND=sqlite contradicts the profile's "
+                "PostgreSQL authority"
+            )
+        if db_path is not None:
+            raise ValueError("PostgreSQL projects cannot use a SQLite db_path")
+        from hermes_cli.projects_postgres import open_projects_postgres
+        from hermes_state_postgres import resolve_postgres_dsn
+
+        return open_projects_postgres(
+            SCHEMA_SQL, _migrate_add_optional_columns, dsn=resolve_postgres_dsn()
+        )
     path = db_path if db_path is not None else projects_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
