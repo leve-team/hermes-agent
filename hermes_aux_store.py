@@ -114,6 +114,15 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     # dead targets, voice modes, ESTOP, webhook subscriptions, ...), one row per
     # entry. No SQLite form: every other backend keeps the owners' JSON files.
     "aux_kv": (AuxTable("aux_kv", "core_aux_kv", ("namespace", "key")),),
+    # levos v3 (t_2b6c09df): acceptance records of client request ids for
+    # ``prompt.submit`` / ``session.create`` (``tui_gateway/submit_idempotency.py``).
+    # No SQLite form: off authority the ids are accepted and ignored.
+    "submit_idempotency": (
+        AuxTable("submit_accepts", "core_submit_accepts", ("session_key", "client_msg_id")),
+        AuxTable(
+            "session_creates", "core_submit_session_creates", ("profile", "client_create_id")
+        ),
+    ),
 }
 _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
     "verification_evidence": {
@@ -125,6 +134,11 @@ _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
         "idx_executions_occurrence": "idx_core_cron_executions_occurrence",
         "idx_cron_incidents_job": "idx_core_cron_incidents_job",
         "idx_cron_incidents_state": "idx_core_cron_incidents_state",
+    },
+    "submit_idempotency": {
+        "idx_submit_accepts_msg": "idx_core_submit_accepts_msg",
+        "idx_submit_accepts_updated": "idx_core_submit_accepts_updated",
+        "idx_session_creates_updated": "idx_core_submit_session_creates_updated",
     },
 }
 
