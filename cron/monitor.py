@@ -7,7 +7,9 @@ tick: unchanged → agent run suppressed (silent ``no_change`` run); changed/fir
 CHANGE DETECTED" block (capped unified diff + new output) is injected into the prompt; source
 failure → an ERROR, never a change, and the stored hash is left untouched. State:
 ``job["monitor_state"]`` in jobs.json (hash + last_changed_at) and
-``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` (for the diff).
+``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` (for the diff) — on a PostgreSQL authority profile
+the ``monitor`` row of ``core_cron_outputs`` instead (levos 0068): the next tick may run on another
+pod.
 """
 
 from __future__ import annotations
@@ -65,7 +67,11 @@ def _snapshot_path(job_id: str):
 
 
 def _read_last_output(job_id: str) -> str:
+    from cron import durable
+
     try:
+        if durable.authority():
+            return durable.load_output(job_id, durable.MONITOR) or ""
         path = _snapshot_path(job_id)
         if path.exists():
             return path.read_text(encoding="utf-8")
@@ -75,7 +81,12 @@ def _read_last_output(job_id: str) -> str:
 
 
 def _write_last_output(job_id: str, output: str) -> None:
+    from cron import durable
+
     try:
+        if durable.authority():
+            durable.save_output(job_id, durable.MONITOR, output)
+            return
         from cron.jobs import _ensure_cron_dir
 
         path = _snapshot_path(job_id)

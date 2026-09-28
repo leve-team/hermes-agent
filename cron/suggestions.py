@@ -5,11 +5,15 @@ A suggestion is a ready-to-run cron job spec the user accepts (creates the real 
 of source: ``catalog`` (curated starters), ``blueprint`` (skill ``blueprint:`` blocks, see
 ``tools/blueprints.py``), ``usage`` (self-improvement review), ``integration`` (connected account).
 Accepting calls ``cron.jobs.create_job`` with the stored ``job_spec`` — no second job engine;
-nothing auto-creates (consent-first). Storage mirrors ``cron/jobs.py`` (atomic replace, 0600).
+nothing auto-creates (consent-first). Storage mirrors ``cron/jobs.py`` (atomic replace, 0600). On
+a PostgreSQL-authority profile (levos 0068) the records live one row per suggestion in the
+profile's store (``core_cron_suggestions``) and the lock is a PostgreSQL advisory lock, so two pods
+of the profile see and latch the same suggestions; no file is written.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -17,7 +21,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -34,6 +38,9 @@ SUGGESTIONS_FILE: Optional[Path] = None
 
 # Protects load->modify->save cycles (the background review fork and the main agent can both write).
 _suggestions_lock = threading.Lock()
+# The PostgreSQL connection of this thread's open section (authority only).
+_section = threading.local()
+_LOCK_TIMEOUT_SECONDS = 30.0
 
 # Cap pending suggestions so the list never becomes a nag wall; when full, new ones are dropped.
 MAX_PENDING = 5
@@ -61,7 +68,101 @@ def _ensure_dir() -> None:
     _ensure_cron_dir(_current_suggestions_file().parent)
 
 
+def _initialize_table(conn) -> None:
+    from hermes_aux_store import aux_schema_transaction
+
+    with aux_schema_transaction(conn, "cron_suggestions"):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS cron_suggestions (
+                 id TEXT PRIMARY KEY,
+                 position INTEGER NOT NULL,
+                 record TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+               )"""
+        )
+
+
+def _open_store():
+    from hermes_aux_store import open_aux_postgres
+
+    return open_aux_postgres("cron_suggestions", initialize=_initialize_table)
+
+
+@contextlib.contextmanager
+def _suggestions_section() -> Iterator[None]:
+    """Serialize a load->modify->save cycle. Off authority: the in-process lock. On PostgreSQL
+    authority additionally one transaction holding ``pg_advisory_xact_lock`` for the whole cycle,
+    so a cycle on another pod cannot interleave; a wait beyond ``_LOCK_TIMEOUT_SECONDS`` raises
+    ``AuxStoreUnavailable``."""
+    with _suggestions_lock:
+        from hermes_aux_store import aux_store_authority, aux_xact_lock
+
+        if not aux_store_authority():
+            yield
+            return
+        conn = _open_store()
+        try:
+            with conn:
+                aux_xact_lock(conn, "cron-suggestions", timeout_seconds=_LOCK_TIMEOUT_SECONDS)
+                _section.conn = conn
+                try:
+                    yield
+                finally:
+                    _section.conn = None
+        finally:
+            conn.close()
+
+
+def _pg_read(conn) -> List[Dict[str, Any]]:
+    return [
+        json.loads(row["record"])
+        for row in conn.execute(
+            "SELECT record FROM cron_suggestions ORDER BY position, id"
+        ).fetchall()
+    ]
+
+
+def _pg_write(conn, suggestions: List[Dict[str, Any]]) -> None:
+    """Make the stored rows equal *suggestions*, in order; unchanged rows stay."""
+    documents: Dict[str, tuple] = {}
+    for position, record in enumerate(suggestions):
+        record_id = str(record.get("id") or "")
+        if not record_id:
+            raise ValueError("a suggestion without an id cannot be stored")
+        if record_id in documents:
+            raise ValueError(f"duplicate suggestion id {record_id!r}")
+        documents[record_id] = (position, json.dumps(record, ensure_ascii=False))
+    stored = {
+        row["id"]: (row["position"], row["record"])
+        for row in conn.execute("SELECT id, position, record FROM cron_suggestions").fetchall()
+    }
+    for record_id in stored.keys() - documents.keys():
+        conn.execute("DELETE FROM cron_suggestions WHERE id = ?", (record_id,))
+    now = _hermes_now().isoformat()
+    for record_id, (position, document) in documents.items():
+        if stored.get(record_id) == (position, document):
+            continue
+        conn.execute(
+            """INSERT INTO cron_suggestions (id, position, record, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (id) DO UPDATE SET position = EXCLUDED.position,
+                 record = EXCLUDED.record, updated_at = EXCLUDED.updated_at""",
+            (record_id, position, document, now),
+        )
+
+
 def _load_raw() -> Dict[str, Any]:
+    conn = getattr(_section, "conn", None)
+    if conn is not None:
+        return {"suggestions": _pg_read(conn)}
+    from hermes_aux_store import aux_store_authority
+
+    if aux_store_authority():
+        conn = _open_store()
+        try:
+            return {"suggestions": _pg_read(conn)}
+        finally:
+            conn.close()
     suggestions_file = _current_suggestions_file()
     if not suggestions_file.exists():
         return {"suggestions": []}
@@ -80,6 +181,14 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
+    conn = getattr(_section, "conn", None)
+    if conn is not None:
+        _pg_write(conn, suggestions)
+        return
+    from hermes_aux_store import aux_store_authority
+
+    if aux_store_authority():
+        raise RuntimeError("cron suggestions are written only inside _suggestions_section()")
     _ensure_dir()
     suggestions_file = _current_suggestions_file()
     fd, tmp_path = tempfile.mkstemp(dir=str(suggestions_file.parent), suffix=".tmp", prefix=".sugg_")
@@ -125,7 +234,7 @@ def add_suggestion(
     if not title.strip() or not dedup_key.strip():
         raise ValueError("title and dedup_key are required")
 
-    with _suggestions_lock:
+    with _suggestions_section():
         suggestions = _load_raw().get("suggestions", [])
         if any(
             existing.get("dedup_key") == dedup_key
@@ -170,7 +279,7 @@ def get_suggestion(ref: str) -> Optional[Dict[str, Any]]:
 
 
 def _set_status(suggestion_id: str, status: str) -> bool:
-    with _suggestions_lock:
+    with _suggestions_section():
         suggestions = _load_raw().get("suggestions", [])
         for s in suggestions:
             if s.get("id") == suggestion_id:
@@ -216,7 +325,7 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
 def clear_resolved() -> int:
     """Drop ACCEPTED records from disk (they served their purpose once the job exists); dismissed
     records are RETAINED for their dedup_key. Returns the count removed."""
-    with _suggestions_lock:
+    with _suggestions_section():
         suggestions = _load_raw().get("suggestions", [])
         kept = [s for s in suggestions if s.get("status") != _STATUS_ACCEPTED]
         removed = len(suggestions) - len(kept)

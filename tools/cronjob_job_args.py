@@ -310,6 +310,25 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _store_cron_scripts(*scripts: Optional[str]) -> None:
+    """Store the bodies of validated job scripts on PostgreSQL authority (levos 0068). The job row
+    lives in the profile's store (0060) but the script it names is a file on this pod's disk;
+    another pod may fire the job. A script not written yet is stored by its first run instead.
+    Off authority: no-op."""
+    from cron import durable
+    from hermes_constants import get_hermes_home
+
+    if not durable.authority():
+        return
+    scripts_dir = (get_hermes_home() / "scripts").resolve()
+    for script in scripts:
+        if not script or not script.strip():
+            continue
+        path = (scripts_dir / script.strip()).resolve()
+        if path.is_file() and path.is_relative_to(scripts_dir):
+            durable.capture_script(path, scripts_dir)
+
+
 def _apply_continuity(
     context_from: Optional[Union[str, List[str]]],
     continuity: bool) -> Optional[List[str]]:

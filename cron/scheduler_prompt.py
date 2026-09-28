@@ -63,13 +63,33 @@ _UPSTREAM_CONTEXT_INTRO = (
 )
 
 
+def _usable_context_output(text: str) -> str:
+    """*text* stripped when ``context_from`` may inject it, else ``""`` (empty, or a silent audit).
+
+    Only the run header describes suppression; script/agent payloads can quote these markers.
+    Error documents stay usable as recovery context.
+    """
+    candidate = text.strip()
+    header = candidate.split("\n---\n", 1)[0].split("\n## Prompt", 1)[0]
+    silent_audit = candidate.startswith("# Cron Job:") and any(
+        line.startswith(("**Status:** no_change", "**Status:** silent",
+                         "Script gate returned `wakeAgent=false`"))
+        for line in header.splitlines()
+    )
+    return "" if silent_audit else candidate
+
+
 def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
     """Prepend the latest output of each ``context_from`` job; returns ``(prompt, injected)``."""
     context_from = job.get("context_from")
     if not context_from:
         return prompt, False
+    from cron import durable
     from cron.jobs import get_cron_output_dir
     output_dir = get_cron_output_dir()
+    # levos 0068: on PostgreSQL authority the latest output is the stored one — the source job
+    # may have last run on another pod.
+    outputs_on_pg = durable.authority()
     if isinstance(context_from, str):
         context_from = [context_from]
     injected = False
@@ -87,24 +107,19 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
             )
             continue
         try:
-            output_files = sorted(
-                (output_dir / source_job_id).glob("*.md"), key=lambda f: f.stat().st_mtime,
-                reverse=True,
-            )
             latest_output = ""
-            for output_file in output_files:
-                candidate = output_file.read_text(encoding="utf-8").strip()
-                # Only the run header describes suppression; script/agent payloads can
-                # quote these markers. Keep error documents useful for recovery context.
-                header = candidate.split("\n---\n", 1)[0].split("\n## Prompt", 1)[0]
-                silent_audit = candidate.startswith("# Cron Job:") and any(
-                    line.startswith(("**Status:** no_change", "**Status:** silent",
-                                     "Script gate returned `wakeAgent=false`"))
-                    for line in header.splitlines()
+            if outputs_on_pg:
+                latest_output = (durable.load_output(source_job_id) or "").strip()
+            else:
+                output_files = sorted(
+                    (output_dir / source_job_id).glob("*.md"), key=lambda f: f.stat().st_mtime,
+                    reverse=True,
                 )
-                if candidate and not silent_audit:
-                    latest_output = candidate
-                    break
+                for output_file in output_files:
+                    candidate = _usable_context_output(output_file.read_text(encoding="utf-8"))
+                    if candidate:
+                        latest_output = candidate
+                        break
             if len(latest_output) > _MAX_CONTEXT_CHARS:
                 latest_output = (
                     latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]")

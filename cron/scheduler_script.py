@@ -287,6 +287,20 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
         )
+    # levos 0068: on PostgreSQL authority the job row may come from another pod whose disk held
+    # the script. A local file runs as before and its body is stored; a missing one is written
+    # back from the profile's store.
+    from cron import durable
+    from hermes_aux_store import AuxStoreUnavailable
+
+    try:
+        if durable.authority():
+            if path.is_file():
+                durable.capture_script(path, scripts_dir_resolved)
+            elif not path.exists():
+                durable.restore_script(path, scripts_dir_resolved)
+    except (AuxStoreUnavailable, OSError) as exc:
+        return None, f"Script store unavailable: {exc}"
     if not path.exists():
         return None, f"Script not found: {path}"
     if not path.is_file():

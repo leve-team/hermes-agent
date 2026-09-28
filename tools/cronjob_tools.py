@@ -58,6 +58,7 @@ from tools.cronjob_job_args import (
     _repeat_display,
     _resolve_cron_context_deliver,
     _split_monitor_arg,
+    _store_cron_scripts,
     _validate_bot_chat_deliver,
     _validate_context_from_refs,
     _validate_cron_base_url,
@@ -557,6 +558,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             [a["context_from"]] if isinstance(a["context_from"], str) else a["context_from"])))
     if error:
         return tool_error(error, success=False)
+    _store_cron_scripts(script, a["monitor_script"])
 
     context_from = a["context_from"]
     if a["continuity"] is not None:
@@ -816,6 +818,7 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
             return tool_error(error, success=False)
     if not updates:
         return tool_error("No updates provided.", success=False)
+    _store_cron_scripts(a["script"], a["monitor_script"])
     updated = update_job(job["id"], updates)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
