@@ -12,8 +12,10 @@ Afterwards no store file may exist under the home or the gateway lock directory 
 ``channel_directory.json``, ``gateway_state.json``, ``desktop/interrupted_turns.json``,
 ``cron/deliveries.db`` — and ``sqlite3.connect`` (``:memory:`` included) must not have been
 called. Logs, caches, skills and the process identity files (``gateway.pid`` …) are not store
-state and are not checked. The per-store contracts (E–H) are pinned below with their
-off-authority counterparts.
+state and are not checked. The pod runs twice: with kanban on its own PostgreSQL backend, and as
+the v3 deployment with the built-in kanban off (``kanban.enabled: false``, t_fb9c7b9e) and
+``HERMES_KANBAN_BACKEND`` unset, staying up past the kanban watchers' first ticks. The per-store
+contracts (E–H) are pinned below with their off-authority counterparts.
 """
 
 from __future__ import annotations
@@ -188,11 +190,15 @@ _POD = textwrap.dedent(r'''
         deadline = time.monotonic() + 120
         while gateway_state() != "running" and time.monotonic() < deadline:
             time.sleep(0.2)
-        report.setdefault("seconds", {})["gateway_up"] = round(time.monotonic() - BOOT, 1)
+        up_at = time.monotonic()
+        report.setdefault("seconds", {})["gateway_up"] = round(up_at - BOOT, 1)
         step("runtime_status", gateway_state)
         step("tui_turn", tui_turn)
         step("cron_tick", cron_tick)
         step("adapter_lock", adapter_lock)
+        # Stay up past the gateway's background watcher delays (kanban: 5 s, then a tick).
+        while time.monotonic() - up_at < float(os.environ.get("V3_POD_MIN_UP_SECONDS") or 0):
+            time.sleep(0.2)
         os.kill(os.getpid(), signal.SIGTERM)
 
     threading.Thread(target=driver, daemon=True).start()
@@ -208,9 +214,13 @@ _POD = textwrap.dedent(r'''
 ''')
 
 
+@pytest.mark.parametrize("kanban", ["postgres", "off"])
 def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
-    postgres_dsn, model_url, tmp_path
+    postgres_dsn, model_url, tmp_path, kanban
 ):
+    """``kanban``: ``postgres`` = kanban on its own PostgreSQL backend; ``off`` = the v3
+    deployment (``kanban.enabled: false``, t_fb9c7b9e) with ``HERMES_KANBAN_BACKEND`` unset, so
+    the default kanban backend would be SQLite if anything reached it."""
     home = tmp_path / "home"
     locks = tmp_path / "xdg-state"
     home.mkdir()
@@ -219,16 +229,19 @@ def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
         f"model:\n  provider: custom\n  base_url: {model_url}\n  default: test-model\n"
         "  api_mode: chat_completions\n"
         "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
-        "terminal:\n  env: local\n",
+        "terminal:\n  env: local\n"
+        + ("kanban:\n  enabled: false\n" if kanban == "off" else ""),
         encoding="utf-8",
     )
     report_path = tmp_path / "report.json"
     env = {key: os.environ[key] for key in ("PATH", "LD_LIBRARY_PATH", "TMPDIR") if key in os.environ}
+    if kanban == "postgres":
+        env.update(HERMES_KANBAN_BACKEND="postgres", HERMES_KANBAN_POSTGRES_DSN=postgres_dsn)
+    else:  # long enough for the kanban dispatcher's and notifier's first ticks if they ran
+        env.update(V3_POD_MIN_UP_SECONDS="12")
     env.update(
         HOME=str(tmp_path), HERMES_HOME=str(home), XDG_STATE_HOME=str(locks),
         HERMES_STATE_POSTGRES_DSN=postgres_dsn, OPENAI_BASE_URL=model_url,
-        # Kanban is outside this closure; a v3 pod runs it on its own PostgreSQL backend.
-        HERMES_KANBAN_BACKEND="postgres", HERMES_KANBAN_POSTGRES_DSN=postgres_dsn,
         OPENAI_API_KEY="local-test-only", PYTHONPATH=str(REPO_ROOT), PYTHONDONTWRITEBYTECODE="1",
         LANG="C.UTF-8", TZ="UTC", V3_POD_REPORT=str(report_path), NO_PROXY="127.0.0.1,localhost",
     )
@@ -250,6 +263,8 @@ def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
     assert connects == [], "\n\n".join(
         f"{c['target']}\n" + "".join(c["stack"].splitlines(keepends=True)[-6:]) for c in connects)
     assert _leftovers(home, locks) == []
+    if kanban == "off":  # nothing kanban-shaped at all: no db, no board dir, no dispatcher lock
+        assert sorted(str(p) for p in tmp_path.rglob("kanban*")) == []
     with psycopg.connect(postgres_dsn) as raw:
         assert raw.execute(
             "SELECT count(*) FROM messages WHERE content = 'hello v3 pod'").fetchone()[0] >= 1
