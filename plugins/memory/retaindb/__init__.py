@@ -185,6 +185,11 @@ class _WriteQueue:
     """SQLite-backed async write queue. Survives crashes — pending rows replay on startup."""
 
     def __init__(self, client: _Client, db_path: Path):
+        from hermes_aux_store import AuxStoreUnavailable, aux_store_authority
+        if aux_store_authority():  # levos v3: no pod-local SQLite on authority, and no PostgreSQL form yet
+            raise AuxStoreUnavailable(
+                "memory provider 'retaindb' spools writes in a local SQLite file (retaindb_queue.db), which a "
+                "PostgreSQL-authority profile does not use; choose the built-in memory or another provider")
         self._client, self._db_path, self._q = client, db_path, queue.Queue()
         self._thread = threading.Thread(target=self._loop, name="retaindb-writer", daemon=True)
         db_path.parent.mkdir(parents=True, exist_ok=True)

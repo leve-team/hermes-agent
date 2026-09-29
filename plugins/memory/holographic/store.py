@@ -86,6 +86,17 @@ def _clamp_trust(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _refuse_on_postgres_authority() -> None:
+    """A PostgreSQL-authority profile keeps no state on the pod disk and this store has no PostgreSQL
+    form: selecting it there is an explicit error, never a silent ``memory_store.db`` (levos v3)."""
+    from hermes_aux_store import AuxStoreUnavailable, aux_store_authority
+
+    if aux_store_authority():
+        raise AuxStoreUnavailable(
+            "memory provider 'holographic' stores facts in a local SQLite file (memory_store.db), which a "
+            "PostgreSQL-authority profile does not use; choose the built-in memory or an external provider")
+
+
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring.
 
@@ -98,6 +109,7 @@ class MemoryStore:
     _shared_guard = threading.Lock()
 
     def __init__(self, db_path: "str | Path | None" = None, default_trust: float = 0.5, hrr_dim: int = 1024) -> None:
+        _refuse_on_postgres_authority()
         if db_path is None:
             from hermes_constants import get_hermes_home
             db_path = str(get_hermes_home() / "memory_store.db")
