@@ -512,7 +512,7 @@ existing seam, never the file's existence:
 No path deletes, moves, renames or creates the legacy file; nothing falls back
 to SQLite, `:memory:` or a file.
 
-**Tests** (real PostgreSQL 16.4, `PG3_PERCENT_PG_BIN`):
+**Tests** (real PostgreSQL 16.4 and 16.15, `PG3_PERCENT_PG_BIN`):
 `tests/test_v3_legacy_state_db_untouched.py` —
 `test_authority_pod_leaves_the_legacy_state_db_untouched` (the pod above; the
 seeded home also carries a pre-switch Bot Chat mailbox), `test_bot_chat_owner_and_lineage_come_from_postgres_on_authority`
@@ -527,6 +527,16 @@ source files to the base tree fails all four. The §6.3 guard
 existing module tests keep the SQLite behaviour
 (`tests/tools/test_bot_live_owner_delivery.py`, `tests/plugins/test_a2a_plugin.py`,
 `tests/hermes_cli/test_fts_optimize_notice.py`).
+
+No-regression sweep (file by file, no xdist; base and head run one after the
+other): `tests/gateway`, `tests/tui_gateway`,
+`tests/tools/test_bot_live_owner_delivery.py`,
+`tests/hermes_cli/test_web_server*.py` and the four `tests/plugins/test_a2a_*.py`
+files — the only failing files on the head are
+`tests/gateway/test_shutdown_cache_cleanup.py` (3) and
+`tests/gateway/test_shutdown_executor_quiesce.py` (3), which fail identically on
+the base tree; the PostgreSQL-backed files there (`test_routing_pg_authority.py`,
+`test_submit_idempotency_pg.py`) pass on both with `PG3_PERCENT_PG_BIN` set.
 
 **Remaining** (not runtime, or a different shape):
 
