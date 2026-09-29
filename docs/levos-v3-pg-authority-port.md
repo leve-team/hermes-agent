@@ -189,3 +189,56 @@ credential store seeds itself (above).
   Two regressions this comparison found were fixed on the branch
   (`DeadTargetRegistry` resolving the backend in its constructor;
   a corrupt `config.yaml` breaking the credential pool on SQLite installs).
+
+## 6. v3 file-state closure
+
+Card `t_aa3728da`. Goal: a PostgreSQL-authority (`sessions.state_backend:
+authority`) v3 runtime leaves no operational state on the pod disk, so a pod
+started anew continues from PostgreSQL and two briefly overlapping pods of one
+profile do not collide. Base: `levos/pg3` `9bb784cf6`. The v2 patches
+0061–0064 live on `levos/pg3-020` (`fcc1dda98`, `c20c7837e`, `1081cacdd`,
+`9cf9ff439`) and are re-implemented on the 0.21.2 structure; E–H have no v2
+original.
+
+### 6.1 Audit: where authority still opened a file or SQLite (base `9bb784cf6`)
+
+Line numbers are the base tree. "Opens" means the authority path reaches the
+file/SQLite call with no PostgreSQL branch in between.
+
+| Bundle | File:line (base) | What is opened on authority | v2 original |
+|---|---|---|---|
+| A 0061 messaging single connection | `gateway/status.py:351` `_get_lock_dir`, `:1285` `acquire_scoped_lock` (`:1327` `_write_json_excl`), `:1333` `release_scoped_lock` | `gateway-locks/<scope>-<hash>.lock` under `XDG_STATE_HOME` — pod-local, so two pods connect the same bot token | `fcc1dda98` |
+| | `gateway/platforms/base.py:2119` `_acquire_platform_lock`, `:2157` `_release_platform_lock` | same lock file; `--replace` takeover by local PID | |
+| | `plugins/platforms/telegram/adapter.py:2930` (acquire), `:3129` (release before polling stopped), `:2279` (409 retry `drop_pending_updates=True`), `:2875`/`:2907` (cold boot drops the Bot API queue) | lock file; the next pod's cold boot deletes the messages sent during the handoff | |
+| | `plugins/platforms/discord/adapter.py:1227` / `:1861`, `plugins/platforms/slack/adapter.py:1634` / `:1756` | lock file (order already lock → transport → close → unlock) | |
+| B 0062 turn ownership / pending messages / tui markers | `gateway/session_lifecycle.py:128` `mark_turn_active`, `:140` `clear_turn_active`, `:150` `recover_interrupted_turns` | turn markers decided by the pod-local `.clean_shutdown` receipt | `c20c7837e` |
+| | `gateway/run_startup.py:949` (`.clean_shutdown` read/unlink), `:650` `_recover_unclean_sessions` (120 s recency fallback) | `HERMES_HOME/.clean_shutdown` | |
+| | `gateway/run_shutdown.py:1926` | writes `.clean_shutdown` | |
+| | `gateway/shutdown_flush.py:34` `_get_flush_dir`, `:44` `_write_payload`, `:115` spool, `:133` drain, `:201` `recover_pending_to_db` (callers `gateway/run_shutdown.py:1150,1823,1827`, `gateway/run.py:5388`, `gateway/platforms/base.py`, `gateway/session_transcript.py`) | `HERMES_HOME/pending_messages/pending-*.json` | |
+| | `tui_gateway/turn_marker.py:31` `_marker_path`, `:58` `_store` | `HERMES_HOME/desktop/interrupted_turns.json` | |
+| | `gateway/session_state.py`, `gateway/run_watchers.py` | nothing (in-memory state; the watcher only prunes through `SessionStore`) | |
+| C 0063 delivery obligations / async delegations | `gateway/delivery_ledger.py:146` `_connect`, `:261` `_owner_alive`; `tools/async_delegation.py:85` `_connect`, `:328` `recover_abandoned_delegations` | no file (pg3 0051 already writes both tables to PostgreSQL via `SessionDB.open_writer`), but ownership is a local pid probe — see 6.4 | `1081cacdd` |
+| D 0064 routing index | `gateway/session_persistence.py:61` `acquire(path)` | **`state.db` on SQLite**: an explicit path makes `SessionDB` select SQLite (`hermes_state.py:471`, `hermes_state_registry.py:207`), so the gateway's `SessionStore` and everything borrowing its handle ran on SQLite | `9cf9ff439` |
+| | `gateway/session_persistence.py:288` `_import_legacy_sessions_json`, `:438`/`:454` whole-scope `replace_gateway_routing_entries`, `:460` `_save_sessions_json` | `sessions/sessions.json` read and mirrored; a whole-scope rewrite erases a peer pod's keys | |
+| | `gateway/channel_directory.py:40` `_directory_path`, `:167` write, `:364` `_build_from_sessions_json` | `HERMES_HOME/channel_directory.json`, `sessions/sessions.json` | |
+| | `hermes_state_sessions.py` | no `sessions.json` access (only a docstring at `:378`); nothing to change | |
+| E 0.21.2 new stores | `cron/delivery_queue.py:77` `_db_path`, `:85` `sqlite3.connect` (enqueue `cron/scheduler_delivery.py`, drain `cron/scheduler.py`) | `cron/deliveries.db` | none |
+| | `gateway/platforms/api_server_run_idempotency.py:67`, `:72`, `:81` (`:memory:` fallback) | `runs_idempotency.db` | none |
+| F state checks | `gateway/readiness.py:24` `_probe_state_db` (`:32` connect) | opens `state.db` read-only whenever the file exists | none |
+| | `gateway/lifecycle_ledger.py:172` `check_state_db_integrity` (`:184` connect) | same | none |
+| G hosted rooms | `gateway/hosted_rooms.py:398` `default_db_path`, `:434`/`:438` `_connect`, `:970` probe; `gateway/hosted_rooms_common.py:99`, `:119`; `gateway/hosted_room_policy_checkpoint.py:115` (worker started by `gateway/run_startup.py` `_ensure_hosted_room_worker`) | `shared-state.db` (root of the profiles tree) | none |
+| H memory plugin | `plugins/memory/holographic/store.py:103`, `:116` | `memory_store.db` when `memory.provider: holographic` | none |
+
+Runtime paths found beyond the card's table (same audit):
+
+| File:line (base) | What | Disposition |
+|---|---|---|
+| `hermes_state_pg_schema.py:1258` → `hermes_state_schema.py:707` | every PostgreSQL connect parses the SQLite `SCHEMA_SQL` in `sqlite3.connect(":memory:")` (and caches it in `cache/schema_columns.json`) | parsed without SQLite on the PostgreSQL path (6.3) |
+| `hermes_cli/goals.py:597` `_acquire_session_db` | `acquire(home/"state.db")` → SQLite `state.db` for the goal manager | follows the home's backend (6.3) |
+| `plugins/memory/retaindb/__init__.py:204`, `:345` | `retaindb_queue.db` when `memory.provider: retaindb` | explicit error on authority, like H |
+| `gateway/status.py:984` `write_runtime_status` | `gateway_state.json` | see 6.3 |
+| `tools/bot_live_delivery.py:37`, `:162`; `plugins/platforms/a2a/adapter.py:136` | open `state.db` only when the file exists (never on an authority pod) | unchanged; listed as remaining |
+| `hermes_cli/observability/shared_metrics.py:307` | telemetry SQLite, only behind its opt-in | unchanged; listed as remaining |
+| process identity / restart bookkeeping: `gateway.pid`, `gateway.lock`, `.gateway-takeover.json`, `.gateway-planned-stop.json`, `gateway-starts.log`, `.restart_failure_counts`, `.restart_pending.json`, `.restart_notify.json`, `state/gateway.lifecycle.json`, `state/` heartbeat, `.drain_request.json`, control-socket pointer, `processes.json`, cron ticker heartbeat / output / audit files, `spawn-trees/` | per-process, per-pod liveness and operator files | not operational state shared across pods; listed as remaining |
+
+Excluded as the card says: kanban (`kanban*.py`), backup / recovery / doctor CLIs, one-shot migrations, evals, scripts, tests.
