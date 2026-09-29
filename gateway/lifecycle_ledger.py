@@ -176,7 +176,20 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     b-tree pages.  ``quick_check(1)`` stops at the first problem (~2s on a healthy
     500MB store): cheap once per unclean boot, too costly every boot.  Opened
     normally: a WAL store needs its -shm sidecar for read-only, and the PRAGMA writes nothing.
+    On a PostgreSQL-authority profile there is no file to tear: the store is checked by one short
+    connection instead (levos v3), ``"absent"`` when its core schema was never created.
     """
+    try:
+        from hermes_state_postgres import probe_authority_store
+    except ImportError:
+        probe_authority_store = None  # base install without the PostgreSQL module
+    if probe_authority_store is not None:
+        try:
+            verdict = probe_authority_store(_home_path(home))
+        except Exception as exc:
+            return f"check-failed: {exc}"
+        if verdict is not None:
+            return verdict
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"

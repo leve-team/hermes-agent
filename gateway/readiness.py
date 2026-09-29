@@ -21,7 +21,27 @@ def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, An
     return {"status": status, **({"detail": detail} if detail else {}), **extra}
 
 
+def _probe_authority_store(home: Path) -> dict[str, Any] | None:
+    """PostgreSQL-authority form of the state probe (levos v3); None off authority."""
+    try:
+        from hermes_state_postgres import probe_authority_store
+    except ImportError:
+        return None  # base install without the PostgreSQL module
+    try:
+        verdict = probe_authority_store(home)
+    except Exception as exc:
+        return _check("degraded", str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__)
+    if verdict is None:
+        return None
+    return _check("ok", "not initialized" if verdict == "absent" else None, backend="postgres")
+
+
 def _probe_state_db(home: Path) -> dict[str, Any]:
+    """The session store's health: ``state.db`` read-only, or on a PostgreSQL-authority profile a
+    short connection to its store (that profile has no ``state.db`` to open)."""
+    authority = _probe_authority_store(home)
+    if authority is not None:
+        return authority
     path = home / "state.db"
     if not path.exists():
         return _check("ok", "not initialized")

@@ -1201,34 +1201,71 @@ def open_store_for_home(
     return db
 
 
+def _is_active_home(home: Any) -> bool:
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+
+    try:
+        return Path(home).resolve() == Path(get_hermes_home()).resolve()
+    except OSError:
+        return False
+
+
+def home_selects_authority(profile_home: Any) -> bool:
+    """True when *profile_home* runs on PostgreSQL authority (levos v3). The active home follows
+    this process's selector (env, then config); any other home follows its own ``config.yaml``."""
+    from hermes_state_read import normalize_read_mode
+
+    if _is_active_home(profile_home):
+        return resolve_state_backend() == "authority"
+    return normalize_read_mode(_home_sessions_config(profile_home).get("state_backend") or "sqlite") == "authority"
+
+
 def open_authority_store_for_db_path(db_path: Any) -> Any:
     """The PostgreSQL authority store behind ``<home>/state.db``, else None (levos v3).
 
     Callers that address a profile's store by its ``state.db`` path (the
     gateway's ``SessionStore``, the goal manager) would otherwise open that
     file on SQLite: an explicit path always selects SQLite in ``SessionDB``.
-    The active home follows this process's selector (env, then config); any
-    other home follows its own ``config.yaml``, as ``open_store_for_home``
-    does. None means the home is not on authority and the caller keeps its
-    SQLite path; an authority store that cannot open raises.
+    None means the home is not on authority and the caller keeps its SQLite
+    path; an authority store that cannot open raises.
     """
     from pathlib import Path
-    from hermes_constants import get_hermes_home
-    from hermes_state_read import normalize_read_mode
 
     home = Path(db_path).parent
-    try:
-        active = home.resolve() == Path(get_hermes_home()).resolve()
-    except OSError:
-        active = False
-    if active:
-        if resolve_state_backend() != "authority":
-            return None
+    if not home_selects_authority(home):
+        return None
+    if _is_active_home(home):
         from hermes_state import SessionDB
 
         return SessionDB(read_only=False)
-    backend = normalize_read_mode(_home_sessions_config(home).get("state_backend") or "sqlite")
-    return open_store_for_home(home) if backend == "authority" else None
+    return open_store_for_home(home)
+
+
+def probe_authority_store(profile_home: Any) -> Optional[str]:
+    """Health of *profile_home*'s PostgreSQL authority store, for the probes that used to open
+    ``state.db`` (readiness, the unclean-exit integrity check). None when the home is not on
+    authority (the caller probes its file); ``"ok"``; ``"absent"`` when the core schema was never
+    created. A connection failure raises ``RuntimeError`` naming only the error type (never the
+    DSN). One short connection, no schema work."""
+    if not home_selects_authority(profile_home):
+        return None
+    try:
+        if _is_active_home(profile_home):
+            dsn = resolve_postgres_dsn()
+        else:
+            dsn = _dsn_from_profile_env(profile_home) or str(
+                _home_sessions_config(profile_home).get("postgres_dsn") or "").strip()
+        if not dsn:
+            raise RuntimeError("no DSN")
+        conn = connect_postgres(dsn)
+        try:
+            present = conn.execute("SELECT to_regclass('sessions') IS NOT NULL").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise RuntimeError(f"PostgreSQL authority store unreachable ({type(exc).__name__})") from None
+    return "ok" if present else "absent"
 
 
 def open_store_for_profile(profile_name: str, read_only: bool = False) -> Any:
