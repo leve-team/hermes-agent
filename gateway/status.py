@@ -992,7 +992,11 @@ def write_runtime_status(
     """Persist gateway runtime health information for diagnostics/status. ``drop_profile_platforms``
     removes one deleted profile's ``<profile>:<platform>`` entries (hot unroute)."""
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
+    from gateway import status_pg_runtime
+
+    on_postgres = status_pg_runtime.uses_postgres(path)
+    stored = status_pg_runtime.read(path) if on_postgres else _read_json_file(path)
+    payload = stored or _build_runtime_status_record()
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()
     payload.setdefault("platforms", {})
@@ -1036,15 +1040,22 @@ def write_runtime_status(
         platform_payload.update(updated_at=_utc_now_iso(), writer_pid=current_record["pid"],
                                 writer_start_time=current_record["start_time"])
         payload["platforms"][platform] = platform_payload
-    _write_json_file(path, payload)
+    if on_postgres:  # PostgreSQL authority: no gateway_state.json on the pod (levos v3)
+        status_pg_runtime.write(path, payload)
+    else:
+        _write_json_file(path, payload)
     with contextlib.suppress(Exception):
         from agent.monitoring.gateway_health import emit_runtime_status_transition
         emit_runtime_status_transition(previous_payload, payload)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    """Read ``gateway_state.json``; ``path`` lets callers inspect another profile's file."""
-    return _read_json_file(path or _get_runtime_status_path())
+    """Read ``gateway_state.json``; ``path`` lets callers inspect another profile's file. On a
+    PostgreSQL-authority profile the active profile's record is read from its store."""
+    from gateway import status_pg_runtime
+
+    path = path or _get_runtime_status_path()
+    return status_pg_runtime.read(path) if status_pg_runtime.uses_postgres(path) else _read_json_file(path)
 
 
 # Max age of a ``gateway_state.json`` snapshot before its liveness claim is suspect:

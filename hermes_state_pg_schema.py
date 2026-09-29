@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 
 from hermes_state_common import SCHEMA_SQL
 from hermes_state_pg_triggers import POSTGRES_MESSAGE_TRIGGER_SQL
-from hermes_state_schema import SessionSchemaMixin
 
 logger = logging.getLogger(__name__)
 
@@ -1255,7 +1254,10 @@ def reconcile_postgres_columns(conn: Any, schema_sql: str) -> List[str]:
     A missing required column that cannot be added aborts startup. Reporting
     success here would defer the error to the next transcript write.
     """
-    declared = SessionSchemaMixin._parse_schema_columns(schema_sql)
+    # Parsed without SQLite: a PostgreSQL-authority process opens no SQLite connection (levos v3).
+    from hermes_state_pg_columns import declared_schema_columns
+
+    declared = declared_schema_columns(schema_sql)
 
     raw = conn.raw if hasattr(conn, "raw") else conn
     live: Dict[str, set] = {}
