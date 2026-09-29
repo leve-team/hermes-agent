@@ -911,10 +911,11 @@ def _assert_active_config_parseable() -> Dict[str, Any]:
     An EXISTING file that cannot be read or parsed cannot safely mean anything,
     so fail closed and let the operator fix it.
     """
+    from pathlib import Path
     from hermes_cli.config_readers import read_user_config_for_authority
     from hermes_constants import get_hermes_home
 
-    config_path = get_hermes_home() / "config.yaml"
+    config_path = Path(get_hermes_home()) / "config.yaml"
     if not config_path.is_file():
         return {}  # absent is a legitimate "no selection"
 
