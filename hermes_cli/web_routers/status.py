@@ -376,8 +376,11 @@ async def _advisory_pressure(status: Dict[str, Any], home: Path) -> None:
     try:
         from hermes_state import SessionDB as _SDB
         from hermes_constants import get_hermes_home as _ghh
+        from hermes_state_postgres import home_selects_authority
         _db_path = _ghh() / "state.db"
-        if _db_path.exists():
+        # The rebuild is SQLite FTS5 state; on PostgreSQL authority a state.db left from before
+        # the switch is never opened (levos v3).
+        if not home_selects_authority(_ghh()) and _db_path.exists():
             _sdb = _SDB(db_path=_db_path, read_only=True)
             try:
                 _rebuild = _sdb.fts_rebuild_status()

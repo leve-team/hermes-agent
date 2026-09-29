@@ -237,7 +237,7 @@ Runtime paths found beyond the card's table (same audit):
 | `hermes_cli/goals.py:597` `_acquire_session_db` | `acquire(home/"state.db")` → SQLite `state.db` for the goal manager | follows the home's backend (6.3) |
 | `plugins/memory/retaindb/__init__.py:204`, `:345` | `retaindb_queue.db` when `memory.provider: retaindb` | explicit error on authority, like H |
 | `gateway/status.py:984` `write_runtime_status` | `gateway_state.json` | see 6.3 |
-| `tools/bot_live_delivery.py:37`, `:162`; `plugins/platforms/a2a/adapter.py:136` | open `state.db` only when the file exists (never on an authority pod) | unchanged; listed as remaining |
+| `tools/bot_live_delivery.py:37`, `:162`; `plugins/platforms/a2a/adapter.py:136` | open `state.db` when the file exists — **wrong assumption**: an authority pod keeps the `state.db` it wrote before the switch, and these paths opened it (opsi-v3, 2026-09-30) | closed by `t_0eeaa6f9` (6.7): PostgreSQL on authority, the file never opened; `hermes_cli/web_routers/status.py` `/api/status` and `hermes_cli/update_cmd_maint.py` (FTS notice) had the same shape |
 | `hermes_cli/observability/shared_metrics.py:307` | telemetry SQLite, only behind its opt-in | unchanged; listed as remaining |
 | process identity / restart bookkeeping: `gateway.pid`, `gateway.lock`, `.gateway-takeover.json`, `.gateway-planned-stop.json`, `gateway-starts.log`, `.restart_failure_counts`, `.restart_pending.json`, `.restart_notify.json`, `state/gateway.lifecycle.json`, `state/` heartbeat, `.drain_request.json`, control-socket pointer, `processes.json`, cron ticker heartbeat / output / audit files, `spawn-trees/` | per-process, per-pod liveness and operator files | not operational state shared across pods; listed as remaining |
 
@@ -336,9 +336,10 @@ unset, kept up past the kanban watchers' first ticks).
 - **Pre-existing JSONL transcript fallback**: when the session store cannot
   open, `SessionStore` still falls back to `sessions/*.jsonl` (not added here;
   the routing index itself raises `AuxStoreUnavailable`).
-- `tools/bot_live_delivery.py` and `plugins/platforms/a2a/adapter.py` open
-  `state.db` only when the file exists (never on an authority pod), so those
-  features read nothing there; `hermes_cli/observability/shared_metrics.py`
+- ~~`tools/bot_live_delivery.py` and `plugins/platforms/a2a/adapter.py` open
+  `state.db` only when the file exists (never on an authority pod)~~ — the
+  assumption was wrong (an authority pod keeps its pre-switch `state.db`);
+  closed by `t_0eeaa6f9`, 6.7. `hermes_cli/observability/shared_metrics.py`
   opens its SQLite only behind the telemetry opt-in.
 - Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3; turned
   off for v3 by 6.6) and the hosted-room PostgreSQL port (G) are separate work.
@@ -439,3 +440,119 @@ the kanban plugin only; on (default, env `1`) it returns None as before and
 kanban paths on. On the base tree the off tests fail (the router mounts).
 `docs/quality/rule-index.md` is still absent in this repository; the root
 `AGENTS.md` rules were followed as for t_fb9c7b9e (§4).
+
+### 6.7 legacy state.db on an authority pod
+
+Card `t_0eeaa6f9`. Base: `levos/pg3` `5f99dca14`. Live (infraops opsi,
+2026-09-30 01:45 KST): after opsi-v3 switched to the new core (runtime start
+16:45:01Z) the PVC's pre-authority store was still written —
+`state.db-wal` 16:49:18Z, `state.db-shm` 16:49:54Z — during the acceptance run
+(one new conversation, one resumed session, a memory recall); kanban, the
+dashboard kanban API and hosted rooms were off as designed. Every profile moved
+to v3 (v2 ones included) keeps its old `state.db` (it is not deleted), so the
+§6.1 rows "open `state.db` only when the file exists (never on an authority
+pod)" assumed something false. A read-only SQLite open is no exception: on a
+WAL database it maps and writes `-shm` and may checkpoint `-wal`.
+
+**Reproduction.** `tests/test_v3_legacy_state_db_untouched.py` runs the §6.3
+pod (kanban off, as deployed; the scenario now also closes and resumes the tui
+session with its notification poller ticking, and asks the dashboard's
+`/api/status` once) on a home that already holds a WAL-mode `state.db` with
+three sessions (one titled `Bot Chat`) and live `-wal` / `-shm` sidecars, and
+asserts that the three files keep existence, size and mtime and that
+`sqlite3.connect` is never called. On the base tree it fails; the recorder's
+connects (target, innermost repo frame):
+
+```
+file:…/home/state.db?mode=ro   tools/bot_live_delivery.py:39 find_canonical_live_owner      (×3-5: tui_gateway/session_notifications.py:510 _poll_bot_live_delivery_once, per session poller tick)
+file:…/home/state.db?mode=ro   hermes_cli/web_routers/status.py:381 _advisory_pressure       (/api/status)
+:memory:                       hermes_state_portability.py:138 _compact_session_cols → hermes_state_schema.py:707 _parse_schema_columns   (/api/status → status.py:87 _count_status_active_sessions → list_sessions_rich)
+```
+
+The `:memory:` connect is not about the legacy file: the §6.3 guard with the
+added `/api/status` step fails on the base tree with that one connect too (both
+kanban variants).
+
+**Audit** (base tree; runtime paths that reach `state.db` by path, gated only
+by the file existing — the full sweep of `state.db` / `DEFAULT_DB_PATH` /
+`SessionDB(db_path=…)` / `hermes_state_registry.acquire(path)` /
+`sqlite3.connect` outside tests, evals, scripts and the excluded operator
+CLIs). `acquire(path)` never routes to PostgreSQL by itself; every caller below
+that is not listed already asks `open_authority_store_for_db_path`,
+`home_selects_postgres` / `open_store_for_home`, `aux_store_authority()`,
+`resolve_state_backend()` or `SessionDB.open_writer` first, or only stats the
+file (`mcp_serve.py`, `tui_gateway/change_watcher.py`).
+
+| File:line (base) | Reached from | Data on authority | Disposition |
+|---|---|---|---|
+| `tools/bot_live_delivery.py:37-39` `find_canonical_live_owner` | tui session poller (`tui_gateway/session_notifications.py:510`, every idle tick of every session), cron live delivery (`cron/scheduler_delivery.py:697`), bot DM tool (`tools/bot_mode_dm.py`) | Bot Chat session and compression tip are in PostgreSQL | PostgreSQL store (read-only) on authority; the legacy file's `Bot Chat` is not consulted |
+| `tools/bot_live_delivery.py:162` `_matches` (via `claim_pending_delivery`) | same | compression lineage in PostgreSQL | same |
+| `plugins/platforms/a2a/adapter.py:129` `_state_db` (`:544`, `:562`, `:566`) | a2a forwarding to a local profile (writes the forwarded session's title) | `sessions` in PostgreSQL | the statement runs on the target profile's PostgreSQL store; if that cannot open, `""` + debug log (as before for an unusable file) |
+| `hermes_cli/web_routers/status.py:377-383` `_advisory_pressure` | dashboard `/api/status` | FTS5 rebuild progress is SQLite state | skipped on authority (`fts_rebuild` omitted) |
+| `hermes_cli/update_cmd_maint.py:157` `_print_fts_optimize_available_notice` | end of `hermes update` (also spawned by the gateway `/update` and the dashboard) | SQLite FTS5 layout | skipped on authority |
+| `hermes_state_portability.py:138` `_compact_session_cols` → `hermes_state_schema.py:707` | `/api/status` → `_count_status_active_sessions` → `list_sessions_rich(compact_rows=True)` on PostgreSQL | — (`sqlite3.connect(":memory:")` to parse `SCHEMA_SQL`) | parsed by `hermes_state_pg_columns.declared_schema_columns` (same columns, same order; §6.2 guard) |
+
+**Implementation.** The branch is `home_selects_authority` through the
+existing seam, never the file's existence:
+
+- `hermes_state_postgres.open_authority_store_for_db_path(db_path, *,
+  read_only=False)` — new keyword; the active home opens `SessionDB(read_only=…)`,
+  another home `open_store_for_home(home, read_only=…)`; still None off authority.
+- `tools/bot_live_delivery.py`: `_authority_store(home)` (read-only) is used by
+  `find_canonical_live_owner` and `_matches`; off authority both keep their
+  SQLite `state.db` path unchanged.
+- `plugins/platforms/a2a/adapter.py`: `_authority_state_db` runs the same
+  statement on the store (`?` placeholders are translated by the PostgreSQL
+  connection; writes open read-write and commit).
+- `hermes_cli/web_routers/status.py`, `hermes_cli/update_cmd_maint.py`: return
+  before the file check on authority.
+- `hermes_state_portability.py`: SQLite-free schema parse for the compact
+  session projection (both backends; identical result).
+
+No path deletes, moves, renames or creates the legacy file; nothing falls back
+to SQLite, `:memory:` or a file.
+
+**Tests** (real PostgreSQL 16.4, `PG3_PERCENT_PG_BIN`):
+`tests/test_v3_legacy_state_db_untouched.py` —
+`test_authority_pod_leaves_the_legacy_state_db_untouched` (the pod above; the
+seeded home also carries a pre-switch Bot Chat mailbox), `test_bot_chat_owner_and_lineage_come_from_postgres_on_authority`
+(owner = the PostgreSQL `Bot Chat`, not the legacy file's; a queued envelope is
+claimed across a PostgreSQL compression), `test_a2a_forwarded_session_lookup_and_title_use_postgres_on_authority`,
+`test_status_and_update_notices_skip_sqlite_fts_on_authority` (legacy file
+grown sparse past the notice's 0.5 GB floor). Each runs with `sqlite3.connect`
+recorded and refused and asserts the legacy triple unchanged. Reverting the
+source files to the base tree fails all four. The §6.3 guard
+(`tests/test_v3_no_file_state_authority.py`) gains the resume and
+`/api/status` steps and shares its pod through `run_pod`. Off authority the
+existing module tests keep the SQLite behaviour
+(`tests/tools/test_bot_live_owner_delivery.py`, `tests/plugins/test_a2a_plugin.py`,
+`tests/hermes_cli/test_fts_optimize_notice.py`).
+
+**Remaining** (not runtime, or a different shape):
+
+- `hermes update`'s pre-update snapshot and post-update integrity guard
+  (`hermes_cli/update_cmd_maint.py` `_verify_and_restore_one_state_db`,
+  `_verify_state_db_after_snapshot`) still check — and on a failed check may
+  restore a snapshot over — an existing `state.db` of every home, authority or
+  not. They belong to backup / recovery, excluded as in 6.1 (an operator
+  update, though the gateway `/update` and the dashboard can spawn it).
+- `hermes approvals suggest` (`hermes_cli/approvals_suggest.py`) scans
+  `state.db` when it exists (CLI only; its data is in PostgreSQL on authority).
+- The dashboard console's `sessions repair` (`hermes_cli/console_engine.py`)
+  is the repair CLI (excluded).
+- `home_selects_postgres` / `profile_selects_postgres` read only the target
+  home's `config.yaml`: a profile on authority only through the process env
+  (`HERMES_STATE_BACKEND`), addressed by name or home (api_server named-profile
+  branch, `_open_session_db_for_profile(<own name>)`, dashboard profile
+  sidebar), is read as SQLite. v3 selects the backend in `config.yaml`, where
+  these follow it.
+- Each idle tui session's poller resolves the Bot Chat owner every tick
+  (0.5 s), so on authority it opens a short read-only PostgreSQL connection per
+  tick (about 9 ms against a local socket), where the SQLite pod opened the
+  file per tick. Skipping the lookup while the mailbox is empty would need a
+  poller change (its tests stub the claim), left for a follow-up.
+
+`docs/quality/rule-index.md` is still absent in this repository; the root
+`AGENTS.md` rules were followed (real imports against a temp `HERMES_HOME`, a
+real PostgreSQL, behaviour-contract tests red on the base tree, no new
+`HERMES_*` env var).

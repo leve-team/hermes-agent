@@ -152,6 +152,11 @@ def _print_fts_optimize_available_notice() -> None:
     try:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
+        from hermes_state_postgres import home_selects_authority
+        # FTS5 storage is SQLite's; on PostgreSQL authority a state.db left from before the
+        # switch is never opened (levos v3).
+        if home_selects_authority(get_hermes_home()):
+            return
     except Exception:
         return
     db_path = get_hermes_home() / "state.db"

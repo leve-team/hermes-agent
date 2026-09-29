@@ -1230,14 +1230,16 @@ def home_selects_authority(profile_home: Any) -> bool:
     return normalize_read_mode(sessions.get("state_backend") or "sqlite") == "authority"
 
 
-def open_authority_store_for_db_path(db_path: Any) -> Any:
+def open_authority_store_for_db_path(db_path: Any, *, read_only: bool = False) -> Any:
     """The PostgreSQL authority store behind ``<home>/state.db``, else None (levos v3).
 
     Callers that address a profile's store by its ``state.db`` path (the
-    gateway's ``SessionStore``, the goal manager) would otherwise open that
-    file on SQLite: an explicit path always selects SQLite in ``SessionDB``.
-    None means the home is not on authority and the caller keeps its SQLite
-    path; an authority store that cannot open raises.
+    gateway's ``SessionStore``, the goal manager, the Bot Chat live-owner
+    lookup) would otherwise open that file on SQLite: an explicit path always
+    selects SQLite in ``SessionDB``, and an authority home may still hold the
+    ``state.db`` it wrote before the switch. None means the home is not on
+    authority and the caller keeps its SQLite path; an authority store that
+    cannot open raises.
     """
     from pathlib import Path
 
@@ -1247,8 +1249,8 @@ def open_authority_store_for_db_path(db_path: Any) -> Any:
     if _is_active_home(home):
         from hermes_state import SessionDB
 
-        return SessionDB(read_only=False)
-    return open_store_for_home(home)
+        return SessionDB(read_only=read_only)
+    return open_store_for_home(home, read_only=read_only)
 
 
 def probe_authority_store(profile_home: Any) -> Optional[str]:

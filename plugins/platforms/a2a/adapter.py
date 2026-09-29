@@ -126,11 +126,40 @@ def _safe_context_slug(value: str, max_len: int = 96) -> str:
     return (slug or "ctx")[:max_len]
 
 
+def _authority_state_db(db: str, sql: str, params: tuple, *, commit: bool) -> Optional[str]:
+    """The statement on the profile's PostgreSQL authority store; None when the profile is not on
+    authority. A ``state.db`` left there from before the switch is never opened (levos v3)."""
+    try:
+        from hermes_state_postgres import open_authority_store_for_db_path
+    except ImportError:
+        return None
+    store = open_authority_store_for_db_path(db, read_only=not commit)
+    if store is None:
+        return None
+    try:
+        cur = store._conn.execute(sql, params)
+        row = None if commit else cur.fetchone()
+        if commit:
+            store._conn.commit()
+    finally:
+        store.close()
+    return str(row[0]) if row else ""
+
+
 def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bool = False) -> str:
-    """Run one statement against a profile's state.db; first column of the first row or ""."""
+    """Run one statement against a profile's session store; first column of the first row or ""."""
     home = _profile_home(profile)
     db = os.path.join(home, "state.db") if home else ""
-    if not db or not os.path.exists(db):
+    if not db:
+        return ""
+    try:
+        answer = _authority_state_db(db, sql, params, commit=commit)
+    except Exception:
+        logger.debug(log_msg, exc_info=True)
+        return ""
+    if answer is not None:
+        return answer
+    if not os.path.exists(db):
         return ""
     try:
         with contextlib.closing(sqlite3.connect(db, timeout=5)) as con:

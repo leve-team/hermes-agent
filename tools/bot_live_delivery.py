@@ -34,9 +34,11 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     from hermes_state import SessionDB
 
     home = Path(profile_home).resolve()
-    if not (home / "state.db").is_file():
-        return None
-    db = SessionDB(db_path=home / "state.db", read_only=True)
+    db = _authority_store(home)
+    if db is None:
+        if not (home / "state.db").is_file():
+            return None
+        db = SessionDB(db_path=home / "state.db", read_only=True)
     try:
         row = db.get_session_by_title("Bot Chat")
         session_id = db.get_compression_tip(row["id"]) if row else None
@@ -52,6 +54,20 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
             return dict(profile_home=str(home), session_id=session_id,
                         lease_id=entry["lease_id"], live_session_id=meta["live_session_id"])
     return None
+
+
+def _authority_store(home: Path | str):
+    """Read-only handle on *home*'s PostgreSQL authority store, else None (levos v3).
+
+    An authority home may still hold the ``state.db`` it wrote before the switch; that file is
+    never opened (a read-only SQLite open of a WAL database still writes ``-shm``). None: the
+    home is not on authority and the caller keeps its SQLite ``state.db`` path.
+    """
+    try:
+        from hermes_state_postgres import open_authority_store_for_db_path
+    except ImportError:
+        return None
+    return open_authority_store_for_db_path(Path(home) / "state.db", read_only=True)
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
@@ -159,7 +175,9 @@ def _matches(home: Path | str, record: dict, owner: dict) -> bool:
         return True
     from hermes_state import SessionDB
 
-    db = SessionDB(db_path=Path(home) / "state.db", read_only=True)
+    db = _authority_store(home)
+    if db is None:
+        db = SessionDB(db_path=Path(home) / "state.db", read_only=True)
     try:
         return db.get_compression_tip(pinned["session_id"]) == owner["session_id"]
     finally:

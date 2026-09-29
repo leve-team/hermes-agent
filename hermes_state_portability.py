@@ -135,7 +135,11 @@ class SessionPortabilityMixin:
         """``s.``-prefixed SELECT list of every SCHEMA_SQL ``sessions`` column except
         prompt storage internals (the compact_rows projection)."""
         if cls._session_compact_cols_sql is None:
-            declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
+            # SQLite-free parse (same mapping as _parse_schema_columns, which executes SCHEMA_SQL in
+            # sqlite3.connect(":memory:")): PostgreSQL-authority listings open no SQLite (levos v3).
+            from hermes_state_pg_columns import declared_schema_columns
+
+            declared = declared_schema_columns(SCHEMA_SQL)["sessions"]
             cls._session_compact_cols_sql = ", ".join(
                 f"s.{name}" for name in declared if name not in cls._SESSION_COMPACT_EXCLUDED
             )

@@ -3,9 +3,12 @@
 One spawned process plays a v3 pod on a fresh ``HERMES_HOME`` whose profile selects
 ``sessions.state_backend: authority`` on the fork's ephemeral PostgreSQL: it starts the messaging
 gateway (``gateway.run.start_gateway``), creates a tui session and submits a prompt through the
-tui gateway's JSON-RPC handler (the model is a local OpenAI-compatible stand-in), runs one cron
-tick with a due job, takes and releases a messaging adapter's credential lock, and shuts the
-gateway down. ``sqlite3.connect`` is replaced by a recorder before anything is imported.
+tui gateway's JSON-RPC handler (the model is a local OpenAI-compatible stand-in), closes and
+resumes that session (each session's notification poller ticks while idle), runs one cron tick
+with a due job, takes and releases a messaging adapter's credential lock, asks the dashboard's
+``/api/status`` once (t_0eeaa6f9), and shuts the gateway down. ``sqlite3.connect`` is replaced
+by a recorder before anything is imported. ``run_pod`` is shared with
+:mod:`tests.test_v3_legacy_state_db_untouched` (the same pod over a pre-authority ``state.db``).
 
 Afterwards no store file may exist under the home or the gateway lock directory — ``*.db``,
 ``*.sqlite*``, ``*-wal``, ``*-shm``, ``gateway-locks/``, ``sessions.json``,
@@ -134,6 +137,8 @@ _POD = textwrap.dedent(r'''
             report["steps"].append([name, "error", f"{type(exc).__name__}: {exc}"])
         report.setdefault("seconds", {})[name] = round(time.monotonic() - started, 1)
 
+    TUI = {}
+
     def tui_turn():
         from tui_gateway import server
         created = server.handle_request({"id": "c", "method": "session.create",
@@ -150,9 +155,28 @@ _POD = textwrap.dedent(r'''
             if thread is not None and not thread.is_alive() and not session.get("running"):
                 break
             time.sleep(0.2)
+        # Idle with its agent: the session's notification poller (bot-live, /loop, kanban) ticks.
+        time.sleep(2)
+        TUI.update(sid=sid, key=session["session_key"])
         db = server._get_db()
         rows = db.get_messages_as_conversation(session["session_key"])
         return [row.get("role") for row in rows]
+
+    def tui_resume():
+        from tui_gateway import server
+        server.handle_request({"id": "x", "method": "session.close",
+                               "params": {"session_id": TUI["sid"]}})
+        resumed = server.handle_request({"id": "r", "method": "session.resume",
+                                         "params": {"session_id": TUI["key"], "cols": 80}})
+        if "error" in resumed:
+            raise RuntimeError(resumed["error"])
+        time.sleep(2)  # the resumed session's poller ticks too
+        return bool(resumed["result"].get("session_id"))
+
+    def api_status():
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+        return TestClient(app).get("/api/status").status_code
 
     def cron_tick():
         from cron import jobs, scheduler
@@ -194,8 +218,10 @@ _POD = textwrap.dedent(r'''
         report.setdefault("seconds", {})["gateway_up"] = round(up_at - BOOT, 1)
         step("runtime_status", gateway_state)
         step("tui_turn", tui_turn)
+        step("tui_resume", tui_resume)
         step("cron_tick", cron_tick)
         step("adapter_lock", adapter_lock)
+        step("api_status", api_status)
         # Stay up past the gateway's background watcher delays (kanban: 5 s, then a tick).
         while time.monotonic() - up_at < float(os.environ.get("V3_POD_MIN_UP_SECONDS") or 0):
             time.sleep(0.2)
@@ -214,13 +240,9 @@ _POD = textwrap.dedent(r'''
 ''')
 
 
-@pytest.mark.parametrize("kanban", ["postgres", "off"])
-def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
-    postgres_dsn, model_url, tmp_path, kanban
-):
-    """``kanban``: ``postgres`` = kanban on its own PostgreSQL backend; ``off`` = the v3
-    deployment (``kanban.enabled: false``, t_fb9c7b9e) with ``HERMES_KANBAN_BACKEND`` unset, so
-    the default kanban backend would be SQLite if anything reached it."""
+def run_pod(postgres_dsn: str, model_url: str, tmp_path: Path, *, kanban: str, seed=None) -> dict:
+    """Run :data:`_POD` on a fresh authority ``HERMES_HOME`` (``tmp_path/home``) and return its
+    report. ``seed(home)`` runs after the config is written and before the pod starts."""
     home = tmp_path / "home"
     locks = tmp_path / "xdg-state"
     home.mkdir()
@@ -233,6 +255,8 @@ def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
         + ("kanban:\n  enabled: false\n" if kanban == "off" else ""),
         encoding="utf-8",
     )
+    if seed is not None:
+        seed(home)
     report_path = tmp_path / "report.json"
     env = {key: os.environ[key] for key in ("PATH", "LD_LIBRARY_PATH", "TMPDIR") if key in os.environ}
     if kanban == "postgres":
@@ -251,17 +275,37 @@ def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
         timeout=600,
     )
     assert report_path.exists(), result.stdout[-4000:] + result.stderr[-8000:]
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    return json.loads(report_path.read_text(encoding="utf-8"))
 
+
+def assert_pod_steps(report: dict) -> None:
     steps = {name: (status, detail) for name, status, detail in report["steps"]}
     assert steps["runtime_status"] == ("ok", "running"), steps  # read back from PostgreSQL
     assert steps["tui_turn"][0] == "ok", steps
     assert "assistant" in steps["tui_turn"][1] and "user" in steps["tui_turn"][1], steps
+    assert steps["tui_resume"] == ("ok", True), steps
     assert steps["cron_tick"] == ("ok", 1), steps
     assert steps["adapter_lock"] == ("ok", [True, True]), steps
-    connects = report["sqlite_connects"]
-    assert connects == [], "\n\n".join(
+    assert steps["api_status"] == ("ok", 200), steps
+
+
+def format_connects(connects: list) -> str:
+    return "\n\n".join(
         f"{c['target']}\n" + "".join(c["stack"].splitlines(keepends=True)[-6:]) for c in connects)
+
+
+@pytest.mark.parametrize("kanban", ["postgres", "off"])
+def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
+    postgres_dsn, model_url, tmp_path, kanban
+):
+    """``kanban``: ``postgres`` = kanban on its own PostgreSQL backend; ``off`` = the v3
+    deployment (``kanban.enabled: false``, t_fb9c7b9e) with ``HERMES_KANBAN_BACKEND`` unset, so
+    the default kanban backend would be SQLite if anything reached it."""
+    report = run_pod(postgres_dsn, model_url, tmp_path, kanban=kanban)
+    home, locks = tmp_path / "home", tmp_path / "xdg-state"
+    assert_pod_steps(report)
+    connects = report["sqlite_connects"]
+    assert connects == [], format_connects(connects)
     assert _leftovers(home, locks) == []
     if kanban == "off":  # nothing kanban-shaped at all: no db, no board dir, no dispatcher lock
         assert sorted(str(p) for p in tmp_path.rglob("kanban*")) == []
