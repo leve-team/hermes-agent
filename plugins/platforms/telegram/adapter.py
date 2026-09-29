@@ -2274,9 +2274,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
             # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
             # one, creating the very conflict we are trying to recover from (#75017).
+            # Under a PostgreSQL platform lock (levos 0061) no other gateway of this profile polls, so the
+            # competitor is the previous holder's expiring long-poll (PTB's getUpdates timeout is 10s, below
+            # every RETRY_DELAY) — dropping would only delete the queued messages.
             self._polling_conflict_recovery_generation = expected_generation
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(
+                    app, drop_pending_updates=not self._platform_lock_fences_pods,
+                    error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -2872,7 +2877,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._app.updater.start_webhook(
             listen=webhook_host, port=webhook_port, url_path=webhook_path, webhook_url=webhook_url,
             secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=not is_reconnect,  # push-based ⇒ practically a no-op; mirrors polling
+            drop_pending_updates=self._drop_pending_on_connect(is_reconnect),  # push-based ⇒ practically a no-op
        )
         self._webhook_mode = True
         self._polling_progress_accepting = False
@@ -2904,10 +2909,17 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_error_callback_ref = _polling_error_callback  # reused by _handle_polling_conflict
         polling_started = await self._start_polling_resilient(
             # Cold first boot drops the stale Bot API queue; a watcher reconnect preserves it.
-            drop_pending_updates=not is_reconnect, error_callback=_polling_error_callback, require_progress=not is_reconnect)
+            drop_pending_updates=self._drop_pending_on_connect(is_reconnect), error_callback=_polling_error_callback,
+            require_progress=not is_reconnect)
         if not polling_started:
             logger.warning(
                 "[%s] Connected in degraded Telegram mode: gateway is alive, polling will be retried in the background", self.name)
+
+    def _drop_pending_on_connect(self, is_reconnect: bool) -> bool:
+        """Whether this connect discards the Bot API's queued updates. A cold boot drops a stale queue —
+        except under a PostgreSQL platform lock (levos 0061), where a cold boot is the next pod taking
+        over and the queue holds the messages sent during the handoff."""
+        return not is_reconnect and not self._platform_lock_fences_pods
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect via long polling, or a webhook server if ``TELEGRAM_WEBHOOK_URL`` is set.
@@ -3125,8 +3137,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
         # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
-        # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        # The rest of teardown is best-effort against a half-dead transport. See #80598. A PostgreSQL lock
+        # (levos 0061) fences other pods, so it is released only after polling stopped below; this
+        # process's own reconnect re-enters it meanwhile.
+        if not self._platform_lock_fences_pods:
+            self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
@@ -3177,6 +3192,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
+        self._release_platform_lock()
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:

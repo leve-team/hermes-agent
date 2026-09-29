@@ -1285,7 +1285,13 @@ def _process_is_stopped(pid: int) -> bool:
 def acquire_scoped_lock(
     scope: str, identity: str, metadata: Optional[dict[str, Any]] = None
 ) -> tuple[bool, Optional[dict[str, Any]]]:
-    """Acquire a machine-local lock keyed by scope + identity (one Telegram token across homes)."""
+    """Acquire a machine-local lock keyed by scope + identity (one Telegram token across homes).
+    On a PostgreSQL-authority profile the lock is the profile's advisory lock instead
+    (``gateway.status_pg_locks``) and no lock file is written."""
+    from gateway import status_pg_locks
+
+    if status_pg_locks.scoped_lock_uses_postgres():
+        return status_pg_locks.acquire_postgres_scoped_lock(scope, identity)
     lock_path = _get_scope_lock_path(scope, identity)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -1333,6 +1339,12 @@ def acquire_scoped_lock(
 def release_scoped_lock(scope: str, identity: str) -> None:
     """Release a scope lock owned by this PID. No start_time equality check: on-disk null vs a live
     fingerprint would wedge reconnects."""
+    from gateway import status_pg_locks
+
+    if (status_pg_locks.holds_postgres_scoped_lock(scope, identity)
+            or status_pg_locks.scoped_lock_uses_postgres()):
+        status_pg_locks.release_postgres_scoped_lock(scope, identity)
+        return
     lock_path = _get_scope_lock_path(scope, identity)
     if (_read_json_file(lock_path) or {}).get("pid") == os.getpid():
         _unlink_quietly(lock_path)

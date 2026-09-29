@@ -438,6 +438,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after
+from gateway.platforms.platform_lock import PlatformPostgresLockMixin
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
@@ -1794,7 +1795,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(PlatformPostgresLockMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -2122,7 +2123,10 @@ class BasePlatformAdapter(ABC):
         ``--replace`` connect (the status module validates ownership and terminates)."""
         from gateway.status import (
             acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
+        from gateway.status_pg_locks import scoped_lock_uses_postgres
         self._platform_lock_scope, self._platform_lock_identity = scope, identity
+        if scoped_lock_uses_postgres():
+            return self._acquire_postgres_platform_lock(scope, identity, resource_desc)
         lock_meta = {"platform": self.platform.value}
         acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
         if acquired:
@@ -2159,8 +2163,11 @@ class BasePlatformAdapter(ABC):
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
-        from gateway.status import release_scoped_lock
-        release_scoped_lock(self._platform_lock_scope, identity)
+        if self._platform_lock_fences_pods:
+            self._release_postgres_platform_lock(identity)
+        else:
+            from gateway.status import release_scoped_lock
+            release_scoped_lock(self._platform_lock_scope, identity)
         self._platform_lock_identity = None
 
     def _wire_plugin_handlers(self, native: Any = None) -> None:
