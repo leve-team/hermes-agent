@@ -203,7 +203,7 @@ _POD = textwrap.dedent(r'''
         report["gateway"] = f"SystemExit({exc.code})"
     report.setdefault("seconds", {})["total"] = round(time.monotonic() - BOOT, 1)
     report["sqlite_connects"] = CALLS
-    Path(os.environ["V3_POD_REPORT"]).write_text(json.dumps(report))
+    Path(os.environ["V3_POD_REPORT"]).write_text(json.dumps(report), encoding="utf-8")
     os._exit(0)
 ''')
 
@@ -234,10 +234,11 @@ def test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite(
     )
     result = subprocess.run(
         [sys.executable, "-c", _POD], env=env, cwd=str(tmp_path), capture_output=True, text=True,
+        encoding="utf-8",
         timeout=600,
     )
     assert report_path.exists(), result.stdout[-4000:] + result.stderr[-8000:]
-    report = json.loads(report_path.read_text())
+    report = json.loads(report_path.read_text(encoding="utf-8"))
 
     steps = {name: (status, detail) for name, status, detail in report["steps"]}
     assert steps["runtime_status"] == ("ok", "running"), steps  # read back from PostgreSQL
@@ -428,7 +429,7 @@ def test_runtime_status_stays_a_file_off_authority():
     from gateway import status
 
     status.write_runtime_status(gateway_state="running")
-    assert json.loads((_home() / "gateway_state.json").read_text())["gateway_state"] == "running"
+    assert json.loads((_home() / "gateway_state.json").read_text(encoding="utf-8"))["gateway_state"] == "running"
 
 
 def test_postgres_schema_reconcile_reads_the_columns_sqlite_would():

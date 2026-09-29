@@ -431,5 +431,5 @@ def test_channel_directory_stays_a_file_off_authority(tmp_path, monkeypatch):
     home = Path(os.environ["HERMES_HOME"])
     holder = {Platform.TELEGRAM: _ListingAdapter([{"id": "-100", "name": "ops", "type": "group"}])}
     asyncio.run(channel_directory.build_channel_directory(holder))
-    assert json.loads((home / "channel_directory.json").read_text())["platforms"]["telegram"]
+    assert json.loads((home / "channel_directory.json").read_text(encoding="utf-8"))["platforms"]["telegram"]
     assert channel_directory.resolve_channel_name("telegram", "ops") == "-100"

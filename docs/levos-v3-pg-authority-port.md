@@ -159,12 +159,12 @@ credential store seeds itself (above).
 
 - 0061 messaging single connection, 0062 turn ownership / pending messages /
   tui markers, 0063 delivery obligations / async delegation leases, 0064
-  routing index — next cards. Their files (`gateway/status.py`,
+  routing index — next cards (done by `t_aa3728da`, §6). Their files (`gateway/status.py`,
   `gateway/platforms/base.py`, `gateway/session.py`, `gateway/turn_owner.py`,
   `gateway/delivery_ledger.py`, `tools/async_delegation.py`,
   `tui_gateway/turn_marker.py`, `plugins/platforms/telegram/`) are untouched.
 - Stores that are new in 0.21.2 and were not part of any v2 patch still use the
-  pod disk on authority: `gateway/platforms/api_server_run_idempotency.py`
+  pod disk on authority (closed by `t_aa3728da`, §6): `gateway/platforms/api_server_run_idempotency.py`
   (`runs_idempotency.db`) and `cron/delivery_queue.py` (restart-safe worker
   delivery queue, pid-based ownership).
 - `docs/quality/rule-index.md` referenced by the card does not exist in this
@@ -242,3 +242,102 @@ Runtime paths found beyond the card's table (same audit):
 | process identity / restart bookkeeping: `gateway.pid`, `gateway.lock`, `.gateway-takeover.json`, `.gateway-planned-stop.json`, `gateway-starts.log`, `.restart_failure_counts`, `.restart_pending.json`, `.restart_notify.json`, `state/gateway.lifecycle.json`, `state/` heartbeat, `.drain_request.json`, control-socket pointer, `processes.json`, cron ticker heartbeat / output / audit files, `spawn-trees/` | per-process, per-pod liveness and operator files | not operational state shared across pods; listed as remaining |
 
 Excluded as the card says: kanban (`kanban*.py`), backup / recovery / doctor CLIs, one-shot migrations, evals, scripts, tests.
+
+### 6.2 Implementation, per bundle
+
+Every authority branch below opens through the existing `hermes_aux_store`
+seam (`open_aux_postgres`, `aux_kv_*`, `AuxSessionLock`, `aux_xact_lock`,
+`aux_schema_transaction`, `connect_aux_postgres`) and raises
+`AuxStoreUnavailable` (no DSN in the message) when PostgreSQL cannot serve;
+none opens SQLite, `:memory:` or a file. Off authority (`sqlite`, `probe`)
+every path is the base code.
+
+| Bundle | Implementation | Tests (real PostgreSQL) |
+|---|---|---|
+| prerequisite | `hermes_state_postgres.open_authority_store_for_db_path` / `home_selects_authority`; used by `gateway/session_persistence.py` (`_open_authority_store`) and `hermes_cli/goals.py` (`_acquire_session_db`) — the gateway's `SessionStore` (and the runner handle that borrows it) and the goal manager open the authority store instead of a SQLite `state.db` | `tests/gateway/test_routing_pg_authority.py::test_session_store_follows_the_profile_backend` |
+| A 0061 | `gateway/status_pg_locks.py` (new: acquire / release / ensure, re-entrant per owner), `gateway/status.py` (`acquire_scoped_lock` / `release_scoped_lock` route there), `gateway/platforms/platform_lock.py` (new mixin: PostgreSQL platform lock, retryable `<scope>_lock`, watch task → `<scope>_lock_lost`), `gateway/platforms/base.py` (routing only), `plugins/platforms/telegram/adapter.py` (unlock after polling stopped; keep the Bot API queue on cold boot and 409 retry), `hermes_aux_store.AuxSessionLock.held()`; Discord / Slack already lock → open → close → unlock | `tests/test_messaging_lock_pg_authority.py` (18: two spawned pods per platform, handoff order, lost session retaken / disconnect, cold-boot queue) |
+| B 0062 | `gateway/turn_owner.py` (new: lease rows, `claim_dead`, `hand_over`, `release`), `gateway/session_turn_leases.py` (new `SessionStore` mixin: `recover_turns_from_leases`, legacy markers, `hand_over_turns`), `gateway/session_lifecycle.py` (`mark_turn_active` leases first, `clear_turn_active` drops; `_settle_turn_marker`), `gateway/run_turn_leases.py` (new `GatewayRunner` mixin: startup recovery without the 120 s fallback, supervised `turn_lease_watcher` that also recovers a peer's pending messages, drain-timeout hand-over, exit receipt = lease outcome), `gateway/run_startup.py` / `gateway/run_shutdown.py` (call sites), `gateway/shutdown_flush.py` + `gateway/shutdown_flush_pg.py` (new: `core_gateway_pending_messages`, `FOR UPDATE SKIP LOCKED`, legacy files recovered once), `tui_gateway/turn_marker.py` (`core_tui_turn_markers` with owner/lease, incl. pg3's `auto_continue`), `hermes_aux_store` (stores + `AuxLeaseRenewer`) | `tests/test_overlap_c03_pg_authority.py` (14) |
+| C 0063 | see 6.4; `gateway/delivery_ledger.py`, `tools/async_delegation.py`, `gateway/run_turn_leases.py` (`_schedule_obligation_resweep`, called from `run_startup._claim_pending_obligations`), `hermes_aux_store` (`AUX_LEASE_COLUMNS`, `AUX_LEASE_EXPIRED`, `aux_owner_instance`, `aux_add_columns`) | `tests/test_overlap_c04_leases.py` (6); `tests/test_pg3_writer_local_follow_backend.py` ends an owner by lease on PostgreSQL |
+| D 0064 | `hermes_state_gateway.py` (`apply_gateway_routing_changes`, `load_gateway_routing_entry`), `gateway/session_persistence.py` (row view, row-level writes, `_refresh_routing_key`, no `sessions.json` import/mirror, no sessions dir), `gateway/session.py` / `gateway/session_transcript.py` (keyed entry points refresh their row); beyond v2: `gateway/channel_directory.py` = one `core_aux_kv` row per platform (a pod writes only platforms it built) | `tests/gateway/test_routing_pg_authority.py` (9) |
+| E | `cron/delivery_queue.py` (`core_cron_deliveries` / `core_cron_delivery_tombstones`, advisory-locked transactions, claim lease instead of pid probe); `gateway/platforms/api_server_run_idempotency.py` (`core_run_idempotency`, advisory-locked reserve/lookup, owner lease → `owner_live`) + `gateway/platforms/api_server_runs.py` (uses `owner_live`) | `tests/test_v3_no_file_state_authority.py::test_cron_delivery_queue_*`, `::test_run_idempotency_*` |
+| F | `hermes_state_postgres.probe_authority_store` (one short connection; ok / schema absent / unreachable); `gateway/readiness.py` (`_probe_state_db`), `gateway/lifecycle_ledger.py` (`check_state_db_integrity`) | `::test_state_checks_*` |
+| G | refused (decision below): `gateway/hosted_rooms.py` (`hosted_rooms_enabled`, `HostedRoomsDisabledError` from `default_db_path`), `tui_gateway/methods_groups.py` (`start_hosted_room_service` → None), `gateway/run_startup.py` (no room worker / watcher) | `::test_hosted_rooms_*` |
+| H | explicit error: `plugins/memory/holographic/store.py` (`MemoryStore`), `plugins/memory/retaindb/__init__.py` (`_WriteQueue`) raise `AuxStoreUnavailable` naming the file before any connect | `::test_sqlite_memory_plugin*` |
+| guard | `tests/test_v3_no_file_state_authority.py::test_v3_pod_on_authority_keeps_no_state_files_and_opens_no_sqlite`; what it found: `gateway_state.json` → `gateway/status_pg_runtime.py` (a `core_aux_kv` row keyed by pod hostname + record path over one cached connection, `gateway/status.py` `write_runtime_status` / `read_runtime_status`); `sqlite3.connect(":memory:")` on every PostgreSQL connect → `hermes_state_pg_columns.declared_schema_columns` (SQLite-free `CREATE TABLE` reader used by `reconcile_postgres_columns`) | `::test_runtime_status_*`, `::test_postgres_schema_reconcile_reads_the_columns_sqlite_would` |
+
+**G decision.** Hosted rooms (Group Chat) are ~4.5k lines of room
+coordination over the install-root SQLite `shared-state.db` (driver, replicas,
+peers, policy checkpoints, grants). An authority pod must not keep that file
+and overlapping pods would each coordinate their own copy, while a PostgreSQL
+port of the whole state machine is a feature of its own. The feature is
+therefore refused on authority, loudly: `default_db_path()` raises
+`HostedRoomsDisabledError` (a `HostedRoomError`, so the legacy prompt fence
+treats a `Group: …` title as "not a hosted room"), the service does not start,
+the gateway logs one info line, room grant routes answer with their existing
+error responses. Off authority nothing changes.
+
+### 6.3 Regression guard
+
+`tests/test_v3_no_file_state_authority.py` spawns one pod process (fresh
+`HERMES_HOME`, `sessions.state_backend: authority`, real PostgreSQL,
+`sqlite3.connect` replaced by a recorder before any import) that runs
+`gateway.run.start_gateway` → tui `session.create` + `prompt.submit` against a
+local OpenAI-compatible stand-in → one `cron.scheduler.tick` with a due job →
+a messaging adapter's credential lock taken and released → SIGTERM shutdown.
+It asserts the steps succeeded (the runtime status read back from PostgreSQL
+says `running`, the turn stored user + assistant rows in PostgreSQL, the tick
+ran one job, the lock was the PostgreSQL one), zero `sqlite3.connect` calls
+(`:memory:` included), and none of `*.db`, `*.sqlite*`, `*-wal`, `*-shm`,
+`gateway-locks/`, `sessions.json`, `channel_directory.json`,
+`gateway_state.json`, `desktop/interrupted_turns.json`, `cron/deliveries.db`
+under the home or the XDG lock directory. Not checked (not store state): logs,
+`cache/`, `skills/`, `SOUL.md`, process identity and liveness files. On the
+base tree the same pod records 8 `sqlite3.connect` calls (`shared-state.db` ×4,
+`state.db` ×3, `:memory:` ×1) and leaves `state.db`, `shared-state.db`,
+`gateway_state.json`, `channel_directory.json` and a `gateway-locks/` file.
+
+Kanban is outside this card: the pod runs it on its own PostgreSQL backend
+(`HERMES_KANBAN_BACKEND=postgres`), which is what a v3 deployment must set;
+with the default SQLite kanban backend the gateway's dispatcher and the tui
+notification poller open `kanban.db`.
+
+### 6.4 C: pg3's PostgreSQL tables vs the v2 lease contract
+
+| Contract (v2 `1081cacdd`) | `levos/pg3` before this card | Added here |
+|---|---|---|
+| rows live in the profile's PostgreSQL store | yes (0051 `SessionDB.open_writer`) | — |
+| owner identity | `owner_pid` + `owner_started_at` (local kernel) | `owner_instance` (per-process id) + `lease_expires_at` (server clock), added idempotently |
+| owner renews while alive | no | `AuxLeaseRenewer`, every 30 s to 120 s ahead (both tables) |
+| takeover rule | pid probe (`_owner_alive`, `_pid_exists`) — another pod's pids look dead | only another instance's row whose lease ran out, re-checked inside the guarded `UPDATE`; no pid probe on PostgreSQL |
+| a live-lease row skipped at startup | waits for the next restart | gateway `_schedule_obligation_resweep` after `seconds_until_recoverable()`; delegations: deferred recovery timer on the completion queue |
+| this process's own rows (pg3-only: `sweep_failed_for_runtime`, `pending_flood_retries`, `release_runtime_claim`) | pid + start time | also `owner_instance` on PostgreSQL (another pod's namespace can repeat both) |
+| flood-adopt claim (pg3-only) | pid-guarded | same lease guard and lease stamp as the claim |
+
+### 6.5 Remaining (not closed by this card)
+
+- **Process identity / liveness and operator files** stay pod-local by design
+  (each describes one process on one pod): `gateway.pid`, `gateway.lock`,
+  `gateway.sock`, `.gateway-takeover.json`, `.gateway-planned-stop.json`,
+  `gateway-starts.log`, `.restart_*`, `.update_*`, `.drain_request.json`,
+  `state/gateway.lifecycle.json`, `state/gateway.heartbeat`,
+  `runtime/active_sessions.json` (+ `.lock`, the per-host session slot cap),
+  `processes.json`, `spawn-trees/`, `cron/ticker_heartbeat`,
+  `cron/ticker_last_success`, `cron/catch_up_occurrences`,
+  `cron/usage_audit.jsonl`, `cron/output/*.md` (also mirrored to PostgreSQL
+  by 0068), `.skills_prompt_snapshot.json`, `.update_check`.
+- **Readers that stat or open `gateway_state.json` directly** instead of
+  `gateway.status.read_runtime_status` see no record on authority:
+  `hermes_cli/container_boot.py`, `hermes_cli/service_manager.py`,
+  `hermes_cli/web_server_cron.py`, `hermes_cli/gateway_windows.py` and the tui
+  change watcher's `platforms.changed` signal (file mtime).
+- **Pre-existing JSONL transcript fallback**: when the session store cannot
+  open, `SessionStore` still falls back to `sessions/*.jsonl` (not added here;
+  the routing index itself raises `AuxStoreUnavailable`).
+- `tools/bot_live_delivery.py` and `plugins/platforms/a2a/adapter.py` open
+  `state.db` only when the file exists (never on an authority pod), so those
+  features read nothing there; `hermes_cli/observability/shared_metrics.py`
+  opens its SQLite only behind the telemetry opt-in.
+- Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3) and the
+  hosted-room PostgreSQL port (G) are separate work.
+- The feature branch could not be pushed from the worker (no GitHub
+  credentials in the environment); commits are local to the worker branch.
