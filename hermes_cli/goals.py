@@ -594,7 +594,14 @@ def _acquire_session_db(home: str):
     writer per profile beside the gateway's registry handle — its own token-writer thread and
     close-time checkpoint (the #90837 corruption shape), doubled under multiplexing."""
     from hermes_state_registry import acquire
-    return acquire(Path(home) / "state.db")
+    path = Path(home) / "state.db"
+    try:
+        from hermes_state_postgres import open_authority_store_for_db_path
+    except ImportError:
+        return acquire(path)
+    # An explicit path selects SQLite; a PostgreSQL-authority home opens its own PG store.
+    store = open_authority_store_for_db_path(path)
+    return acquire(path) if store is None else store
 
 
 def _release_session_db(db) -> None:

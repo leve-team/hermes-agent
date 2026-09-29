@@ -1201,6 +1201,36 @@ def open_store_for_home(
     return db
 
 
+def open_authority_store_for_db_path(db_path: Any) -> Any:
+    """The PostgreSQL authority store behind ``<home>/state.db``, else None (levos v3).
+
+    Callers that address a profile's store by its ``state.db`` path (the
+    gateway's ``SessionStore``, the goal manager) would otherwise open that
+    file on SQLite: an explicit path always selects SQLite in ``SessionDB``.
+    The active home follows this process's selector (env, then config); any
+    other home follows its own ``config.yaml``, as ``open_store_for_home``
+    does. None means the home is not on authority and the caller keeps its
+    SQLite path; an authority store that cannot open raises.
+    """
+    from pathlib import Path
+    from hermes_constants import get_hermes_home
+    from hermes_state_read import normalize_read_mode
+
+    home = Path(db_path).parent
+    try:
+        active = home.resolve() == Path(get_hermes_home()).resolve()
+    except OSError:
+        active = False
+    if active:
+        if resolve_state_backend() != "authority":
+            return None
+        from hermes_state import SessionDB
+
+        return SessionDB(read_only=False)
+    backend = normalize_read_mode(_home_sessions_config(home).get("state_backend") or "sqlite")
+    return open_store_for_home(home) if backend == "authority" else None
+
+
 def open_store_for_profile(profile_name: str, read_only: bool = False) -> Any:
     """Open a named profile's own store, with the requested access mode enforced."""
     from hermes_cli import profiles as profiles_mod

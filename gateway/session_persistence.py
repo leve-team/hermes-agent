@@ -34,6 +34,15 @@ _SESSIONS_JSON_README = (
 )
 
 
+def _open_authority_store(path: Path):
+    """The PostgreSQL authority store behind *path*, or None off authority (levos v3)."""
+    try:
+        from hermes_state_postgres import open_authority_store_for_db_path
+    except ImportError:
+        return None  # base install without the PostgreSQL module
+    return open_authority_store_for_db_path(path)
+
+
 def _is_live_system_guard(exc: BaseException) -> bool:
     """Test-isolation guard: must stay a loud failure and is never cached."""
     return isinstance(exc, RuntimeError) and "live-system guard" in str(exc)
@@ -58,6 +67,10 @@ class SessionPersistenceMixin:
 
         def _open():
             try:
+                # An explicit path selects SQLite; a PostgreSQL-authority home opens its PG store.
+                authority_store = _open_authority_store(path)
+                if authority_store is not None:
+                    return authority_store
                 return acquire(path)  # process-wide registry: one writer per path
             except Exception as e:
                 if not _is_live_system_guard(e):
