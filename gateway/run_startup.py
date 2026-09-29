@@ -944,28 +944,9 @@ class GatewayStartupMixin:
             recovered += self._recover_secondary_process_checkpoints(process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
-        # Recover sessions active at last exit (exact turn markers + 120s recency fallback for
-        # marker-less older turns). SKIP after a clean exit — the previous process already drained.
-        _clean_marker = _hermes_home / ".clean_shutdown"
-        if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
-            try:
-                discarded = await self._consume_clean_shutdown_marker(_clean_marker)
-            except Exception as exc:
-                logger.error(
-                    "Clean-start marker cleanup failed; refusing startup so the "
-                    "clean-exit receipt cannot mask a later unclean exit: %s", exc,
-                )
-                raise RuntimeError("clean-start recovery cleanup failed") from exc
-            if discarded:
-                logger.info("Discarded %d orphan active-turn marker(s) after clean shutdown", discarded)
-        else:
-            exact, fallback = await self._recover_unclean_sessions()
-            if exact + fallback:
-                logger.info(
-                    "Marked %d in-flight session(s) as resumable from previous run "
-                    "(%d exact, %d legacy)", exact + fallback, exact, fallback,
-                )
+        # Recover sessions active at last exit: exact turn markers + 120s recency fallback, skipped
+        # after a clean exit; on PostgreSQL authority the turn leases decide (gateway.run_turn_leases).
+        await self._recover_sessions_after_previous_run()
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
@@ -1323,6 +1304,10 @@ class GatewayStartupMixin:
         self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
+        # PostgreSQL authority: pick up turns and pending messages a peer pod leaves behind after
+        # this pod started (levos 0062).
+        if self._turn_leases_on_postgres():
+            self._spawn_supervised(self._turn_lease_watcher, "turn_lease_watcher")
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
         try:
             if self._scale_to_zero_should_arm():

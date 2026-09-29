@@ -7,6 +7,10 @@ All hooks write atomic JSON payloads under ``<hermes_home>/pending_messages/``:
 ``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``,
 deletes each file on success), ``flush_agent_history_to_file`` (DB flush raised),
 ``spool_dropped_transcript_message`` / ``drain_transcript_spool``.
+
+On a PostgreSQL-authority profile (levos 0062) the spool is the table
+``core_gateway_pending_messages`` instead of the directory (``gateway.shutdown_flush_pg``): a pod's
+disk dies with the pod, so nothing is written under ``pending_messages/`` there.
 """
 
 from __future__ import annotations
@@ -19,7 +23,9 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
+
+from gateway import shutdown_flush_pg
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +33,8 @@ logger = logging.getLogger(__name__)
 # operation. Payloads carry the full transcript message dict for verbatim replay.
 # See #78182.
 TRANSCRIPT_CAP_DROP_REASON = "transcript_cap_drop"
+# Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
+_AGENT_HISTORY_REASON = "shutdown-with-unpersisted-agent-history"
 # Monotonic tiebreaker so same-second spool files replay in drop order.
 _TRANSCRIPT_SPOOL_SEQ = itertools.count()
 
@@ -63,13 +71,30 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
     return final_path
 
 
-def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
-    """Serialise and write one pending value; return True when a payload was written."""
+def _publish(payload: Dict[str, Any]) -> Union[Path, str]:
+    """Store one recovery payload where this profile's successor will look."""
+    if shutdown_flush_pg.enabled():
+        return shutdown_flush_pg.publish(payload)
+    return _write_payload(_get_flush_dir(), payload)
+
+
+def _value_payload(kind: str, session_key: str, value: Any, **extra: Any) -> Optional[Dict[str, Any]]:
+    """The recovery payload of one pending value; None when it cannot be serialised."""
     try:
         serialised = _serialise_value(value)
-        if serialised is None:
-            return False
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
+    except Exception as exc:
+        logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
+        return None
+    return None if serialised is None else {"session_key": session_key, **extra, "data": serialised}
+
+
+def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
+    """Serialise and write one pending value; return True when a payload was written."""
+    payload = _value_payload(kind, session_key, value, **extra)
+    if payload is None:
+        return False
+    try:
+        _write_payload(flush_dir, payload)
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
@@ -80,6 +105,12 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     """Serialise non-empty ``_pending_messages`` slots (``MessageEvent`` or str); return count."""
     if not pending:
         return 0
+    if shutdown_flush_pg.enabled():
+        ts = int(time.time())
+        payloads = [_value_payload("pending", key, value, reason=reason, ts=ts)
+                    for key, value in list(pending.items()) if value is not None]
+        return shutdown_flush_pg.publish_many(
+            [p for p in payloads if p is not None], what="pending", reason=reason)
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
@@ -98,6 +129,13 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
     """
     if not overflow_by_session:
         return 0
+    if shutdown_flush_pg.enabled():
+        ts = int(time.time())
+        payloads = [_value_payload("overflow", key, value, reason=reason, ts=ts, seq=seq)
+                    for key, events in list(overflow_by_session.items()) if key and events
+                    for seq, value in enumerate(list(events)) if value is not None]
+        return shutdown_flush_pg.publish_many(
+            [p for p in payloads if p is not None], what="queued overflow", reason=reason)
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, events in list(overflow_by_session.items()):
         if not session_key or not events:
@@ -112,15 +150,16 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
     return flushed
 
 
-def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -> Optional[Path]:
+def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -> Optional[Union[Path, str]]:
     """Spool a cap-evicted transcript message; ``None`` on failure (callers degrade to drop+log).
 
     Uses the same on-disk pending spool as :func:`flush_pending_to_file` (one atomic JSON payload per
     message under ``<hermes_home>/pending_messages/``), so a runtime cap rotation no longer silently
-    discards user data while the process stays up (#78182).
+    discards user data while the process stays up (#78182). On PostgreSQL authority the return value
+    names the spool row.
     """
     try:
-        return _write_payload(_get_flush_dir(), {
+        return _publish({
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
             "seq": next(_TRANSCRIPT_SPOOL_SEQ),
             "data": {"session_id": session_id, "message": message},
@@ -136,6 +175,8 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
     only after its replay succeeds. The first failure stops the drain (the DB is likely still
     unhealthy) and keeps the rest for retry.
     """
+    if shutdown_flush_pg.enabled():
+        return shutdown_flush_pg.drain_transcript_spool(session_id, replay, cap_reason=TRANSCRIPT_CAP_DROP_REASON)
     try:
         candidates = list(_get_flush_dir().glob("pending-*.json"))
     except Exception as exc:
@@ -202,9 +243,26 @@ def recover_pending_to_db(session_db=None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
-    Returns the number of messages recovered.
+    Returns the number of messages recovered. On PostgreSQL authority the spool rows are recovered
+    instead, plus — once — any files a gateway older than levos 0062 left on this disk.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
+    if shutdown_flush_pg.enabled():
+        from hermes_constants import get_hermes_home
+
+        recovered = 0
+        legacy_dir = get_hermes_home() / "pending_messages"
+        if legacy_dir.is_dir():
+            recovered += _recover_pending_files(session_db, legacy_dir)
+        recovered += shutdown_flush_pg.recover_to_db(
+            session_db, _recover_one_payload, skip_reason=_AGENT_HISTORY_REASON)
+        if recovered:
+            logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
+        return recovered
+    return _recover_pending_files(session_db, _get_flush_dir())
+
+
+def _recover_pending_files(session_db, flush_dir: Path) -> int:
+    flush_files = sorted(flush_dir.glob("*.json"))
     if not flush_files:
         return 0
     own_db = session_db is None
@@ -216,7 +274,7 @@ def recover_pending_to_db(session_db=None) -> int:
         for path in flush_files:
             payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
-            if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
+            if payload.get("reason") == _AGENT_HISTORY_REASON:
                 continue
             if _recover_one_payload(session_db, path, payload):
                 recovered += 1
@@ -274,7 +332,6 @@ def flush_agent_history_to_file(session_id: Optional[str], history: list) -> Non
     if not history:
         return
     try:
-        flush_dir = _get_flush_dir()
         snapshot = []
         for _m in history:
             try:
@@ -282,8 +339,8 @@ def flush_agent_history_to_file(session_id: Optional[str], history: list) -> Non
                 snapshot.append(_m if plain else str(_m))
             except Exception:
                 continue
-        _write_payload(flush_dir, {
-            "reason": "shutdown-with-unpersisted-agent-history", "issue": "#72680",
+        _publish({
+            "reason": _AGENT_HISTORY_REASON, "issue": "#72680",
             "session_id": session_id, "count": len(snapshot), "messages": snapshot,
         })
         logger.warning("Preserved %d in-memory message(s) for session %s "

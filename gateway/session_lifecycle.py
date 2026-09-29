@@ -128,8 +128,27 @@ class SessionLifecycleMixin:
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
-        unwind cannot clear a newer turn."""
-        token = uuid.uuid4().hex
+        unwind cannot clear a newer turn.
+
+        On PostgreSQL authority (levos 0062) the token is leased to this process in
+        ``core_gateway_turn_leases`` before the marker is written, so an overlapping pod can tell a
+        running turn from an orphaned one."""
+        from gateway import turn_owner
+
+        leased = turn_owner.enabled()
+        token = turn_owner.new_token() if leased else uuid.uuid4().hex
+        if leased:
+            turn_owner.acquire(token, scope=self._routing_scope(), session_key=session_key)
+        try:
+            marked = self._mark_turn_active(session_key, token)
+        except BaseException:
+            self._drop_turn_lease(token)
+            raise
+        if marked is None:
+            self._drop_turn_lease(token)
+        return marked
+
+    def _mark_turn_active(self, session_key: str, token: str) -> Optional[str]:
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
@@ -145,6 +164,7 @@ class SessionLifecycleMixin:
             if entry is None or entry.active_turn_token != token:
                 return False
             self._set_turn_marker_locked(session_key, entry, None, None)
+        self._drop_turn_lease(token)
         return True
 
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
@@ -152,36 +172,43 @@ class SessionLifecycleMixin:
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.
         Returns the number of newly promoted sessions."""
         now = _now()
-        max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
 
         def _promote(entry: SessionEntry) -> bool:
             nonlocal promoted
             if not entry.active_turn_token:
                 return False
-            started_at = entry.active_turn_started_at
-            try:
-                marker_is_stale = started_at is None or (
-                    max_age_seconds > 0 and now - started_at > max_age
-                )
-            except TypeError:
-                # Mixed aware/naive timestamps: clear rather than risk an unsafe old resume.
-                marker_is_stale = True
-            if not marker_is_stale and not entry.suspended:
-                if entry.resume_pending:
-                    # A drain-timeout marker is more specific; keep it.
-                    if entry.last_resume_marked_at is None:
-                        entry.last_resume_marked_at = now
-                else:
-                    entry.resume_pending = True
-                    entry.resume_reason = "restart_interrupted"
-                    entry.last_resume_marked_at = now  # freshness starts at discovery
-                    promoted += 1
-            entry.active_turn_token = None
-            entry.active_turn_started_at = None
+            promoted += self._settle_turn_marker(entry, now, max_age_seconds)
             return True
 
         self._update_all_entries_locked(_promote)
+        return promoted
+
+    @staticmethod
+    def _settle_turn_marker(entry: SessionEntry, now: datetime, max_age_seconds: int) -> bool:
+        """Clear an interrupted turn's marker; True when that newly armed ``resume_pending``. Old or
+        invalid markers and suspended sessions are cleared without resuming."""
+        started_at = entry.active_turn_started_at
+        try:
+            marker_is_stale = started_at is None or (
+                max_age_seconds > 0 and now - started_at > timedelta(seconds=max(0, max_age_seconds))
+            )
+        except TypeError:
+            # Mixed aware/naive timestamps: clear rather than risk an unsafe old resume.
+            marker_is_stale = True
+        promoted = False
+        if not marker_is_stale and not entry.suspended:
+            if entry.resume_pending:
+                # A drain-timeout marker is more specific; keep it.
+                if entry.last_resume_marked_at is None:
+                    entry.last_resume_marked_at = now
+            else:
+                entry.resume_pending = True
+                entry.resume_reason = "restart_interrupted"
+                entry.last_resume_marked_at = now  # freshness starts at discovery
+                promoted = True
+        entry.active_turn_token = None
+        entry.active_turn_started_at = None
         return promoted
 
     def discard_active_turn_markers(self) -> int:

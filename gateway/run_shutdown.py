@@ -1735,7 +1735,8 @@ class GatewayShutdownMixin:
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        marked = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        await GatewayRunner._hand_over_resume_pending(self, marked)
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
@@ -1919,16 +1920,8 @@ class GatewayShutdownMixin:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
-        # Clean-shutdown marker skips suspend_recently_active() next boot; a timed-out drain left
-        # half-finished sessions, so no marker — the next startup suspends them.
-        if not ctx.timed_out:
-            with suppress(Exception):
-                (_hermes_home / ".clean_shutdown").touch()
-        else:
-            logger.info(
-                "Skipping .clean_shutdown marker — drain timed out with "
-                "interrupted agents; next startup will suspend recently active sessions."
-            )
+        # Clean-exit receipt (``.clean_shutdown``, or the turn-lease outcome on PostgreSQL authority).
+        self._record_exit_receipt(timed_out=ctx.timed_out)
         # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))

@@ -33,6 +33,7 @@ plus their one-shot move, :func:`migrate_cron_to_pg`.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import os
 import re
@@ -117,6 +118,20 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     # levos v3 (t_2b6c09df): acceptance records of client request ids for
     # ``prompt.submit`` / ``session.create`` (``tui_gateway/submit_idempotency.py``).
     # No SQLite form: off authority the ids are accepted and ignored.
+    # levos 0062: gateway turn leases, the shutdown pending-message queue and
+    # the tui interrupted-turn markers. PostgreSQL only — elsewhere they stay
+    # ``.clean_shutdown``, ``pending_messages/`` and ``desktop/``.
+    "gateway_turns": (
+        AuxTable("gateway_turn_leases", "core_gateway_turn_leases", ("token",)),
+    ),
+    "gateway_pending": (
+        AuxTable(
+            "gateway_pending_messages", "core_gateway_pending_messages", ("id",), "id"
+        ),
+    ),
+    "tui_turn_markers": (
+        AuxTable("tui_turn_markers", "core_tui_turn_markers", ("home", "session_key")),
+    ),
     "submit_idempotency": (
         AuxTable("submit_accepts", "core_submit_accepts", ("session_key", "client_msg_id")),
         AuxTable(
@@ -829,6 +844,70 @@ def aux_change_signal(name: str) -> Tuple[Any, ...]:
             raise AuxStoreUnavailable(
                 f"change signal {name!r}: the PostgreSQL authority store could not be read"
             ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Row ownership leases (levos 0062 / 0063)
+# ---------------------------------------------------------------------------
+# A row a process owns until it finishes (a running turn, an outbound delivery
+# obligation, a running background delegation) used to name its owner by pid +
+# process start time, and another process judged "owner dead" by probing its
+# own kernel. A pod cannot see another pod's pids, so on PostgreSQL authority
+# the owner counts as dead only once its lease ran out: while it lives the
+# owner renews ``lease_expires_at``, an epoch second on the PostgreSQL server
+# clock so clock skew between pods does not count. The cron execution lease of
+# levos 0060 follows the same model.
+
+AUX_SERVER_EPOCH = "EXTRACT(EPOCH FROM clock_timestamp())::float8"
+
+
+class AuxLeaseRenewer:
+    """One daemon thread per process renewing this process's leases.
+
+    *renew* runs every ``interval()`` seconds in the context of the first
+    :meth:`start` call; a failure is logged through *log* and retried on the
+    next round (a lease that runs out while PostgreSQL is away lets another
+    process take the row over, it never makes two owners renew it).
+    """
+
+    def __init__(self, name: str, renew: Callable[[], Any], interval: Callable[[], float], log: Any):
+        self.name = name
+        self._renew = renew
+        self._interval = interval
+        self._log = log
+        self._guard = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._pid = 0
+
+    def start(self) -> None:
+        with self._guard:
+            if self._thread is not None and self._thread.is_alive() and self._pid == os.getpid():
+                return
+            self._stop = threading.Event()
+            self._pid = os.getpid()
+            self._thread = threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(self._run, self._stop),
+                name=self.name,
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Stop renewing (process exit, tests); a stopped owner's leases run out."""
+        with self._guard:
+            thread, self._thread = self._thread, None
+            self._stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    def _run(self, stop: threading.Event) -> None:
+        while not stop.wait(self._interval()):
+            try:
+                self._renew()
+            except Exception as exc:
+                self._log.warning("%s: lease renewal failed: %s", self.name, exc)
 
 
 # ---------------------------------------------------------------------------
