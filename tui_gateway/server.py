@@ -10305,6 +10305,36 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _claim_notification_or_release_running(
+    session: dict, evt: dict, consumer: str
+) -> str | None:
+    """Claim ``evt`` for delivery, or hand back the ``running`` flag.
+
+    Every notification path sets ``session["running"] = True`` before
+    claiming. When the claim is lost (another consumer owns the durable
+    event) or the claim call raises, no turn starts — leaving ``running`` set
+    would strand the session busy: user prompts get queued behind a turn that
+    never runs and this session's notifications re-queue forever. Nothing is
+    emitted here: the path never sent ``message.start``, so the client never
+    saw this session go busy.
+    """
+    from tools.async_delegation import claim_event_delivery
+
+    try:
+        claim = claim_event_delivery(evt, consumer)
+    except Exception as exc:
+        print(
+            f"[tui_gateway] notification delivery claim failed ({consumer}): "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        claim = None
+    if claim is None:
+        with session["history_lock"]:
+            session["running"] = False
+    return claim
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10452,9 +10482,9 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        _claim = _claim_notification_or_release_running(session, evt, "tui-poller")
         if _claim is None:
             continue
         try:
@@ -10530,9 +10560,9 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            complete_event_delivery, release_event_delivery,
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
+        _claim = _claim_notification_or_release_running(session, evt, "tui-poller")
         if _claim is None:
             continue
         try:
@@ -11804,9 +11834,11 @@ def _run_prompt_submit(
                         break
                     session["running"] = True
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    complete_event_delivery, release_event_delivery,
                 )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
+                _claim = _claim_notification_or_release_running(
+                    session, _evt, "tui-post-turn"
+                )
                 if _claim is None:
                     continue
                 try:
