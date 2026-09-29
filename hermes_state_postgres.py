@@ -1218,7 +1218,15 @@ def home_selects_authority(profile_home: Any) -> bool:
 
     if _is_active_home(profile_home):
         return resolve_state_backend() == "authority"
-    return normalize_read_mode(_home_sessions_config(profile_home).get("state_backend") or "sqlite") == "authority"
+    try:
+        sessions = _home_sessions_config(profile_home)
+    except RuntimeError:
+        # Like hermes_aux_store.aux_store_authority: an unparseable config refuses only while the
+        # home carries a DSN; without one it cannot be on authority and keeps its SQLite store.
+        if _dsn_from_profile_env(profile_home):
+            raise
+        return False
+    return normalize_read_mode(sessions.get("state_backend") or "sqlite") == "authority"
 
 
 def open_authority_store_for_db_path(db_path: Any) -> Any:
