@@ -3032,6 +3032,120 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
     _emit("session.info", sid, _session_info(agent, session))
 
 
+# How long a finished turn's answer must stay the session's last word before
+# ``session.final`` announces it (levos patch 0071). One conversation spans
+# many turns — queued input, /goal continuations, background-process and
+# async-subagent wakeups — so ``message.complete`` alone cannot tell a
+# consumer (web push) that the conversation is over.
+FINAL_SETTLE_SECONDS = 60.0
+
+
+def _record_final_candidate(sid: str, session: dict, turn_gen: int, outcome) -> None:
+    """Remember a finished turn's answer and schedule its settle check.
+
+    ``outcome`` is the ``(text, status)`` of the ``message.complete`` the turn
+    sent, or None when it sent none. Interrupted turns never become final.
+    """
+    if outcome is None:
+        return
+    text, status = outcome
+    if status not in ("complete", "error"):
+        return
+    text = text if isinstance(text, str) else str(text or "")
+    session_key = str(session.get("session_key") or "")
+    title = _session_live_title(session, session_key) if session_key else ""
+    with session["history_lock"]:
+        superseded = int(session.get("final_gen", 0) or 0) != turn_gen
+        if not superseded:
+            session["final_candidate"] = {
+                "gen": turn_gen,
+                "text": text,
+                "status": status,
+                "title": title,
+                "finished_at": time.time(),
+            }
+    if superseded:
+        logger.info("session.final skipped: reason=%s sid=%s", "superseded", sid)
+        return
+    _schedule_final_settle_check(sid, session)
+
+
+def _schedule_final_settle_check(sid: str, session: dict) -> None:
+    """Arm the session's single settle check, replacing any pending one."""
+    timer = threading.Timer(FINAL_SETTLE_SECONDS, _final_settle_check, args=(sid, session))
+    timer.daemon = True
+    with session["history_lock"]:
+        previous = session.get("_final_settle_timer")
+        session["_final_settle_timer"] = timer
+    if previous is not None:
+        previous.cancel()
+    timer.start()
+
+
+def _final_settle_blocker(session: dict) -> str | None:
+    """Why the session has not settled on its candidate. Caller holds history_lock."""
+    if session.get("_closing"):
+        return "closing"
+    candidate = session.get("final_candidate")
+    if not isinstance(candidate, dict):
+        return "no_candidate"
+    if candidate.get("gen") != int(session.get("final_gen", 0) or 0):
+        return "superseded"
+    if session.get("running"):
+        return "running"
+    if session.get("queued_prompt") or session.get("queued_prompts"):
+        return "queued"
+    return None
+
+
+def _final_settle_check(sid: str, session: dict) -> None:
+    """Emit ``session.final`` once iff the session settled on its candidate.
+
+    Best effort, one shot: a candidate that fails any condition is dropped,
+    never retried — the next turn that ends records its own. Never touches
+    ``running`` and never starts a turn. The registry and delegation lookups
+    take other locks and may reach the state DB, so they run outside
+    ``history_lock`` and the cheap conditions are re-checked under the lock
+    before the candidate is consumed; the emit itself happens after the lock
+    is released.
+    """
+    try:
+        with session["history_lock"]:
+            reason = _final_settle_blocker(session)
+            candidate = session.get("final_candidate")
+        if reason is None:
+            # A record detached from the registry is closed (or replaced by a
+            # newer record under the same sid) even if _closing never landed.
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    reason = "closing"
+        if reason is None and _session_has_active_delegations(sid, session):
+            reason = "delegations"
+        payload = None
+        with session["history_lock"]:
+            if reason is None:
+                reason = _final_settle_blocker(session)
+            if reason is None and session.get("final_candidate") is not candidate:
+                reason = "superseded"
+            if reason is None:
+                payload = {
+                    "stored_session_id": str(session.get("session_key") or ""),
+                    "gen": int(candidate["gen"]),
+                    "status": candidate["status"],
+                    "title": str(candidate.get("title") or ""),
+                    "preview": candidate["text"].strip()[:200],
+                    "finished_at": candidate["finished_at"],
+                }
+            if candidate is not None and session.get("final_candidate") is candidate:
+                session["final_candidate"] = None
+        if payload is None:
+            logger.info("session.final skipped: reason=%s sid=%s", reason, sid)
+            return
+        _emit("session.final", sid, payload)
+    except Exception:
+        logger.debug("session.final settle check failed for %s", sid, exc_info=True)
+
+
 def _session_source(session: dict | None) -> str:
     if session:
         source = str(session.get("source") or "").strip()
@@ -7392,6 +7506,8 @@ def _init_session(
             "history_lock": threading.Lock(),
             "history_version": 0,
             "inflight_turn": None,
+            "final_gen": 0,
+            "final_candidate": None,
             "created_at": now,
             "last_active": now,
             "running": False,
@@ -8683,14 +8799,14 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> str:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
     ``_run_prompt_submit`` already produces (so TUI/desktop handling is
     uniform), and retains the failed turn via ``_fail_inflight_turn`` so a
     client that missed this frame (disconnect window) can recover it from
-    ``session.resume``'s ``inflight`` payload.
+    ``session.resume``'s ``inflight`` payload. Returns the frame's text.
     """
     with session["history_lock"]:
         _fail_inflight_turn(session, error)
@@ -8717,6 +8833,7 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         payload["rendered"] = rendered
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
+    return text
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -8809,6 +8926,8 @@ def _deferred_session_record(
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
         "explicit_cwd": False,
+        "final_candidate": None,
+        "final_gen": 0,
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -10896,6 +11015,11 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return False
+        # The turn is going to run: it supersedes any settled-answer candidate
+        # an earlier turn left behind (see _record_final_candidate).
+        final_gen = int(session.get("final_gen", 0) or 0) + 1
+        session["final_gen"] = final_gen
+        session["final_candidate"] = None
         if image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
@@ -10950,6 +11074,7 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
+        final_outcome = None  # (text, status) of the message.complete sent, if any
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
@@ -11453,6 +11578,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            final_outcome = (raw, status)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -11635,7 +11761,7 @@ def _run_prompt_submit(
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
+                final_outcome = (_emit_terminal_turn_error(sid, session, e), "error")
                 turn_error_retained = True
             except Exception as emit_exc:
                 print(
@@ -11733,6 +11859,10 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            try:
+                _record_final_candidate(sid, session, final_gen, final_outcome)
+            except Exception:
+                logger.debug("session.final candidate record failed", exc_info=True)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
