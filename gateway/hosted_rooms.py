@@ -191,6 +191,9 @@ class RoomConflictError(HostedRoomError): """Raised when an idempotency key is r
 class RoomProbeUnavailableError(HostedRoomError):
     """Raised when a non-blocking ownership probe cannot read the room store."""
 
+class HostedRoomsDisabledError(HostedRoomError):
+    """Raised on a PostgreSQL-authority profile, where Group Chat is not available (levos v3)."""
+
 class EventConflictError(HostedRoomError): """Raised when an event id is reused with different immutable content."""
 
 class AuthorityConflictError(HostedRoomError):
@@ -395,6 +398,16 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     ).fetchone() is not None
 
 
+def hosted_rooms_enabled() -> bool:
+    """False on a PostgreSQL-authority profile (levos v3). Room coordination lives in the SQLite
+    ``shared-state.db`` of the install root; an authority profile keeps no state on the pod disk
+    (overlapping pods would each coordinate their own copy) and has no PostgreSQL form of this store
+    yet, so Group Chat is refused there instead of silently writing a file."""
+    from hermes_aux_store import aux_store_authority
+
+    return not aux_store_authority()
+
+
 def default_db_path() -> Path:
     """Return the hosted-room coordination database for the active install.
 
@@ -407,7 +420,13 @@ def default_db_path() -> Path:
     during bot-gateway restart storms, 2026-09-03). Keeping the hosted_room*
     tables in a dedicated file means profile gateways never open the master
     session store writable.
+
+    Raises :class:`HostedRoomsDisabledError` on a PostgreSQL-authority profile.
     """
+    if not hosted_rooms_enabled():
+        raise HostedRoomsDisabledError(
+            "Group Chat (hosted rooms) is not available on a PostgreSQL-authority profile: its "
+            "coordination store is a local SQLite file")
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
     return (home.parent.parent if home.parent.name == "profiles" else home) / "shared-state.db"

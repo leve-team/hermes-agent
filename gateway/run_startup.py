@@ -1208,15 +1208,20 @@ class GatewayStartupMixin:
 
     async def _start_post_connect_services(self, connected_count: int) -> None:
         """Room worker, heartbeat, gateway:startup hook, channel directory, /update notice."""
+        from gateway.hosted_rooms import hosted_rooms_enabled
         from gateway.run import _hermes_home
-        try:
-            await self._ensure_hosted_room_worker()
-        except Exception:
-            logger.error(
-                "Group Chat worker failed to start; mutating Group Chat commands "
-                "will fail closed until supervision recovers it", exc_info=True,
-            )
-        self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
+        if not hosted_rooms_enabled():
+            logger.info("Group Chat worker not started: hosted rooms are unavailable on a "
+                        "PostgreSQL-authority profile")
+        else:
+            try:
+                await self._ensure_hosted_room_worker()
+            except Exception:
+                logger.error(
+                    "Group Chat worker failed to start; mutating Group Chat commands "
+                    "will fail closed until supervision recovers it", exc_info=True,
+                )
+            self._spawn_supervised(self._hosted_room_worker_watcher, "hosted_room_worker")
         self._start_loop_heartbeat_task()
         from gateway.run_heartbeat_restore import restore_heartbeat_watches
         self._start_heartbeat_poller()  # Keep retrying even when the first scan is empty.

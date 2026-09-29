@@ -39,11 +39,14 @@ def bind_server(server) -> None:
 
 
 def start_hosted_room_service():
-    """Start one process-owned hosted room service idempotently."""
+    """Start one process-owned hosted room service idempotently; None when there is no bound
+    server or Group Chat is disabled (PostgreSQL authority)."""
     global _service
     if _bound_server is None:
         return None
-    from gateway.hosted_rooms import default_db_path
+    from gateway.hosted_rooms import default_db_path, hosted_rooms_enabled
+    if not hosted_rooms_enabled():
+        return None
     from tui_gateway.hosted_room_service import HostedRoomService
     db_path = default_db_path()
     with _service_lock:
