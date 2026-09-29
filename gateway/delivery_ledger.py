@@ -9,6 +9,14 @@ only on SendResult.success | mark_failed() 'failed' on a definitive rejection. C
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
 and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
 best-effort: ledger failures must never block a send; callers wrap every call in try/except.
+
+On PostgreSQL authority (levos 0063) the owner of a row may run in another pod, where no pid probe
+can see it, so ownership is a lease instead: ``owner_instance`` names the owning process and the row
+counts as orphaned only once its ``lease_expires_at`` (PostgreSQL server clock) ran out. A live owner
+renews its open rows every ``LEASE_RENEW_SECONDS``; a row skipped at startup because its lease was
+still live becomes claimable after ``seconds_until_recoverable()``. This process's own rows are
+matched by ``owner_instance`` as well as pid + start time there (another pod's pid namespace can
+repeat both).
 """
 
 from __future__ import annotations
@@ -34,6 +42,14 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+
+# PostgreSQL authority lease (levos 0063): a live owner renews every LEASE_RENEW_SECONDS; another
+# process may claim the row once the lease is LEASE_SECONDS stale (four missed renewals).
+LEASE_SECONDS = 120.0
+LEASE_RENEW_SECONDS = 30.0
+_OPEN_STATES = "('pending', 'attempting', 'failed')"
+_lease_renewer = None
+_lease_renewer_guard = threading.Lock()
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
 # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
@@ -186,6 +202,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         }
         if "adapter_profile" not in columns:
             conn.execute(postgres_ddl("ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT"))
+        from hermes_aux_store import AUX_LEASE_COLUMNS, aux_add_columns
+
+        aux_add_columns(conn, "delivery_obligations", AUX_LEASE_COLUMNS)
         return
     from hermes_state_wal import apply_wal_with_fallback
 
@@ -245,6 +264,82 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         yield conn
 
 
+def _take_lease(conn: Any, obligation_id: str) -> None:
+    """Stamp this process as the row's lease owner (PostgreSQL only)."""
+    from hermes_aux_store import AUX_SERVER_EPOCH, aux_owner_instance
+
+    conn.execute(
+        f"""UPDATE delivery_obligations SET owner_instance=?, lease_expires_at={AUX_SERVER_EPOCH} + ?
+            WHERE obligation_id=?""",
+        (aux_owner_instance(), float(LEASE_SECONDS), obligation_id))
+
+
+def _own_instance(conn: Any) -> tuple[str, tuple]:
+    """SQL guard (and its parameter) matching only rows this process instance owns on PostgreSQL."""
+    if not _is_postgres(conn):
+        return "", ()
+    from hermes_aux_store import aux_owner_instance
+
+    return " AND owner_instance IS NOT DISTINCT FROM ?", (aux_owner_instance(),)
+
+
+def renew_obligation_leases() -> int:
+    """Renew this process's open rows; 0 off PostgreSQL authority."""
+    from hermes_aux_store import AUX_SERVER_EPOCH, aux_owner_instance, aux_store_authority
+
+    if not aux_store_authority():
+        return 0
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return 0
+        return conn.execute(
+            f"""UPDATE delivery_obligations SET lease_expires_at={AUX_SERVER_EPOCH} + ?
+                WHERE owner_instance=? AND state IN {_OPEN_STATES}""",
+            (float(LEASE_SECONDS), aux_owner_instance())).rowcount
+
+
+def _start_lease_renewer() -> None:
+    global _lease_renewer
+    from hermes_aux_store import AuxLeaseRenewer
+
+    with _lease_renewer_guard:
+        if _lease_renewer is None:
+            _lease_renewer = AuxLeaseRenewer(
+                "delivery-obligation-lease", renew_obligation_leases, lambda: LEASE_RENEW_SECONDS, logger)
+        renewer = _lease_renewer
+    renewer.start()
+
+
+def _stop_lease_renewer() -> None:
+    """Stop renewing (tests; a stopped owner's leases run out)."""
+    with _lease_renewer_guard:
+        renewer = _lease_renewer
+    if renewer is not None:
+        renewer.stop()
+
+
+def seconds_until_recoverable() -> Optional[float]:
+    """Seconds until the earliest live lease another process holds on an open row runs out; None
+    when there is none. Always None off PostgreSQL authority, where the pid probe of
+    ``sweep_recoverable`` is final; on PostgreSQL the startup sweep skips rows whose owner (another
+    pod, or this pod's previous process) still holds a lease, so the caller sweeps again later."""
+    from hermes_aux_store import AUX_SERVER_EPOCH, aux_owner_instance, aux_store_authority
+
+    if not aux_store_authority():
+        return None
+    with _DB_LOCK, _transaction() as conn:
+        if not _is_postgres(conn):
+            return None
+        row = conn.execute(
+            f"""SELECT MIN(lease_expires_at) - {AUX_SERVER_EPOCH} FROM delivery_obligations
+                WHERE state IN {_OPEN_STATES} AND owner_instance IS DISTINCT FROM ?
+                  AND lease_expires_at >= {AUX_SERVER_EPOCH}""",
+            (aux_owner_instance(),)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
+
+
 def _start_time(pid: int) -> Optional[int]:
     try:
         from gateway.status import get_process_start_time  # lazy: tests monkeypatch gateway.status
@@ -302,10 +397,15 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        leased = _is_postgres(conn)
         conn.execute(
-            _RECORD_POSTGRES if _is_postgres(conn) else _RECORD_SQLITE,
+            _RECORD_POSTGRES if leased else _RECORD_SQLITE,
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+        if leased:
+            _take_lease(conn, obligation_id)
+    if leased:
+        _start_lease_renewer()
     _prune()
 
 
@@ -331,14 +431,15 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     if started is None:
         return False
     with _DB_LOCK, _transaction() as conn:
+        own, own_params = _own_instance(conn)
         cursor = conn.execute(
             """UPDATE delivery_obligations
                SET state='failed', attempts=CASE
                        WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
                    updated_at=?, last_error=?
                WHERE obligation_id=? AND state='attempting'
-                 AND owner_pid IS ? AND owner_started_at IS ?""",
-            (time.time(), error[:500] if error else None, obligation_id, pid, started))
+                 AND owner_pid IS ? AND owner_started_at IS ?""" + own,
+            (time.time(), error[:500] if error else None, obligation_id, pid, started, *own_params))
     return bool(cursor.rowcount)
 
 
@@ -389,21 +490,35 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
+        leased = _is_postgres(conn)
+        # PostgreSQL authority: "dead" means another instance's lease ran out (no pid probe), and every
+        # guarded UPDATE re-checks it (the owner may renew meanwhile) and stamps this instance's lease.
+        orphaned, orphan_params, lease_set, lease_params = "", (), "", ()
+        live_owner = "FALSE"
+        if leased:
+            from hermes_aux_store import AUX_LEASE_EXPIRED, AUX_SERVER_EPOCH, aux_owner_instance
+
+            me = aux_owner_instance()
+            orphaned = f" AND owner_instance IS DISTINCT FROM ? AND {AUX_LEASE_EXPIRED}"
+            orphan_params = (me,)
+            lease_set = f", owner_instance=?, lease_expires_at={AUX_SERVER_EPOCH} + ?"
+            lease_params = (me, float(LEASE_SECONDS))
+            live_owner = f"(owner_instance IS NOT DISTINCT FROM ? OR NOT {AUX_LEASE_EXPIRED})"
         rows = conn.execute(
-            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+            f"""SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at
+                      owner_pid, owner_started_at, adapter_profile, last_error, updated_at, {live_owner}
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
-        ).fetchall()
+               WHERE state IN {_OPEN_STATES}""", orphan_params).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
-             owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
-            if _owner_alive(owner_pid, owner_started_at):
+             owner_pid, owner_started_at, adapter_profile, last_error, updated_at, lease_live) in rows:
+            if lease_live if leased else _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""", (now, oid))
+                       SET state='abandoned', updated_at=? WHERE obligation_id=?""" + orphaned,
+                    (now, oid, *orphan_params))
                 continue
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
@@ -413,11 +528,11 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 # Still inside the platform's wait: adopt the dead owner's row without spending an attempt
                 # (state and error kept) so this process's flood timer can claim it once the wait passes.
                 cursor = conn.execute(
-                    """UPDATE delivery_obligations
+                    f"""UPDATE delivery_obligations
                        SET owner_pid=?, owner_started_at=?,
-                           adapter_profile=COALESCE(adapter_profile, 'default')
-                       WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                    (pid, started, oid, owner_pid, owner_pid))
+                           adapter_profile=COALESCE(adapter_profile, 'default'){lease_set}
+                       WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""" + orphaned,
+                    (pid, started, *lease_params, oid, owner_pid, owner_pid, *orphan_params))
                 if cursor.rowcount:
                     claimed.append({
                         "obligation_id": oid, "session_key": session_key, "platform": platform,
@@ -431,13 +546,14 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             # ``IS $1``); ``IS NOT DISTINCT FROM`` is the portable spelling. ``CASE WHEN ?=1`` keeps the
             # flag boolean on PostgreSQL (a bare integer WHEN is rejected there).
             cursor = conn.execute(
-                """UPDATE delivery_obligations
+                f"""UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
                        adapter_profile=COALESCE(adapter_profile, 'default'),
                        state=CASE WHEN ?=1 THEN 'attempting' ELSE state END,
-                       last_error=CASE WHEN ?=1 THEN NULL ELSE last_error END
-                   WHERE obligation_id=? AND owner_pid IS NOT DISTINCT FROM ?""",
-                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid))
+                       last_error=CASE WHEN ?=1 THEN NULL ELSE last_error END{lease_set}
+                   WHERE obligation_id=? AND owner_pid IS NOT DISTINCT FROM ?""" + orphaned,
+                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, *lease_params, oid,
+                 owner_pid, *orphan_params))
             if cursor.rowcount:
                 # pending = never started, redeliver plainly; anything else (crashed mid-await, other
                 # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
@@ -445,6 +561,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
                                             flood=flood_row))
+    if leased and claimed:
+        _start_lease_renewer()
     return claimed
 
 
@@ -466,25 +584,26 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     expected_profile = "default" if not profile or profile == "default" else str(profile)
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
+        own, own_params = _own_instance(conn)
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+               WHERE state='failed' AND platform=?""" + own, (platform, *own_params)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
                     or not _runtime_retryable(last_error)):
                 continue
-            owner_guard = (now, oid, owner_pid, owner_started_at)
+            owner_guard = (now, oid, owner_pid, owner_started_at, *own_params)
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=?
                        WHERE obligation_id=? AND state='failed'
-                         AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                         AND owner_pid IS ? AND owner_started_at IS ?""" + own, owner_guard)
                 continue
             if is_flood_error(last_error) and now < flood_not_before(updated_at, last_error):
                 continue  # the platform's wait has not passed; the flood timer comes back for it
@@ -494,7 +613,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 """UPDATE delivery_obligations
                    SET state='attempting', attempts=attempts+1, updated_at=?, last_error=NULL
                    WHERE obligation_id=? AND state='failed'
-                     AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                     AND owner_pid IS ? AND owner_started_at IS ?""" + own, owner_guard)
             if cursor.rowcount:
                 # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
                 # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
@@ -514,10 +633,12 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
     if started is None:
         return []
     with _DB_LOCK, _transaction() as conn:
+        own, own_params = _own_instance(conn)
         rows = conn.execute(
             """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
                FROM delivery_obligations
-               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
+               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""" + own,
+            (pid, started, *own_params)).fetchall()
     earliest: Dict[tuple, float] = {}
     for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
         if not is_flood_error(last_error) or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:

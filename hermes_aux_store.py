@@ -40,6 +40,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -859,6 +860,40 @@ def aux_change_signal(name: str) -> Tuple[Any, ...]:
 # levos 0060 follows the same model.
 
 AUX_SERVER_EPOCH = "EXTRACT(EPOCH FROM clock_timestamp())::float8"
+# SQLite DDL types (``postgres_ddl`` turns REAL into DOUBLE PRECISION).
+AUX_LEASE_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("owner_instance", "TEXT"),
+    ("lease_expires_at", "REAL"),
+)
+AUX_LEASE_EXPIRED = f"(lease_expires_at IS NULL OR lease_expires_at < {AUX_SERVER_EPOCH})"
+
+_owner_guard = threading.Lock()
+_owner: Tuple[int, str] = (0, "")
+
+
+def aux_owner_instance() -> str:
+    """This process's lease owner id; a forked child gets its own."""
+    global _owner
+    pid = os.getpid()
+    with _owner_guard:
+        if _owner[0] != pid:
+            _owner = (pid, uuid.uuid4().hex)
+        return _owner[1]
+
+
+def aux_add_columns(conn: Any, table: str, columns: Tuple[Tuple[str, str], ...]) -> None:
+    """Add the *columns* PostgreSQL *table* lacks; a racing peer is harmless."""
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?",
+            (table,),
+        ).fetchall()
+    }
+    for name, sql_type in columns:
+        if name not in present:
+            conn.execute(postgres_ddl(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {sql_type}"))
 
 
 class AuxLeaseRenewer:

@@ -157,3 +157,33 @@ class GatewayTurnLeasesMixin:
                 "Skipping .clean_shutdown marker — drain timed out with "
                 "interrupted agents; next startup will suspend recently active sessions."
             )
+
+    async def _schedule_obligation_resweep(self) -> None:
+        """Sweep the delivery ledger again once a live foreign lease runs out (levos 0063): on
+        authority the startup sweep skips rows whose owner — an overlapping pod, or this pod's
+        previous process — still holds a lease, and they would otherwise wait for the next restart.
+        Off PostgreSQL the ledger reports no wait."""
+        pending = getattr(self, "_obligation_resweep_task", None)
+        if pending is not None and not pending.done():
+            return
+        try:
+            from gateway.delivery_ledger import seconds_until_recoverable
+
+            delay = await asyncio.to_thread(seconds_until_recoverable)
+        except Exception:
+            logger.debug("delivery ledger lease query failed", exc_info=True)
+            return
+        if delay is None:
+            return
+
+        async def _resweep() -> None:
+            await asyncio.sleep(delay + 1.0)
+            self._obligation_resweep_task = None
+            if getattr(self, "_running", False):
+                await self._redeliver_pending_obligations()
+
+        task = self._obligation_resweep_task = asyncio.create_task(_resweep())
+        background = getattr(self, "_background_tasks", None)
+        if background is not None:
+            background.add(task)
+            task.add_done_callback(background.discard)

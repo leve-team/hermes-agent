@@ -292,6 +292,7 @@ class GatewayStartupMixin:
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return []
+        await self._schedule_obligation_resweep()
         if not claimed:
             return []
         # Clear resume_pending for EVERY claimed row before any send: the answer is in the ledger.
