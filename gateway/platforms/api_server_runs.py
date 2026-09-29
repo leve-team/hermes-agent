@@ -237,8 +237,10 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     if record is None:
         return None
     status = dict(record["status"])
-    if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
-        int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
+    # PostgreSQL authority: the owner may be another pod; its lease answers, not a local pid probe.
+    owner_live = record["owner_live"] if "owner_live" in record else _owner_alive(
+        int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0))
+    if status.get("status") not in TERMINAL_STATUSES and not owner_live:
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())

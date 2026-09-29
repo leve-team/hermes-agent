@@ -5,6 +5,14 @@ relay/E2EE adapter objects, so it queues the final send here.  A gateway claims
 each row at most once.  If that gateway dies after claiming, the outcome is
 marked unknown and never retried: losing a delivery is safer than duplicating a
 possibly-completed send.
+
+On a PostgreSQL-authority profile the queue is ``core_cron_deliveries`` /
+``core_cron_delivery_tombstones`` in the profile's store instead of
+``cron/deliveries.db`` (the worker and the gateway may run in different pods,
+and a pod's disk dies with it). Every transaction holds the store's advisory
+lock (SQLite's single writer), and a claim is fenced by a lease on the
+PostgreSQL server clock instead of a local pid probe, which cannot see another
+pod. A PostgreSQL failure raises ``AuxStoreUnavailable``; no file is opened.
 """
 
 from __future__ import annotations
@@ -35,6 +43,71 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+# PostgreSQL authority: a claimed send not finished within this lease counts as
+# abandoned by its (possibly other-pod) owner. Sends are bounded well below it.
+DELIVERY_LEASE_SECONDS = 600.0
+_PG_STORE = "cron_deliveries"
+
+
+def _on_postgres() -> bool:
+    from hermes_aux_store import aux_store_authority
+
+    return DELIVERY_DB is None and aux_store_authority()
+
+
+def _is_postgres(conn: Any) -> bool:
+    return bool(getattr(conn, "is_postgres", False))
+
+
+def _insert_or_ignore(conn: Any, sql: str) -> str:
+    """``INSERT OR IGNORE`` in the connection's dialect."""
+    if not _is_postgres(conn):
+        return sql
+    return sql.replace("INSERT OR IGNORE", "INSERT", 1).rstrip() + " ON CONFLICT DO NOTHING"
+
+
+_DELIVERIES_DDL = """CREATE TABLE IF NOT EXISTS deliveries (
+                     execution_id TEXT PRIMARY KEY,
+                     job_json TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     for_failure INTEGER NOT NULL DEFAULT 0,
+                     status TEXT NOT NULL CHECK(status IN
+                       ('pending','delivering','delivered','failed','unknown')),
+                     owner_process_id TEXT,
+                     owner_pid INTEGER,
+                     owner_started_at INTEGER,
+                     created_at TEXT NOT NULL,
+                     finished_at TEXT,
+                     error TEXT
+                   )"""
+_TOMBSTONES_DDL = """CREATE TABLE IF NOT EXISTS delivery_tombstones (
+                     execution_id TEXT PRIMARY KEY,
+                     terminal_status TEXT NOT NULL CHECK(terminal_status IN
+                       ('delivered','failed','unknown')),
+                     finished_at TEXT
+                   )"""
+
+
+def _pg_initialize(conn: Any) -> None:
+    from hermes_aux_store import aux_add_columns, aux_schema_transaction
+
+    with aux_schema_transaction(conn, _PG_STORE):
+        conn.execute(_DELIVERIES_DDL)
+        conn.execute(_TOMBSTONES_DDL)
+        aux_add_columns(conn, "core_cron_deliveries", (("lease_expires_at", "REAL"),))
+
+
+@contextmanager
+def _pg_transaction() -> Iterator[Any]:
+    from hermes_aux_store import aux_xact_lock, open_aux_postgres
+
+    conn = open_aux_postgres(_PG_STORE, initialize=_pg_initialize)
+    try:
+        with conn:
+            aux_xact_lock(conn, "cron-deliveries", timeout_seconds=30.0)
+            yield conn
+    finally:
+        conn.close()
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -54,12 +127,12 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     excess = terminal_count - keep
     if excess > 0:
         conn.execute(
-            """INSERT OR IGNORE INTO delivery_tombstones
+            _insert_or_ignore(conn, """INSERT OR IGNORE INTO delivery_tombstones
                (execution_id, terminal_status, finished_at)
                SELECT execution_id, status, finished_at FROM deliveries
                WHERE status IN ('delivered','failed','unknown')
                ORDER BY finished_at, created_at, execution_id
-               LIMIT ?""",
+               LIMIT ?"""),
             (excess,),
         )
         conn.execute(
@@ -80,6 +153,10 @@ def _path() -> Path:
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
     with _lock:
+        if _on_postgres():
+            with _pg_transaction() as conn:
+                yield conn
+            return
         path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, timeout=5)
@@ -94,30 +171,8 @@ def _transaction() -> Iterator[sqlite3.Connection]:
             conn.execute("PRAGMA busy_timeout=5000")
             apply_wal_with_fallback(conn, db_label="cron/deliveries.db")
             conn.execute("PRAGMA synchronous=FULL")
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS deliveries (
-                     execution_id TEXT PRIMARY KEY,
-                     job_json TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     for_failure INTEGER NOT NULL DEFAULT 0,
-                     status TEXT NOT NULL CHECK(status IN
-                       ('pending','delivering','delivered','failed','unknown')),
-                     owner_process_id TEXT,
-                     owner_pid INTEGER,
-                     owner_started_at INTEGER,
-                     created_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     error TEXT
-                   )"""
-            )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS delivery_tombstones (
-                     execution_id TEXT PRIMARY KEY,
-                     terminal_status TEXT NOT NULL CHECK(terminal_status IN
-                       ('delivered','failed','unknown')),
-                     finished_at TEXT
-                   )"""
-            )
+            conn.execute(_DELIVERIES_DDL)
+            conn.execute(_TOMBSTONES_DDL)
             add_column_if_missing(
                 conn, "deliveries", "for_failure",
                 "for_failure INTEGER NOT NULL DEFAULT 0",
@@ -142,7 +197,9 @@ def enqueue(
     with _transaction() as conn:
         # Serialize the tombstone check and insert with retention in other
         # processes, which can move a terminal delivery into the tombstone table.
-        conn.execute("BEGIN IMMEDIATE")
+        # (PostgreSQL: the transaction already holds the store's advisory lock.)
+        if not _is_postgres(conn):
+            conn.execute("BEGIN IMMEDIATE")
         tombstone = conn.execute(
             "SELECT terminal_status, finished_at FROM delivery_tombstones "
             "WHERE execution_id=?",
@@ -155,9 +212,9 @@ def enqueue(
                 "finished_at": tombstone["finished_at"],
             }
         conn.execute(
-            """INSERT OR IGNORE INTO deliveries
+            _insert_or_ignore(conn, """INSERT OR IGNORE INTO deliveries
                (execution_id, job_json, content, for_failure, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
+               VALUES (?, ?, ?, ?, 'pending', ?)"""),
             (
                 str(execution_id),
                 json.dumps(job, ensure_ascii=False, sort_keys=True),
@@ -205,11 +262,16 @@ def claim_next() -> Optional[dict]:
         ).fetchone()
         if row is None:
             return None
+        lease, lease_params = "", ()
+        if _is_postgres(conn):
+            from hermes_aux_store import AUX_SERVER_EPOCH
+
+            lease, lease_params = f", lease_expires_at={AUX_SERVER_EPOCH} + ?", (DELIVERY_LEASE_SECONDS,)
         cur = conn.execute(
-            """UPDATE deliveries SET status='delivering', owner_process_id=?,
-               owner_pid=?, owner_started_at=?
+            f"""UPDATE deliveries SET status='delivering', owner_process_id=?,
+               owner_pid=?, owner_started_at=?{lease}
                WHERE execution_id=? AND status='pending'""",
-            (_PROCESS_ID, pid, started, row["execution_id"]),
+            (_PROCESS_ID, pid, started, *lease_params, row["execution_id"]),
         )
         if cur.rowcount != 1:
             return None
@@ -251,9 +313,13 @@ def recover_abandoned() -> int:
     """Fence dead delivery owners as unknown; never replay uncertain sends."""
     changed = 0
     with _transaction() as conn:
+        leased = _is_postgres(conn)
+        expired = "FALSE"
+        if leased:  # another pod's pid cannot be probed here: its lease decides
+            from hermes_aux_store import AUX_LEASE_EXPIRED as expired
         rows = conn.execute(
-            "SELECT execution_id, owner_process_id, owner_pid, owner_started_at "
-            "FROM deliveries WHERE status='delivering'"
+            "SELECT execution_id, owner_process_id, owner_pid, owner_started_at, "
+            f"{expired} AS lease_expired FROM deliveries WHERE status='delivering'"
         ).fetchall()
         for row in rows:
             same_process = row["owner_process_id"] == _PROCESS_ID
@@ -261,7 +327,8 @@ def recover_abandoned() -> int:
                 with _lock:
                     if row["execution_id"] in _ACTIVE_DELIVERIES:
                         continue
-            elif _owner_is_live(int(row["owner_pid"]), row["owner_started_at"]):
+            elif not row["lease_expired"] if leased else _owner_is_live(
+                    int(row["owner_pid"]), row["owner_started_at"]):
                 continue
             error = (
                 "Gateway finished delivery but could not persist its outcome; "

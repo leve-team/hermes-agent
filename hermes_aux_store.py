@@ -106,6 +106,11 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
         AuxTable("cron_suggestions", "core_cron_suggestions", ("id",)),
     ),
     "cron_jobs": (AuxTable("cron_jobs", "core_cron_jobs", ("id",)),),
+    # levos v3 (t_aa3728da): 0.21.2's cron delivery handoff (``cron/deliveries.db``).
+    "cron_deliveries": (
+        AuxTable("deliveries", "core_cron_deliveries", ("execution_id",)),
+        AuxTable("delivery_tombstones", "core_cron_delivery_tombstones", ("execution_id",)),
+    ),
     # levos 0065: the memory tool's MEMORY.md / USER.md (no SQLite form either;
     # one row per file name, drift snapshots as ``<name>.bak.<ts>`` rows).
     "memory": (AuxTable("memory_files", "core_memory_files", ("name",)),),
@@ -133,6 +138,10 @@ AUX_STORES: Mapping[str, Tuple[AuxTable, ...]] = {
     "tui_turn_markers": (
         AuxTable("tui_turn_markers", "core_tui_turn_markers", ("home", "session_key")),
     ),
+    # levos v3 (t_aa3728da): 0.21.2's ``POST /v1/runs`` reservations (``runs_idempotency.db``).
+    "run_idempotency": (
+        AuxTable("run_idempotency", "core_run_idempotency", ("scope", "idempotency_key")),
+    ),
     "submit_idempotency": (
         AuxTable("submit_accepts", "core_submit_accepts", ("session_key", "client_msg_id")),
         AuxTable(
@@ -151,6 +160,7 @@ _AUX_INDEXES: Mapping[str, Mapping[str, str]] = {
         "idx_cron_incidents_job": "idx_core_cron_incidents_job",
         "idx_cron_incidents_state": "idx_core_cron_incidents_state",
     },
+    "run_idempotency": {"run_idempotency_run_id": "idx_core_run_idempotency_run_id"},
     "submit_idempotency": {
         "idx_submit_accepts_msg": "idx_core_submit_accepts_msg",
         "idx_submit_accepts_updated": "idx_core_submit_accepts_updated",
