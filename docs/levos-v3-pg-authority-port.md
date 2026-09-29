@@ -296,10 +296,13 @@ base tree the same pod records 8 `sqlite3.connect` calls (`shared-state.db` ×4,
 `state.db` ×3, `:memory:` ×1) and leaves `state.db`, `shared-state.db`,
 `gateway_state.json`, `channel_directory.json` and a `gateway-locks/` file.
 
-Kanban is outside this card: the pod runs it on its own PostgreSQL backend
-(`HERMES_KANBAN_BACKEND=postgres`), which is what a v3 deployment must set;
-with the default SQLite kanban backend the gateway's dispatcher and the tui
-notification poller open `kanban.db`.
+Kanban: a v3 deployment sets `kanban.enabled: false` (operator decision, eren
+2026-09-29; §6.6), so nothing opens a kanban store. Should kanban be turned
+back on, the pod must also set `HERMES_KANBAN_BACKEND=postgres`: with the
+default SQLite kanban backend the gateway's dispatcher and the tui
+notification poller open `kanban.db`. The guard runs the pod both ways
+(kanban on its PostgreSQL backend; kanban off with `HERMES_KANBAN_BACKEND`
+unset, kept up past the kanban watchers' first ticks).
 
 ### 6.4 C: pg3's PostgreSQL tables vs the v2 lease contract
 
@@ -337,8 +340,8 @@ notification poller open `kanban.db`.
   `state.db` only when the file exists (never on an authority pod), so those
   features read nothing there; `hermes_cli/observability/shared_metrics.py`
   opens its SQLite only behind the telemetry opt-in.
-- Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3) and the
-  hosted-room PostgreSQL port (G) are separate work.
+- Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3; turned
+  off for v3 by 6.6) and the hosted-room PostgreSQL port (G) are separate work.
 
 ### 6.6 kanban master switch
 
@@ -384,3 +387,44 @@ Only env or path handling, no store access: `gateway/platforms/base.py`
 `agent/system_prompt.py` / `model_tools.py` (`HERMES_KANBAN_*` env and the
 toolset name), `hermes_cli/doctor_platform.py` (reads file headers under
 `hermes doctor`), `cron/scheduler.py` (env scrubbing), plugin hook names.
+
+**Switch.** `kanban.enabled` (default `true`, `hermes_cli/config_defaults.py`)
+with the env override `HERMES_KANBAN_ENABLED` (`0/false/no/off` turns it off
+like `HERMES_KANBAN_DISPATCH_IN_GATEWAY`; `1/true/yes/on` turns it back on
+over config; anything else defers to config). One decision function,
+`hermes_cli/kanban_switch.py` `kanban_enabled()` / `kanban_disabled_reason()`,
+reads only env and config (no `kanban_db` import). On, every path is the base
+code.
+
+| # | Off: what happens | Where |
+|---|---|---|
+| 1-5 | the gateway spawns neither kanban watcher and logs one line `kanban: disabled via config kanban.enabled=false; no dispatcher or notifier in this gateway` (or `via HERMES_KANBAN_ENABLED env`); the watcher, dispatcher boot and notifier tick also return before any store call when called anyway, and a notifier started while on stops reaching boards on its next tick after the switch goes off | `gateway/run_startup.py` `_start_spawn_background_watchers`; `gateway/kanban_watchers.py` `_kanban_notifier_watcher`, `_kanban_dispatcher_boot`; `gateway/kanban_watchers_notifier.py` `_notifier_collect` |
+| 6-7 | `/kanban` answers `gateway.kanban.disabled` ("Kanban is turned off in this runtime …", all locales) | `gateway/slash_commands.py` `_handle_kanban_command` |
+| 8 | the tui session poller skips its kanban poll; the bot-live, `/loop` and `/heartbeat` polls and the completion queue run as before | `tui_gateway/session_notifications.py` `_collect_kanban_notifications` |
+| 9 | `/kanban` in the tui and the classic CLI prints the same notice | `hermes_cli/cli_commands_mixin.py` `_handle_kanban_command` |
+| 10 | no board is pinned | `hermes_cli/main_tui_launch.py` `_pin_kanban_board_env` |
+| 11 | every `kanban_*` tool's check_fn is False (orchestrator toolset and dispatcher workers alike), so no handler is reachable | `tools/kanban_tools.py` `_visible` |
+| 12 | the worker heartbeat and comment bridges return False | `tools/kanban_tools.py` |
+| 13 | not gated: only a process the dispatcher spawned (`HERMES_KANBAN_TASK`) reaches these, and an off runtime spawns none | — |
+| 14 | not gated (remaining): the dashboard kanban plugin is part of `hermes dashboard`, not of the gateway / tui runtime, and opens the store only per operator request; disable it there with `plugins.disabled: [kanban]` | — |
+
+The existing `kanban.dispatch_in_gateway` / `HERMES_KANBAN_DISPATCH_IN_GATEWAY`
+keep their meaning while kanban is on. The switch never touches an existing
+`kanban.db` (not moved, not deleted, not opened) and adds no fallback.
+Re-enabling at runtime reaches the tools, `/kanban` and the tui poller at
+once; the gateway watchers need a restart (they are decided at startup).
+
+**Tests.** `tests/gateway/test_kanban_master_switch.py` (21): with a
+pre-existing `kanban.db` (subscriptions + a pending event) in
+`HERMES_HOME` = `HERMES_KANBAN_HOME` and the switch off, the gateway watcher
+spawn, a notifier watcher run and tick, a dispatcher run and one tui poller
+iteration make zero `sqlite3.connect` and zero `kanban_db_path` / `connect` /
+`count_notify_subs` / `list_boards` / `kanban_home` calls and leave the file
+(mtime, size, no `-wal` / `-shm`) unchanged; the tools are hidden, `/kanban`
+(gateway, CLI / tui) only says so, the worker bridges no-op, no board is
+pinned; env overrides config both ways. Each off-test has an on-twin that
+shows the same entry point reaching the store. Reverting any one gated file to
+the base tree fails its test. `tests/test_v3_no_file_state_authority.py`: the
+pod guard's `off` variant (above, 6.3); on the base tree it records `kanban.db`
+connects from the dispatcher (`kanban_db_connect._open_configured`) and the
+tui poller (`count_notify_subs`, `?mode=ro`) and leaves `home/kanban`.
