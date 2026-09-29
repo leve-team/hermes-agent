@@ -1721,6 +1721,12 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Master switch for the built-in kanban (env HERMES_KANBAN_ENABLED=0/false/no/off
+        # overrides, 1/true/yes/on re-enables). False: the gateway starts no dispatcher or
+        # notifier, the tui poller skips kanban, the kanban_* tools are hidden and /kanban only
+        # says it is off — nothing opens kanban.db or the PostgreSQL kanban backend. The gateway
+        # decides its watchers at startup, so re-enabling there needs a restart.
+        "enabled": True,
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
