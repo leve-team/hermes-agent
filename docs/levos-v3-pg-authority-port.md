@@ -339,3 +339,48 @@ notification poller open `kanban.db`.
   opens its SQLite only behind the telemetry opt-in.
 - Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3) and the
   hosted-room PostgreSQL port (G) are separate work.
+
+### 6.6 kanban master switch
+
+Card `t_fb9c7b9e`. Operator decision (eren, 2026-09-29): v3 turns the built-in
+kanban off (it is to be replaced later). Base: `levos/pg3` `ea213f19b`. The
+existing `kanban.dispatch_in_gateway: false` /
+`HERMES_KANBAN_DISPATCH_IN_GATEWAY=0` stops only the dispatcher
+(`gateway/kanban_watchers.py:197-209`); on a PVC that already holds
+`kanban.db` the notifier and every tui session still open it read-only every
+5 s. Live v3 (09-29): `HERMES_KANBAN_BACKEND` unset, zero kanban rows, the
+gateway logs `kanban dispatcher: embedded in gateway (interval=60.0s)` and the
+PVC has `kanban.db`.
+
+**Runtime entry points into the kanban store** (line numbers: base tree). The
+store is reached only through `kanban_db_connect.connect`
+(`hermes_cli/kanban_db_connect.py:677`, backend by
+`kanban_persistence.resolve_backend` `:209`: argument >
+`HERMES_KANBAN_BACKEND` > routed-board resolver > `sqlite`), `kanban_db.list_boards`
+(`hermes_cli/kanban_db.py:642`), `kanban_db_path` (`:522`), `kanban_home`
+(`:390`) and `kanban_db_notify.count_notify_subs`
+(`hermes_cli/kanban_db_notify.py:193`, a `sqlite3.connect(...?mode=ro)` at
+`:245` whenever the file exists).
+
+| # | File:line (base) | Entry point | Reaches | Cadence |
+|---|---|---|---|---|
+| 1 | `gateway/run_startup.py:1291` `_PRE_RECONNECT_WATCHERS`, `:1299` `_start_spawn_background_watchers` | spawns `_kanban_notifier_watcher` and `_kanban_dispatcher_watcher` | #2-#5 | gateway start |
+| 2 | `gateway/kanban_watchers.py:60` `_kanban_notifier_watcher` → `gateway/kanban_watchers_notifier.py:272` `_notifier_collect` → `:171` `collect` | notifier tick | `list_boards` (`gateway/kanban_watchers_common.py:39`), `kanban_db_path`, `count_notify_subs` (`:197`), `connect` (`:246`) when a board has subscriptions | every 5 s |
+| 3 | `gateway/kanban_watchers.py:111` `_kanban_sub_op` (`_kanban_advance` / `_kanban_unsub` / `_kanban_rewind`) | notifier delivery | `connect` | per delivered event (only from #2) |
+| 4 | `gateway/kanban_watchers.py:185` `_kanban_dispatcher_boot` | dispatcher boot | `kanban_home()/kanban/.dispatcher.lock` | gateway start |
+| 5 | `gateway/kanban_watchers.py:233` `_kanban_dispatcher_watcher` → `gateway/kanban_watchers_dispatcher.py:189`, `:228` | dispatcher tick | `reap_worker_zombies`, `list_boards`, `connect`, `dispatch_once`, auto-decompose | every `dispatch_interval_seconds` (60) |
+| 6 | `gateway/slash_commands.py:337` `_handle_kanban_command` (plain command, `gateway/run_busy.py:760`) | `/kanban` on a messaging platform | `hermes_cli.kanban.run_slash` | per command |
+| 7 | `gateway/slash_commands.py:378` `_kanban_auto_subscribe` | `/kanban create` | `connect` (`:398`), `add_notify_sub` | per command (only from #6) |
+| 8 | `tui_gateway/server.py:1028` → `tui_gateway/session_notifications.py:546` `_notification_poller_loop` (`:579`) → `:364` `_notif_poll_kanban` → `:336` `_collect_kanban_notifications` → `:299` `_kb_poll_board` | tui session notification poller | `list_boards` (`:351`), `kanban_db_path`, `count_notify_subs` (`:306`), `connect` when subscribed | every 5 s (`:121`) per live session |
+| 9 | `hermes_cli/cli_commands_mixin.py:1816` `_handle_kanban_command` (tui `slash.exec` → slash worker → HermesCLI) | `/kanban` in the tui / classic CLI | `run_slash` | per command |
+| 10 | `hermes_cli/main_tui_launch.py:824` `_pin_kanban_board_env` | `hermes chat` / tui launch | `get_current_board` (board file / PostgreSQL board list) | per launch |
+| 11 | `tools/kanban_tools.py:64` `_visible` (check_fn of the 14 tools registered at `:991`, toolset `kanban`); handlers through `:200` `_board`; `:912` `_maybe_auto_subscribe` | kanban tools | `connect` per call | per tool call, when exposed |
+| 12 | `tools/kanban_tools.py:418` `heartbeat_current_worker_from_env`, `:453` `inject_new_comments_from_env` (from `agent/activity_tracking.py:76-80`) | agent activity | `connect` | ≤ 60 s / 6 s, only with `HERMES_KANBAN_TASK` |
+| 13 | `agent/turn_finalizer.py:42` `_record_kanban_budget_exhausted`; `cli.py:4013` `_run_kanban_goal_loop_q`, `:4168` `_collect_kanban_task_images` | dispatcher-spawned worker process | `connect` | only with `HERMES_KANBAN_TASK` (a worker the dispatcher spawned) |
+| 14 | `plugins/kanban/dashboard/plugin_api.py:84` `_conn`, `:1694` `stream_events` (0.3 s tail, `:1629`) | dashboard kanban plugin (`hermes dashboard`) | `init_db`, `connect` | per HTTP request / open socket |
+
+Only env or path handling, no store access: `gateway/platforms/base.py`
+`_kanban_root` (attachment allow-list), `agent/prompt_builder.py` /
+`agent/system_prompt.py` / `model_tools.py` (`HERMES_KANBAN_*` env and the
+toolset name), `hermes_cli/doctor_platform.py` (reads file headers under
+`hermes doctor`), `cron/scheduler.py` (env scrubbing), plugin hook names.
