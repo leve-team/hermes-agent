@@ -182,8 +182,8 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     try:
         from hermes_state_postgres import probe_authority_store
     except ImportError:
-        probe_authority_store = None  # base install without the PostgreSQL module
-    if probe_authority_store is not None:
+        pass  # base install without the PostgreSQL module
+    else:
         try:
             verdict = probe_authority_store(_home_path(home))
         except Exception as exc:

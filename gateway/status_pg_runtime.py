@@ -59,6 +59,8 @@ def _run(sql: str, params: tuple) -> Any:
         dsn = resolve_postgres_dsn()
     except Exception as exc:
         raise AuxStoreUnavailable("gateway runtime status: the authority store could not be resolved") from exc
+    if not dsn:
+        raise AuxStoreUnavailable("gateway runtime status: the authority store has no DSN")
     with _lock:
         try:
             conn = _connections.get(dsn)

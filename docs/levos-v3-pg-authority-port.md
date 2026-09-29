@@ -339,5 +339,3 @@ notification poller open `kanban.db`.
   opens its SQLite only behind the telemetry opt-in.
 - Kanban (`HERMES_KANBAN_BACKEND` selects its own backend; see 6.3) and the
   hosted-room PostgreSQL port (G) are separate work.
-- The feature branch could not be pushed from the worker (no GitHub
-  credentials in the environment); commits are local to the worker branch.
