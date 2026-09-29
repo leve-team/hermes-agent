@@ -273,6 +273,39 @@ class SessionGatewayMixin:
                     [(scope, k, v, now) for k, v in entries.items() if k and v])
         self._execute_write(_do)
 
+    def apply_gateway_routing_changes(
+        self, upserts: Dict[str, str], deletes: Dict[str, str], *, scope: str = "",
+    ) -> None:
+        """Row-level routing write (levos 0064): upsert *upserts*, delete *deletes*. Unlike
+        :meth:`replace_gateway_routing_entries`, rows not named here are left alone, so two
+        gateways sharing one store (overlapping pods on PostgreSQL authority) cannot erase each
+        other's keys. *deletes* maps ``session_key -> entry_json`` the caller last saw; a row is
+        removed only while it still holds that value, so another writer's newer mapping for the
+        same key survives. One write transaction."""
+        now = time.time()
+
+        def _do(conn):
+            for session_key, entry_json in deletes.items():
+                conn.execute(
+                    "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                    (scope, session_key, entry_json))
+            for session_key, entry_json in upserts.items():
+                if session_key and entry_json:
+                    conn.execute(
+                        """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT(scope, session_key) DO UPDATE SET
+                               entry_json = excluded.entry_json,
+                               updated_at = excluded.updated_at""",
+                        (scope, session_key, entry_json, now))
+        self._execute_write(_do)
+
+    def load_gateway_routing_entry(self, session_key: str, *, scope: str = "") -> Optional[str]:
+        """One routing entry's JSON for *scope*, or None when absent."""
+        row = self._read_one(
+            "SELECT entry_json FROM gateway_routing WHERE scope = ? AND session_key = ?", (scope, session_key))
+        return row["entry_json"] if row else None
+
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
         """Load routing entries for *scope* as {session_key: entry_json}."""
         rows = self._read_all("SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,))

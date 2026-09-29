@@ -483,6 +483,7 @@ KV_RICH_SENT = "rich_sent"
 KV_DISCORD_NONCONVERSATIONAL = "discord_nonconversational"
 KV_ESTOP = "estop"
 KV_WEBHOOK_SUBSCRIPTIONS = "webhook_subscriptions"
+KV_CHANNEL_DIRECTORY = "channel_directory"  # levos 0064: one row per platform
 
 
 def kv_threads_namespace(platform: str) -> str:

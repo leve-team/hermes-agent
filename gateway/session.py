@@ -851,6 +851,7 @@ class SessionStore(
         concurrent ``force_new``) share the owner's result so only one transition and SQLite row is
         created. ``touch_activity=False`` (internal events) preserves the user-activity clock."""
         session_key = self._generate_session_key(source)
+        self._refresh_routing_key(session_key)
         inflight_lock = self._lazy("_inflight_lock", threading.Lock)
         self._lazy("_inflight_sessions", dict)
 
@@ -1076,6 +1077,7 @@ class SessionStore(
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
+        self._refresh_routing_key(session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1116,6 +1118,7 @@ class SessionStore(
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI."""
+        self._refresh_routing_key(session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1165,6 +1168,7 @@ class SessionStore(
         """Return the persisted routing entry for an exact session key."""
         if not session_key:
             return None
+        self._refresh_routing_key(session_key)
         with self._lock:
             return self._entry_locked(session_key)
 
@@ -1172,6 +1176,7 @@ class SessionStore(
         """Lock-held accessor for the key -> session_id mapping (None if unknown)."""
         if not session_key:
             return None
+        self._refresh_routing_key(session_key)
         with self._lock:
             entry = self._entry_locked(session_key)
             return entry.session_id if entry else None

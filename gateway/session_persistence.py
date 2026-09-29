@@ -249,6 +249,112 @@ class SessionPersistenceMixin:
         method = getattr(self._routing_db or None, name, None)
         return method if callable(method) else None
 
+    # ── PostgreSQL authority: row-level routing index (levos 0064) ─────────────────────────────
+    # Two gateways of one profile (overlapping pods) share gateway_routing and nothing else. A
+    # whole-index save (DELETE the scope, INSERT this process's view) erases the keys the other pod
+    # created, and a pod that loads the table once never sees them. On authority saves write only
+    # the rows this process changed, keyed entry points re-read their row, and sessions.json is
+    # neither imported nor mirrored. Every other backend keeps the whole-index rewrite.
+
+    def _routing_on_pg_authority(self) -> bool:
+        cached = getattr(self, "_routing_authority", None)
+        if cached is None:
+            from hermes_aux_store import aux_store_authority
+
+            cached = self._routing_authority = aux_store_authority()
+        return cached
+
+    def _routing_db_for_authority(self):
+        db = self._routing_db
+        if not db:
+            from hermes_aux_store import AuxStoreUnavailable
+
+            raise AuxStoreUnavailable(
+                "gateway routing: PostgreSQL authority is selected but the session store is "
+                "unavailable; refusing the sessions.json fallback")
+        return db
+
+    def _routing_row_view(self) -> Dict[str, tuple[str, str]]:
+        """session_key -> (normalized entry JSON, row text) as this process last read or wrote the
+        row; row-level saves diff against it (guarded by ``_save_lock``)."""
+        return self._lazy("_routing_rows", dict)
+
+    @staticmethod
+    def _parse_routing_row(entry_json: str):
+        """Entry and its row-view state; the normalized form is what a save of the unchanged entry
+        would write, so it diffs as unchanged."""
+        from gateway.session import SessionEntry
+
+        data = json.loads(entry_json)
+        if not isinstance(data, dict):
+            raise TypeError(f"expected dict, got {type(data).__name__}")
+        entry = SessionEntry.from_dict(data)
+        return entry, (json.dumps(entry.to_dict()), entry_json)
+
+    def _load_authority_routing_rows_locked(self) -> None:
+        rows = self._routing_db_for_authority().load_gateway_routing_entries(scope=self._routing_scope())
+        view = self._routing_row_view()
+        for key, entry_json in rows.items():
+            try:
+                entry, state = self._parse_routing_row(entry_json)
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("Skipping invalid routing entry %r: %s", key, e)
+                continue
+            self._entries[key] = entry
+            view[key] = state
+
+    def _write_routing_rows(self, data: Dict[str, Any]) -> None:
+        """Persist *data* row by row (``_save_lock`` held): upsert only keys whose serialization
+        differs from the row this process last saw, delete only keys this process dropped — while
+        the row still holds what it saw, so another gateway's newer row survives. Keys this process
+        never saw are untouched."""
+        view = self._routing_row_view()
+        rows = {key: json.dumps(value) for key, value in data.items() if key}
+        upserts = {key: entry_json for key, entry_json in rows.items()
+                   if key not in view or view[key][0] != entry_json}
+        deletes = {key: state[1] for key, state in view.items() if key not in rows}
+        if upserts or deletes:
+            self._routing_db_for_authority().apply_gateway_routing_changes(
+                upserts, deletes, scope=self._routing_scope())
+        for key in deletes:
+            del view[key]
+        for key, entry_json in upserts.items():
+            view[key] = (entry_json, entry_json)
+
+    def _refresh_routing_key(self, session_key: str) -> None:
+        """Re-read one routing row so another gateway's change is seen (authority only). A new or
+        changed row replaces the local entry; a row that disappeared since this process last saw it
+        drops the entry. A local write landing between the read and the apply is newer than the
+        read, so the read is discarded."""
+        if not session_key or not self._routing_on_pg_authority():
+            return
+        self._ensure_loaded()
+        save_lock = self._lazy("_save_lock", threading.Lock)
+        view = self._routing_row_view()
+        with save_lock:
+            seen = view.get(session_key)
+        entry_json = self._routing_db_for_authority().load_gateway_routing_entry(
+            session_key, scope=self._routing_scope())
+        with self._lock, save_lock:
+            if view.get(session_key) != seen:
+                return
+            if entry_json is None:
+                # Only a row this process had seen counts as deleted; an entry published but not
+                # yet saved by another thread stays.
+                if seen is not None:
+                    del view[session_key]
+                    self._entries.pop(session_key, None)
+                return
+            if seen is not None and seen[1] == entry_json:
+                return
+            try:
+                entry, state = self._parse_routing_row(entry_json)
+            except (ValueError, KeyError, TypeError) as e:
+                logger.warning("Skipping invalid routing entry %r: %s", session_key, e)
+                return
+            self._entries[session_key] = entry
+            view[session_key] = state
+
     def _load_routing_rows_locked(self) -> bool:
         """Load state.db routing entries into ``_entries``; False when there is no loader or the
         load failed (warned). Lock held."""
@@ -287,6 +393,16 @@ class SessionPersistenceMixin:
         """
         if self._loaded:
             self._reconcile_recovered_routing_locked()
+            return
+        if self._routing_on_pg_authority():
+            # The table is the only copy: a load failure raises instead of starting empty, and
+            # sessions.json is not imported — a file left on this pod's disk must not revive keys the
+            # shared table dropped.
+            self._load_authority_routing_rows_locked()
+            self._loaded = True
+            self._routing_db_loaded = True
+            self._routing_fallback_baseline = None
+            self._prune_stale_sessions_locked()
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         db_load_succeeded = self._load_routing_rows_locked()
@@ -460,31 +576,41 @@ class SessionPersistenceMixin:
                 for key, (revision, entry_json) in fast_persisted.items():
                     if revision > generation:
                         data[key] = json.loads(entry_json)
-            db_saved = False
-            replacer = self._routing_db_method("replace_gateway_routing_entries")
-            if replacer is not None:
-                try:
-                    replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
-                    db_saved = True
-                except Exception as exc:
-                    logger.warning("gateway.session: state.db routing save failed: %s", exc)
-            if getattr(self, "_write_sessions_json", True) or not db_saved:
-                try:
-                    self._save_sessions_json(data)
-                except Exception as exc:
-                    if not db_saved:
-                        raise
-                    # state.db is authoritative: a failed legacy mirror must not report the
-                    # already-committed primary write as failed.
-                    logger.warning(
-                        "gateway.session: sessions.json mirror save failed after state.db commit: "
-                        "%s", exc)
+            if self._routing_on_pg_authority():
+                # Shared with an overlapping gateway: never a scope-wide rewrite, never a file. A
+                # failed write raises.
+                self._write_routing_rows(data)
+            else:
+                self._write_routing_index(data)
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its generation; newer ones stay for
             # the next delayed full writer.
             if fast_persisted:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
+
+    def _write_routing_index(self, data: Dict[str, Any]) -> None:
+        """Whole-index rewrite of the scope in state.db plus the sessions.json mirror (``_save_lock``
+        held; every backend but PostgreSQL authority)."""
+        db_saved = False
+        replacer = self._routing_db_method("replace_gateway_routing_entries")
+        if replacer is not None:
+            try:
+                replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
+                db_saved = True
+            except Exception as exc:
+                logger.warning("gateway.session: state.db routing save failed: %s", exc)
+        if getattr(self, "_write_sessions_json", True) or not db_saved:
+            try:
+                self._save_sessions_json(data)
+            except Exception as exc:
+                if not db_saved:
+                    raise
+                # state.db is authoritative: a failed legacy mirror must not report the
+                # already-committed primary write as failed.
+                logger.warning(
+                    "gateway.session: sessions.json mirror save failed after state.db commit: "
+                    "%s", exc)
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
@@ -542,6 +668,8 @@ class SessionPersistenceMixin:
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
+                    if self._routing_on_pg_authority():
+                        self._routing_row_view()[session_key] = (entry_json, entry_json)
                 return
             except Exception as exc:
                 logger.warning(

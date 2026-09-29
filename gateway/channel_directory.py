@@ -2,6 +2,11 @@
 
 Built on gateway startup, refreshed every 5 min, saved to ~/.hermes/channel_directory.json.
 send_message reads it for action="list" and to resolve friendly channel names to IDs.
+
+On a PostgreSQL-authority profile (levos 0064) the directory is a set of ``core_aux_kv`` rows, one
+per platform, instead of the file: overlapping pods share it, and a pod writes only the platforms
+it built (the pod that does not hold a bot token has no adapter for it and must not blank the
+holder's list). A PostgreSQL failure is logged like an unwritable or unreadable file.
 """
 
 import asyncio
@@ -164,10 +169,55 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     _apply_channel_aliases(platforms)
     directory = {"updated_at": datetime.now().isoformat(), "platforms": platforms}
     try:
-        await asyncio.to_thread(atomic_json_write, _directory_path(), directory)
+        await asyncio.to_thread(_store_directory, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
     return directory
+
+
+def _directory_on_postgres() -> bool:
+    from hermes_aux_store import aux_store_authority
+
+    return DIRECTORY_PATH is None and aux_store_authority()
+
+
+def _store_directory(directory: Dict[str, Any]) -> None:
+    if not _directory_on_postgres():
+        atomic_json_write(_directory_path(), directory)
+        return
+    from hermes_aux_store import KV_CHANNEL_DIRECTORY, aux_kv_put, aux_kv_transaction
+
+    with aux_kv_transaction(KV_CHANNEL_DIRECTORY) as conn:
+        for platform_name, channels in directory["platforms"].items():
+            aux_kv_put(KV_CHANNEL_DIRECTORY, platform_name, json.dumps(
+                {"updated_at": directory["updated_at"], "channels": channels}), conn=conn)
+
+
+def _read_directory() -> Optional[Dict[str, Any]]:
+    """The stored directory, or None when there is none (or it cannot be read)."""
+    if not _directory_on_postgres():
+        directory_path = _directory_path()
+        if not directory_path.exists():
+            return None
+        with contextlib.suppress(Exception):
+            return _read_json(directory_path)
+        return None
+    from hermes_aux_store import KV_CHANNEL_DIRECTORY, aux_kv_items
+
+    try:
+        rows = aux_kv_items(KV_CHANNEL_DIRECTORY)
+    except Exception as e:
+        logger.warning("Channel directory: failed to read: %s", e)
+        return None
+    if not rows:
+        return None
+    platforms, updated = {}, []
+    for platform_name, value in rows:
+        with contextlib.suppress(ValueError, TypeError, AttributeError):
+            row = json.loads(value)
+            platforms[platform_name] = row["channels"]
+            updated.append(row.get("updated_at") or "")
+    return {"updated_at": max(updated, default=None), "platforms": platforms}
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
@@ -380,11 +430,10 @@ def _build_from_sessions_json(platform_name: str) -> List[Dict[str, str]]:
 # --- Read / resolve --------------------------------------------------------
 
 def load_directory() -> Dict[str, Any]:
-    """Load the cached directory from disk, with aliases re-applied on read."""
-    directory_path = _directory_path()
-    if directory_path.exists():
+    """Load the cached directory (disk, or PostgreSQL on authority), with aliases re-applied on read."""
+    data = _read_directory()
+    if isinstance(data, dict):
         with contextlib.suppress(Exception):
-            data = _read_json(directory_path)
             # Aliases apply on read too, so new names take effect between timed rebuilds.
             _apply_channel_aliases(data.setdefault("platforms", {}))
             return data

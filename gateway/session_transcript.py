@@ -91,6 +91,7 @@ class SessionTranscriptMixin:
         must fail closed."""
         if not session_key or not expected_session_id or not target_session_id:
             return None
+        self._refresh_routing_key(session_key)
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None:
