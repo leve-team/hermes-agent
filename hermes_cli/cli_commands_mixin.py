@@ -1814,7 +1814,13 @@ class CLICommandsMixin:
             print(f"(._.) curator: {exc}")
 
     def _handle_kanban_command(self, cmd: str):
-        """Handle /kanban — strip the leading ``/kanban`` and hand the rest to ``kanban.run_slash``."""
+        """Handle /kanban — strip the leading ``/kanban`` and hand the rest to ``kanban.run_slash``
+        (only a notice when the kanban master switch is off)."""
+        from hermes_cli.kanban_switch import kanban_enabled
+        if not kanban_enabled():
+            from agent.i18n import t
+            print(t("gateway.kanban.disabled"))
+            return
         from hermes_cli.kanban import run_slash
         rest = cmd.strip().lstrip("/")
         if rest.startswith("kanban"):

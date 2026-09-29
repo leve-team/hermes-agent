@@ -336,7 +336,11 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI (DB work in a thread pool). Allowed
-        while an agent runs: the board is profile-agnostic and never touches agent state."""
+        while an agent runs: the board is profile-agnostic and never touches agent state. With the
+        kanban master switch off it only says so and opens no board."""
+        from hermes_cli.kanban_switch import kanban_enabled
+        if not kanban_enabled():
+            return t("gateway.kanban.disabled")
         from hermes_cli.kanban import run_slash
 
         # Strip the leading "/kanban" (with or without slash), leaving args.

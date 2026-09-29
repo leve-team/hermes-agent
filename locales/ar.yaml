@@ -194,6 +194,7 @@ gateway:
     subscribed_suffix:     "(مُشترك — ستُخطَر عند اكتمال {task_id} أو حجبها)"
     truncated_suffix:      "… (مقتطع؛ استخدم `hermes kanban …` في الطرفية للخرج الكامل)"
     no_output:             "(لا يوجد خرج)"
+    disabled:              "كانبان معطّل في بيئة التشغيل هذه (kanban.enabled: false / HERMES_KANBAN_ENABLED)."
     wake:
       completed:           "اكتملت"
       gave_up:             "استسلم (نفدت المحاولات)"

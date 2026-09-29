@@ -19,6 +19,7 @@ from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+from hermes_cli.kanban_switch import kanban_enabled
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
@@ -62,9 +63,10 @@ def _is_dispatcher_owned_worker() -> bool:
 
 
 def _visible(*, to_env_worker: bool) -> bool:
-    """check_fn core: never for delegate children; dispatcher-spawned env workers
-    (HERMES_KANBAN_TASK) per flag; else the profile toolset decides."""
-    if _is_delegated_child_context():
+    """check_fn core: never when the kanban master switch is off or for delegate
+    children; dispatcher-spawned env workers (HERMES_KANBAN_TASK) per flag; else the
+    profile toolset decides."""
+    if not kanban_enabled() or _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return to_env_worker
@@ -424,6 +426,8 @@ def heartbeat_current_worker_from_env() -> bool:
     now = time.monotonic()
     if not tid or (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
         return False
+    if not kanban_enabled():
+        return False
     _auto_heartbeat_last_attempt = now
     try:
         from hermes_cli import kanban_db_dispatch as kbd
@@ -457,7 +461,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     tid = os.environ.get("HERMES_KANBAN_TASK")
     now = time.monotonic()
     if (not tid or agent is None or not hasattr(agent, "steer")
-            or (now - _comment_poll_last_attempt) < _COMMENT_POLL_MIN_INTERVAL_SECONDS):
+            or (now - _comment_poll_last_attempt) < _COMMENT_POLL_MIN_INTERVAL_SECONDS
+            or not kanban_enabled()):
         return False
     _comment_poll_last_attempt = now
     seen = _comment_watermark.get(tid)

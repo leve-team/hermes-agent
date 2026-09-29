@@ -171,6 +171,7 @@ gateway:
     subscribed_suffix:     "(구독 중 — {task_id}이(가) 완료되거나 차단되면 알림을 받습니다)"
     truncated_suffix:      "… (잘림; 전체 출력을 보려면 터미널에서 `hermes kanban …`을 사용하세요)"
     no_output:             "(출력 없음)"
+    disabled:              "이 런타임에서는 칸반이 꺼져 있습니다 (kanban.enabled: false / HERMES_KANBAN_ENABLED)."
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

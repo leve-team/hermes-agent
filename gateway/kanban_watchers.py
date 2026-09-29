@@ -30,6 +30,7 @@ from gateway.kanban_watchers_dispatcher import (
     _log_spawn_results,
     _resolve_dispatcher_settings,
 )
+from hermes_cli.kanban_switch import kanban_disabled_reason, kanban_enabled
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -66,8 +67,11 @@ class GatewayKanbanWatchersMixin:
         ``archived``: ``done`` is reversible, so the cursor — not unsubscribing
         — is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
-        one tick's failure never stops the next.
+        one tick's failure never stops the next. Returns at once when the kanban master switch
+        is off (startup does not spawn it then).
         """
+        if not kanban_enabled():
+            return
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -193,6 +197,10 @@ class GatewayKanbanWatchersMixin:
             from hermes_cli.config import load_config as _load_config
         except Exception:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
+            return None
+        kanban_off = kanban_disabled_reason()
+        if kanban_off:
+            logger.info("kanban dispatcher: disabled via %s", kanban_off)
             return None
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:

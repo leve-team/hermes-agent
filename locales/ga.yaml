@@ -175,6 +175,7 @@ gateway:
     subscribed_suffix:     "(síntiúsaithe — cuirfear in iúl duit nuair a chríochnóidh nó a stopfaidh {task_id})"
     truncated_suffix:      "… (giorraithe; úsáid `hermes kanban …` i do theirminéal le haghaidh aschur iomláin)"
     no_output:             "(gan aschur)"
+    disabled:              "Tá Kanban múchta sa timpeallacht rite seo (kanban.enabled: false / HERMES_KANBAN_ENABLED)."
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

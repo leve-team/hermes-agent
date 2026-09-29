@@ -1298,7 +1298,14 @@ class GatewayStartupMixin:
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        from hermes_cli.kanban_switch import kanban_disabled_reason
+        kanban_off = kanban_disabled_reason()
+        if kanban_off:
+            # Master switch: neither kanban watcher runs, so nothing opens the kanban store.
+            logger.info("kanban: disabled via %s; no dispatcher or notifier in this gateway", kanban_off)
         for method in self._PRE_RECONNECT_WATCHERS:
+            if kanban_off and method.startswith("_kanban_"):
+                continue
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:
             logger.info(

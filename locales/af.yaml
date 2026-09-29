@@ -171,6 +171,7 @@ gateway:
     subscribed_suffix:     "(ingeteken — jy sal in kennis gestel word wanneer {task_id} voltooi of vasval)"
     truncated_suffix:      "… (afgekap; gebruik `hermes kanban …` in jou terminale vir volle uitvoer)"
     no_output:             "(geen uitvoer)"
+    disabled:              "Kanban is in hierdie looptyd afgeskakel (kanban.enabled: false / HERMES_KANBAN_ENABLED)."
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

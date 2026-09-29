@@ -338,10 +338,13 @@ def _collect_kanban_notifications(session: dict) -> list:
     auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
     delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
 
-    See #59890.
+    See #59890. Nothing (no board opened) when the kanban master switch is off.
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
+        return []
+    from hermes_cli.kanban_switch import kanban_enabled
+    if not kanban_enabled():
         return []
     try:
         from hermes_cli import kanban_db as _kb

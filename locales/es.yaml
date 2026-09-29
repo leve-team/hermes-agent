@@ -171,6 +171,7 @@ gateway:
     subscribed_suffix:     "(suscrito — recibirás una notificación cuando {task_id} termine o se bloquee)"
     truncated_suffix:      "… (truncado; usa `hermes kanban …` en tu terminal para la salida completa)"
     no_output:             "(sin salida)"
+    disabled:              "Kanban está desactivado en este entorno de ejecución (kanban.enabled: false / HERMES_KANBAN_ENABLED)."
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"

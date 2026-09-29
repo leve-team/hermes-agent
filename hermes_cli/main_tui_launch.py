@@ -834,6 +834,9 @@ def _pin_kanban_board_env() -> None:
     if os.environ.get("HERMES_KANBAN_BOARD"):
         return
     with contextlib.suppress(Exception):
+        from hermes_cli.kanban_switch import kanban_enabled
+        if not kanban_enabled():  # master switch off: no board to pin, nothing to open
+            return
         from hermes_cli.kanban_db import get_current_board
         os.environ["HERMES_KANBAN_BOARD"] = get_current_board()
 

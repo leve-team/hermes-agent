@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from agent.i18n import t
 
 from gateway.kanban_watchers_common import _list_boards, _to_thread_process_service, logger
+from hermes_cli.kanban_switch import kanban_enabled
 
 
 def _kbc():
@@ -274,8 +275,11 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
 
     Each gateway polls only subscriptions owned by profiles whose adapters it
     hosts; legacy rows without a profile stamp are visible only to the process
-    holding the singleton dispatcher lock.
+    holding the singleton dispatcher lock. Nothing when the kanban master switch is off
+    (turned off after startup: the next tick opens no board).
     """
+    if not kanban_enabled():
+        return []
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
     ).collect()

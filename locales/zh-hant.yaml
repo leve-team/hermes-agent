@@ -171,6 +171,7 @@ gateway:
     subscribed_suffix:     "（已訂閱 — 當 {task_id} 完成或被封鎖時將通知您）"
     truncated_suffix:      "…（已截斷；如需完整輸出請在終端機執行 `hermes kanban …`）"
     no_output:             "（無輸出）"
+    disabled:              "此執行環境已關閉看板 (kanban.enabled: false / HERMES_KANBAN_ENABLED)。"
     wake:
       completed:           "completed"
       gave_up:             "gave up (retries exhausted)"
