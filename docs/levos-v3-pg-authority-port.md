@@ -345,7 +345,8 @@ unset, kept up past the kanban watchers' first ticks).
 
 ### 6.6 kanban master switch
 
-Card `t_fb9c7b9e`. Operator decision (eren, 2026-09-29): v3 turns the built-in
+Card `t_fb9c7b9e` (it asks for "§6.5"; 6.5 already lists t_aa3728da's
+remaining items, so this is 6.6). Operator decision (eren, 2026-09-29): v3 turns the built-in
 kanban off (it is to be replaced later). Base: `levos/pg3` `ea213f19b`. The
 existing `kanban.dispatch_in_gateway: false` /
 `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0` stops only the dispatcher
