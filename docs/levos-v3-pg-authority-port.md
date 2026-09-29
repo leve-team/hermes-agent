@@ -407,7 +407,7 @@ code.
 | 11 | every `kanban_*` tool's check_fn is False (orchestrator toolset and dispatcher workers alike), so no handler is reachable | `tools/kanban_tools.py` `_visible` |
 | 12 | the worker heartbeat and comment bridges return False | `tools/kanban_tools.py` |
 | 13 | not gated: only a process the dispatcher spawned (`HERMES_KANBAN_TASK`) reaches these, and an off runtime spawns none | — |
-| 14 | not gated (remaining): the dashboard kanban plugin is part of `hermes dashboard`, not of the gateway / tui runtime, and opens the store only per operator request; disable it there with `plugins.disabled: [kanban]` | — |
+| 14 | gated (`t_0940d7c8`): `hermes dashboard` (v3 also runs `--isolated`) does not mount the kanban plugin API under `/api/plugins/kanban/` and logs one line `Plugin kanban: API not mounted, kanban disabled (…)`, so no request reaches `_conn` / `stream_events`; the tab's static assets stay and its API calls get 404. Other plugins and `plugins.disabled` are unchanged | `hermes_cli/web_server_dashboard.py` `_plugin_api_mount_skip_reason` |
 
 The existing `kanban.dispatch_in_gateway` / `HERMES_KANBAN_DISPATCH_IN_GATEWAY`
 keep their meaning while kanban is on. The switch never touches an existing
@@ -429,3 +429,13 @@ the base tree fails its test. `tests/test_v3_no_file_state_authority.py`: the
 pod guard's `off` variant (above, 6.3); on the base tree it records `kanban.db`
 connects from the dispatcher (`kanban_db_connect._open_configured`) and the
 tui poller (`count_notify_subs`, `?mode=ro`) and leaves `home/kanban`.
+
+`tests/hermes_cli/test_dashboard_kanban_master_switch.py` (row 14): off by env
+or config, `_plugin_api_mount_skip_reason` returns `kanban disabled (…)` for
+the kanban plugin only; on (default, env `1`) it returns None as before and
+`plugins.disabled` still wins. Mounting the plugin APIs on a fresh app over a
+`HERMES_HOME` holding a `kanban.db` gives zero `/api/plugins/kanban/` paths in
+`/openapi.json`, zero `sqlite3.connect` and an unchanged file off, and the
+kanban paths on. On the base tree the off tests fail (the router mounts).
+`docs/quality/rule-index.md` is still absent in this repository; the root
+`AGENTS.md` rules were followed as for t_fb9c7b9e (§4).

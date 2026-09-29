@@ -748,12 +748,21 @@ def _plugin_api_mount_skip_reason(plugin: Dict[str, Any], enabled_set: set, disa
     Python runs (GHSA-mcfc-hp25-cjv7); bundled plugins are trusted but respect an explicit
     disable; project plugins (``./.hermes/plugins/``) ship with the CWD and are
     attacker-controlled when opening a malicious repo — never auto-imported (GHSA-5qr3-c538-wm9j).
+    The kanban plugin also stays unmounted while the kanban master switch is off: its routes
+    open (and create) the kanban store on the first request.
     """
     source, plugin_name = plugin.get("source"), plugin.get("name", "")
     if source in ("user", "bundled") and plugin_name in disabled_set:
         return "explicitly disabled"
     if source == "user" and plugin_name not in enabled_set:
         return "not in plugins.enabled"
+    if plugin_name == "kanban":
+        # Lazy: keeps dashboard startup cheap and avoids an import cycle through hermes_cli.config.
+        from hermes_cli.kanban_switch import kanban_disabled_reason
+        reason = kanban_disabled_reason()
+        if reason:
+            _log.info("Plugin kanban: API not mounted, kanban disabled (%s)", reason)
+            return f"kanban disabled ({reason})"
     return None
 
 
