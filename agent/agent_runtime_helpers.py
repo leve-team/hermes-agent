@@ -547,6 +547,21 @@ def note_turn_persisted(agent):
     agent._inflight_turn_session_id = None
 
 
+_GATEWAY_NOTICE_DISPLAY_KINDS = frozenset({"model_switch", "personality_switch"})
+
+
+def _is_gateway_notice_row(msg: Any) -> bool:
+    """True for a gateway pivot marker persisted as role=user (model switch /
+    personality change). Identified by display_kind first, then by the
+    ``[System:`` prefix the display projection already sniffs."""
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    if msg.get("display_kind") in _GATEWAY_NOTICE_DISPLAY_KINDS:
+        return True
+    content = msg.get("content")
+    return isinstance(content, str) and content.lstrip().startswith("[System:")
+
+
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
     """Collapse malformed role-alternation left in the live history.
 
@@ -761,11 +776,29 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             # content alone — collapsing image/audio blocks risks
             # mangling the attachment structure.
             if isinstance(prev_content, str) and isinstance(new_content, str):
-                prev["content"] = (
+                joined = (
                     (prev_content + "\n\n" + new_content)
                     if prev_content and new_content
                     else (prev_content or new_content)
                 )
+                if _is_gateway_notice_row(prev) and not _is_gateway_notice_row(msg):
+                    # A gateway pivot marker ("[System: The active model …]",
+                    # role=user, display_kind=model_switch) immediately
+                    # followed by a REAL user message. Merging the user into
+                    # the marker keeps the marker's identity: display_kind
+                    # stays "model_switch", the persisted row starts with
+                    # "[System:", and every display projection hides it —
+                    # the user's words silently vanish from the transcript
+                    # after the next compaction re-inserts the merged row
+                    # (levos 2026-09-30: session 20260919_140939_95f2df,
+                    # 14 user turns lost this way). Keep the USER row as the
+                    # survivor and fold the notice text into it instead.
+                    msg["content"] = joined
+                    drop_stale_api_content(msg)
+                    merged[-1] = msg
+                    repairs += 1
+                    continue
+                prev["content"] = joined
                 # Merged content invalidates the api_content sidecar (exact
                 # bytes previously sent for the pre-merge message) — drop it
                 # so replay can't substitute stale bytes.

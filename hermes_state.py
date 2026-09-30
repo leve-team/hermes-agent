@@ -10974,10 +10974,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         repair_alternation: bool = False,
         include_row_ids: bool = False,
         include_display_only: bool = False,
+        include_compacted: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
+
+        ``include_compacted=True`` is the DISPLAY read: rows preserved by
+        in-place compaction (``active=0, compacted=1``) are included and the
+        per-epoch protected-tail copies are collapsed to one row per logical
+        message (same dedupe key as :meth:`get_messages`; the live/newest copy
+        wins for identity, the ORIGINAL row's position wins for ordering so the
+        transcript stays chronological). Soft-deleted rewind rows
+        (``active=0, compacted=0``) stay hidden. Never use it for the model
+        context — the summary and the originals would both be replayed.
+        (levos: user rows vanished from the portal transcript after every
+        compaction, 2026-09-30.)
 
         By default only active messages are returned. Pass
         ``include_inactive=True`` to load soft-deleted (rewound) rows
@@ -10997,7 +11009,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if include_ancestors and not self._is_explicit_branch_session(session_id):
             session_ids = self._session_lineage_root_to_tip(session_id)
 
-        active_clause = "" if include_inactive else " AND active = 1"
+        if include_inactive:
+            active_clause = ""
+        elif include_compacted:
+            active_clause = " AND (active = 1 OR COALESCE(compacted, 0) = 1)"
+        else:
+            active_clause = " AND active = 1"
         # Default-exclude display-only rows so every context caller is
         # duplication-safe without opting in; display callers opt back in.
         # COALESCE guards a row written before the column existed; IFNULL is
@@ -11022,6 +11039,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 tuple(session_ids),
             ).fetchall()
 
+        if include_compacted:
+            rows = self._dedupe_compaction_copies(rows)
+
         return self._rows_to_conversation(
             rows,
             session_id=session_id,
@@ -11029,6 +11049,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
         )
+
+    @staticmethod
+    def _dedupe_compaction_copies(rows):
+        """Collapse protected-tail copies made by in-place compaction.
+
+        Each compaction epoch re-inserts the surviving tail as fresh rows, so
+        one logical message may exist several times (identical
+        role/content/timestamp/tool fields, different id/active). For a
+        display read keep exactly one: the row that appears FIRST (the
+        original, so the transcript stays in real chronological order —
+        copies carry the old timestamp but a much later id). ``rows`` are
+        ``_CONVERSATION_ROW_COLUMNS`` tuples ordered by id.
+        """
+        seen = set()
+        out = []
+        for row in rows:
+            try:
+                key = (
+                    row["role"], str(row["content"]), row["timestamp"],
+                    row["tool_call_id"], str(row["tool_calls"]), row["tool_name"],
+                )
+            except (KeyError, TypeError, IndexError):
+                # id, role, content, tool_call_id, tool_calls, tool_name, ..., timestamp(idx 15)
+                key = (row[1], str(row[2]), row[15], row[3], str(row[4]), row[5])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+        return out
 
     # Columns every conversation projection decodes. Shared by
     # get_messages_as_conversation and get_resume_conversations so a single
@@ -11202,8 +11251,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, display_only, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"SELECT session_id, display_only, active, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                # Display needs the in-place-compaction archive too
+                # (active=0, compacted=1) — the model set is filtered below.
+                "AND (active = 1 OR COALESCE(compacted, 0) = 1) "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
                 "ORDER BY id",
@@ -11219,8 +11271,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tip_rows = [
             r
             for r in rows
-            if r["session_id"] == session_id and not r["display_only"]
+            if r["session_id"] == session_id and not r["display_only"] and r["active"]
         ]
+        # Display: active + compaction-archived rows, per-epoch tail copies
+        # collapsed (first/original row wins → chronological order).
+        rows = self._dedupe_compaction_copies(rows)
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,

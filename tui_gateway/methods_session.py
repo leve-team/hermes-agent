@@ -552,7 +552,7 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bound_display_messages(_history_to_messages(display_history), params)[0]
             return _ok(
                 rid,
                 {
@@ -705,7 +705,7 @@ def _(rid, params: dict) -> dict:
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bound_display_messages(_history_to_messages(display_history), params)[0]
             payload = {
                 "session_id": sid,
                 "resumed": target,
@@ -767,7 +767,7 @@ def _(rid, params: dict) -> dict:
                 [] if omit_messages else db.get_ancestor_display_prefix(target)
             )
             history = sanitize_replay_history(raw_history)
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bound_display_messages(_history_to_messages(display_history), params)[0]
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -2645,18 +2645,26 @@ def _(rid, params: dict) -> dict:
                     # projection in _history_to_messages only forwards row_id
                     # when the row carries a stamp, so an unstamped read here
                     # silently strips the one durable address clients can use.
+                    # Display read: include rows preserved by in-place
+                    # compaction (active=0, compacted=1) with the per-epoch
+                    # tail copies collapsed — otherwise every compaction makes
+                    # the pre-compaction user turns vanish from the transcript
+                    # (levos 2026-09-30). Rewind rows stay hidden.
                     history = db.get_messages_as_conversation(
                         session["session_key"],
                         include_ancestors=True,
                         include_row_ids=True,
+                        include_compacted=True,
                     )
                 except Exception:
                     pass
+    messages, truncated = _bound_display_messages(_history_to_messages(history), params)
     return _ok(
         rid,
         {
             "count": len(history),
-            "messages": _history_to_messages(history),
+            "truncated": truncated,
+            "messages": messages,
         },
     )
 

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import logging
 import os
 import queue
@@ -7875,7 +7876,24 @@ def _is_display_hidden_marker(role: str | None, text: str) -> bool:
     model. It also removes the stored marker from the payload the desktop
     reconciles against, so it can no longer shift user-message ordinals and
     duplicate the optimistic prompt (#67603)."""
-    return role == "user" and text.lstrip().startswith("[System:")
+    return role == "user" and _split_gateway_notice(text)[1] == ""
+
+
+_NOTICE_PREFIX_RE = re.compile(r"^\s*(\[System:[^\]]*\])\s*")
+
+
+def _split_gateway_notice(text: str) -> tuple[str, str]:
+    """Split a ``[System: …]`` gateway notice off the front of a user text.
+
+    Returns ``(notice, rest)``. ``rest`` is non-empty when a REAL user message
+    was merged behind the notice by the consecutive-user repair; such a row
+    must render the user's words rather than be hidden as a pure marker
+    (levos 2026-09-30 — 14 merged user turns were hidden this way).
+    """
+    m = _NOTICE_PREFIX_RE.match(text or "")
+    if not m:
+        return "", text or ""
+    return m.group(1), (text or "")[m.end():].strip()
 
 
 def _skill_scaffold_projection(content_text: str) -> str:
@@ -7945,9 +7963,74 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+# Display transport bound (levos 2026-09-30): with the in-place-compaction
+# archive included in the display projection, a long-lived session projects to
+# tens of thousands of rows / tens of MB (opsi session: 11k rows, 19 MB) and a
+# mobile browser stalls on it. Every wire payload that ships a display
+# transcript sends the newest ``limit`` rows (default 1000, ``limit=0`` = all)
+# and flags ``truncated``. Before the archive was included the same payloads
+# carried only the post-compaction active window, so a bounded window is never
+# less than before.
+_DISPLAY_TRANSPORT_DEFAULT_LIMIT = 1000
+
+
+def _bound_display_messages(messages: list, params: dict) -> tuple[list, bool]:
+    try:
+        limit = int((params or {}).get("limit", _DISPLAY_TRANSPORT_DEFAULT_LIMIT) or 0)
+    except (TypeError, ValueError):
+        limit = _DISPLAY_TRANSPORT_DEFAULT_LIMIT
+    if limit > 0 and len(messages) > limit:
+        return messages[-limit:], True
+    return messages, False
+
+
+def _project_compaction_carrier_for_display(m: dict) -> dict | None:
+    """Reduce a context-compaction carrier row to its display content.
+
+    Returns ``None`` for a pure handoff (nothing the user typed), else a copy
+    whose content is only the genuine user text the carrier restated after
+    the summary boundary (inflight replay / merged prior tail). Never returns
+    the summary body or the ``## Preserved Turns`` reference dump.
+    """
+    try:
+        from agent.context_compressor import (
+            ContextCompressor,
+            _INFLIGHT_TASK_REPLAY_HEADER,
+            is_compaction_summary_message,
+        )
+    except Exception:
+        return m
+    if not is_compaction_summary_message(m):
+        return m
+    projected = ContextCompressor._strip_context_summary_handoff_message(m)
+    if projected is None:
+        return None
+    content = projected.get("content")
+    if isinstance(content, list):
+        # Text parts only: the carrier re-embeds the newest screenshot as a
+        # base64 image_url part; the original user row (now visible via the
+        # compacted display read) already renders it.
+        content = "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+            if not (isinstance(part, dict) and part.get("type") != "text")
+        )
+    text = _coerce_message_text(content)
+    if _INFLIGHT_TASK_REPLAY_HEADER in text:
+        text = text.split(_INFLIGHT_TASK_REPLAY_HEADER, 1)[1]
+    text = text.strip()
+    if not text:
+        return None
+    out = dict(projected)
+    out["content"] = text
+    out.pop("display_kind", None)
+    return out
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
+    _recent_user_texts: set = set()
 
     for m in history:
         if not isinstance(m, dict):
@@ -7962,9 +8045,43 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # this projection.
         if m.get("display_kind") == "hidden":
             continue
+        # Compaction carrier ("[CONTEXT COMPACTION — REFERENCE ONLY] …",
+        # fable harness "## Preserved Turns" + "[STILL IN PROGRESS …] <live
+        # user ask>"): model-facing handoff, up to ~2 MB with the base64 of
+        # every referenced screenshot. Shipping it to the browser as one user
+        # bubble is what makes the portal scroll stall on mobile
+        # (levos 2026-09-30: 1.9 MB row per compaction). Project it to the
+        # live user ask it carries (if any) and drop the rest.
+        _was_carrier = False
+        try:
+            from agent.context_compressor import is_compaction_summary_message as _is_carrier
+            _was_carrier = bool(_is_carrier(m))
+        except Exception:
+            pass
+        m = _project_compaction_carrier_for_display(m)
+        if m is None:
+            continue
         content_text = _coerce_message_text(m.get("content"))
+        if _was_carrier and role == "user" and any(
+            t and t in content_text for t in _recent_user_texts
+        ):
+            # The restated live ask duplicates the real user row that already
+            # rendered (compacted display read) — show it once.
+            continue
         if _is_display_hidden_marker(role, content_text):
             continue
+        if role == "user":
+            _notice, _rest = _split_gateway_notice(content_text)
+            if _notice and _rest:
+                # Merged "[System: …] + real user text": show the user's words.
+                if _rest in _recent_user_texts:
+                    # A compaction copy of the merged row whose original user
+                    # row already rendered — show the user's words once.
+                    continue
+                content_text = _rest
+                if m.get("display_kind") in ("model_switch", "personality_switch"):
+                    m = dict(m)
+                    m.pop("display_kind", None)
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -8043,6 +8160,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+        if role == "user":
+            _recent_user_texts.add(content_text.strip())
         messages.append(msg)
 
     return messages
