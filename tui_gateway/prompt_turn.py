@@ -117,11 +117,14 @@ def _admit_prompt_turn(
 
 def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
-    can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
+    can rotate session_key mid-turn).  A surviving marker means the process died mid-turn —
+    unless this turn thread still runs: it is counted first (``note_turn_running``), as any turn
+    of the key is, because a WS drop can reap the session record while the thread runs on.
     The key is published before the disk write so an interrupt racing startup can retire
     it; the post-write cancel check closes the inverse race (Stop landed first, no file)."""
     marker_home = _session_home(session)
     marker_key = str(session.get("session_key") or "")
+    note_turn_running(marker_home, marker_key)
     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
     marker_text = session.pop("_auto_continue_prompt", None) or text
     if isinstance(marker_text, str) and marker_text.strip():

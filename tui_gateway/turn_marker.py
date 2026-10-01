@@ -11,7 +11,13 @@ instead of ``desktop/interrupted_turns.json``: the client may resume on another 
 ran the turn. Each row carries its owner process and a lease on the PostgreSQL server clock (the
 gateway turn-lease model, ``gateway.turn_owner``); a marker whose owner is another live process is
 still running there, not interrupted, and is not returned. No file is written, and a PostgreSQL
-failure still degrades to "no marker"."""
+failure still degrades to "no marker".
+
+A turn whose thread still runs in THIS process is not interrupted either, on any store
+(``turn_running_here``): a WS drop reaps the session record, not the turn, so the next
+``session.resume`` finds the marker of a live turn. The owner id cannot tell: it is this process for
+that turn and for a row an earlier process with the same id left behind, and the lease renewer keeps
+every row of the id alive (``_pg_renew``). The registry of turn threads can; it dies with the process."""
 
 from __future__ import annotations
 
@@ -33,6 +39,10 @@ _MAX_ENTRIES = 32
 _MAX_PROMPT_CHARS = 64_000
 
 _lock = threading.Lock()
+
+# (home, session_key) -> the turn threads of this process running it; a thread counts until it ends.
+_running_lock = threading.Lock()
+_running: dict[tuple[str, str], list[threading.Thread]] = {}
 
 
 _PG_STORE = "tui_turn_markers"
@@ -223,6 +233,33 @@ def clear_turn_marker(home: Path | str, session_key: str) -> None:
     if not session_key or _authority_marker(lambda: _pg_clear(str(Path(home)), session_key), session_key, "clear"):
         return
     _update(home, session_key, lambda e: {k: v for k, v in e.items() if k != session_key} if session_key in e else None, "clear")
+
+
+def _prune_running() -> None:
+    for key, threads in list(_running.items()):
+        if alive := [thread for thread in threads if thread.is_alive()]:
+            _running[key] = alive
+        else:
+            del _running[key]
+
+
+def note_turn_running(home: Path | str, session_key: str) -> None:
+    """Count the calling turn thread as running *session_key* in this process until the thread ends
+    (every exit path of the turn, its ``finally`` included, runs before that)."""
+    if not session_key:
+        return
+    with _running_lock:
+        _prune_running()
+        _running.setdefault((str(Path(home)), session_key), []).append(threading.current_thread())
+
+
+def turn_running_here(home: Path | str, session_key: str) -> bool:
+    """True while another thread of this process runs a turn of *session_key*: its marker is not interrupted.
+    The asking thread never counts — it is either that turn itself or done with any turn it ran inline."""
+    me = threading.current_thread()
+    with _running_lock:
+        _prune_running()
+        return any(thread is not me for thread in _running.get((str(Path(home)), session_key), ()))
 
 
 def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | None:

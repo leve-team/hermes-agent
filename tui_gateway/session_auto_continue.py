@@ -67,6 +67,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     if not marker.get("auto_continue", True):
         return None  # The mailbox owns recovery and receipt identity for imported turns.
+    if turn_running_here(home, session_key):
+        # Not interrupted: a WS drop reaped the turn's record while its thread runs on. That turn clears the marker
+        # itself; nothing is cleared or spent here (a long turn's marker is not "stale" either).
+        logger.info("auto-continue for session %s held: its turn is still running in this process", session_key)
+        return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
@@ -104,6 +109,14 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 session["running"] = False
                 session["_auto_continue_scheduled"] = False
             return
+        # The decision predates the agent build: by now the interrupted turn may have concluded after all (its owner
+        # cleared the marker) or a newer turn may hold the key. Dispatch only the interruption that was judged.
+        if not _marker_still_interrupted(home, session_key, marker):
+            logger.info("auto-continue for %s dropped: its turn concluded or a newer one started", session_key)
+            with session["history_lock"]:
+                session["running"] = False
+                session["_auto_continue_scheduled"] = False
+            return
         with session["history_lock"]:
             # Marker inputs read back by _run_prompt_submit: attempt count (crash breaker) and the ORIGINAL prompt (no
             # nested notes). Set here, not at schedule time, so a bail above leaves nothing for a racing user turn.
@@ -118,6 +131,13 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info("auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)", session_key, attempt, age)
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
+
+
+def _marker_still_interrupted(home: Path, session_key: str, marker: dict) -> bool:
+    """*marker* is still the stored marker (same ``started_at``) and no turn of the key runs here."""
+    current = read_turn_marker(home, session_key)
+    return (current is not None and current["started_at"] == marker["started_at"]
+            and not turn_running_here(home, session_key))
 
 
 def _ac_inflight_original(session: dict) -> str:
