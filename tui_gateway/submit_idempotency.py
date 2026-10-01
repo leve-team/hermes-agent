@@ -818,7 +818,7 @@ def finish_submit(claim: Claim, receipt: Optional[dict] = None) -> Optional[Acce
 
 def lookup_submit(client_msg_id: str, session_key: str = "", *, with_text: bool = False) -> Optional[Acceptance]:
     """The record for *client_msg_id* (anywhere in *session_key*'s conversation when
-    given, else the most recent one of any session), reconciled against the messages.
+    given, else the most recent one of any session), its state (not the result) reconciled against the messages.
     ``with_text``: also read the result's final text (session-scoped lookups only)."""
     conn = open_store()
     try:

@@ -687,6 +687,17 @@ No new table, RPC, service or read path; the broker side is a follow-up.
   `resumed`, the 4141 conflict) carry the same metadata, never the text. Off
   authority: `{"enabled": false, "found": false}` as before.
 
+**The history reference is as recorded (P3 note, `t_ee025292`).** With
+`include_result`, `history_persisted`, `history_ref_kind` and
+`assistant_message_id` (and `history_text_match`) are what the result write
+found (`record_result`, looked up once more by `finish_submit` while no row was
+found); a lookup does not check them again. An assistant row deleted after the
+result was recorded is still reported as recorded (opsi, 2026-10-01). The
+public result is the result row itself — `final_text` and `final_sha256`.
+`lookup_submit` reconciles the record's state (`persisted`, `running`,
+`needs_attention`) against the messages, not its result; its docstring now
+says so (no behaviour change).
+
 ### 7.4 Retention and `found: false`
 
 Unchanged `_prune`: a record untouched for 7 days (`updated_at < now -
@@ -793,3 +804,142 @@ a model provider or a real compression rotating `agent.session_id` mid-turn
 `AGENTS.md` rules were followed (real imports and a real PostgreSQL,
 behaviour-contract tests red on the base tree, extend existing code — no new
 table, RPC or `HERMES_*` variable).
+
+### 7.7 auto-continue and live/hosted-room turns
+
+Card `t_ee025292`, on `b48c99e` (§7.1–7.6; one image ships both). opsi's
+acceptance run of `b48c99e` (2026-10-01 08:12–09:11Z: real core, broker, a
+temporary PostgreSQL 17, a proxy dropping only end events) passed every receipt
+contract and failed one P1: after a broker restart `session.resume` judged the
+turn still running in the same core process "interrupted 13s ago" and ran an
+auto-continue turn — two turns, two model calls, two assistant rows and a note
+in the hidden conversation. It reproduced with the broker's result recovery gate
+off: a core defect. The WS drop had reaped the session record while its turn
+thread ran on (`session turn thread still alive after 5.0s teardown grace`); the
+marker's owner was this process, which `_pg_read` treats as interrupted
+unconditionally; and the room's resumed record had this backend's platform as
+its source, so the `bot_room` exclusion never applied to a broker room.
+
+1. **A turn still running in this process is not interrupted** (fix 1).
+   `_record_turn_marker` counts the calling turn thread under
+   `(home, session_key)` (`turn_marker.note_turn_running`, for every turn of a
+   keyed session, before the marker write). A thread counts until it ends —
+   after the turn's `finally` retired the marker — so no exit path leaves it
+   counted, and the count dies with the process. `_maybe_schedule_auto_continue`
+   holds while `turn_running_here(home, key)`: the marker is not cleared, no
+   attempt is spent, no model is called, and a long turn's marker is not cleared
+   as stale either (log `auto-continue for session … held: its turn is still
+   running in this process`). The asking thread never counts.
+   The owner id plays no part: it is the same for a live turn and for a row an
+   earlier process with the same id (`hostname|pid namespace|pid|start`) left
+   behind. `_pg_renew` (`UPDATE … WHERE owner = owner_id()`) renews every row of
+   the id whether its turn runs or not — rows whose clear failed and rows of an
+   earlier incarnation with the same id included — so while this process lives
+   they look alive to other pods (never continued there) and, not counted here,
+   are judged interrupted here (freshness and attempts apply) as before; the
+   renewer is unchanged. The check sits at the resume decision, not in
+   `read_turn_marker` / `_pg_read`: that decision is their only production
+   reader (one check for the file store and PostgreSQL alike), while
+   `read_turn_marker` is also a turn's own view of its marker — the unmodified
+   `tests/tui_gateway/test_auto_continue.py` reads it mid-turn.
+2. **The judgement is checked again right before dispatch.** The kickoff builds
+   the agent first; right before `_run_prompt_submit` it reads the marker again
+   and drops the continuation when the marker is gone (the judged turn concluded
+   after all), its `started_at` changed (a newer turn took the key) or a turn of
+   the key now runs here (log `auto-continue for … dropped: …`; `running` and
+   `_auto_continue_scheduled` reset, marker untouched).
+3. **Hosted-room turns are never auto-continued** (fix 2).
+   `_HOSTED_ROOM_SOURCES = {"bot_room", "levos-room"}`: the in-core room driver
+   and the session-plane broker, whose `session.create` uses
+   `source="levos-room"`. The broker resumes with `{"session_id": stored}` only,
+   so `_Resume.mint` gave the record this backend's platform (`tui` /
+   `desktop`). `_session_resume` now takes the hosted-room source stored on the
+   row the client named (the broker keeps the key `session.create` gave it) or
+   on its compression tip, and `mint()` uses it for the record over the
+   request's: cold, deferred (hydration) and eager resumes — the three
+   auto-continue entry points — carry it, and the room's agent is built for the
+   room's platform as at create (eager `platform_override`, deferred build).
+   Any other source resolves as before (the request's `source`, else this
+   backend's platform): a session reopened from another surface keeps that
+   surface's platform, toolsets and close semantics. Core only — no broker
+   change, no DDL (`sessions.source` is never updated by the row upsert). The
+   source check comes after the marker read and the imported-turn check (same
+   outcome: none, marker untouched): as the first statement its module constant
+   breaks `tests/tui_gateway/test_bot_live_owner_delivery.py`, which rebinds the
+   function on `_session_home` and `read_turn_marker` only.
+
+**Public effect.** A core pod that dies in the middle of a room turn no longer
+re-runs that turn when the broker resumes the session; the room task ends
+`failed` / `expired` through the room's own state machine instead — D1-b's
+"without re-running". A Desktop / TUI session still gets the crash
+auto-continue after a real process death (another owner, lease run out), once
+per attempt, as before.
+
+**Tests** (2026-10-01, real PostgreSQL 17.11 via `PG3_PERCENT_PG_BIN`, the real
+turn thread and a real AIAgent whose model is a stand-in on a loopback endpoint,
+auto-titles off; every run inside a network namespace with only loopback up),
+`tests/tui_gateway/test_auto_continue_inprocess_pg.py`:
+
+| Test | Contract |
+|---|---|
+| `test_turn_still_running_here_is_not_continued_by_a_resume` ×9 (T1, T5) | turn held in its model call, record reaped on the WS drop, two resumes; source desktop / tui / levos-room × cold / eager / hydration: no auto-continue, one model call, marker unchanged until the turn clears it, transcript = the user row and one reply |
+| `test_turn_reaped_by_the_ws_orphan_reaper_is_not_continued` (T1) | a parked Desktop record the WS-orphan reaper interrupts and force-reaps mid-turn |
+| `test_turn_still_running_here_is_not_continued_on_the_file_store` (T1) | the same off authority (`desktop/interrupted_turns.json`) |
+| `test_turn_whose_pod_died_is_still_continued_once` ×3 (T2, T5) | another owner, lease run out, desktop, fresh marker: one continuation per entry point; its marker carries attempt 1 and the original prompt; the model gets the original request once |
+| `test_levos_room_turn_is_not_auto_continued_after_its_pod_died` ×3 (T3, T5) | create(levos-room) → resume without source → turn → pod dies → resume: no auto-continue, marker left for the room; every agent of the room built on `levos-room` |
+| `test_levos_room_compressed_before_this_fix_is_left_to_the_room` (T3) | the root row is the room's, its compression tip says `tui`; resumed by the root key |
+| `test_bot_room_turn_is_left_to_the_room_driver` ×2 (T4) | resume without source and with `source=bot_room` |
+| `test_stale_or_exhausted_marker_is_cleared_not_continued` ×2 (T4) | freshness, `max_attempts` |
+| `test_marker_of_a_live_owner_elsewhere_is_left_alone` (T4) | another pod's live lease |
+| `test_continuation_refused_by_the_session_slot_fence_keeps_the_marker` (T4) | the #94778 slot fence at dispatch |
+| `test_continuation_is_dropped_when_its_marker_changes_before_dispatch` ×2 (T6) | marker deleted / `started_at` changed between the decision and the dispatch |
+
+On `b48c99e` (the file copied in) T1 ×11, T3 ×4, bot_room without source and
+T6 ×2 fail; T2 ×3 and the other T4 guards pass. First failures, verbatim:
+
+```
+test_turn_still_running_here_is_not_continued_by_a_resume[desktop-cold]
+>           assert decision is None, "a resume scheduled the live turn's prompt again"
+E           AssertionError: a resume scheduled the live turn's prompt again
+E           assert {'attempt': 1, 'interrupted_at': 1790852803.1250622} is None
+test_levos_room_turn_is_not_auto_continued_after_its_pod_died[cold]
+>       assert decision is None, "the levos-room turn was auto-continued"
+E       AssertionError: the levos-room turn was auto-continued
+E       assert {'attempt': 1, 'interrupted_at': 1790852811.361554} is None
+```
+
+and the base core logs opsi's sequence: `tui prompt accepted … kind=user` →
+`session turn thread still alive after 0.2s teardown grace` → `auto-continue
+scheduled for session … (attempt 1, interrupted 0s ago)` → `tui prompt accepted
+… kind=auto_continue`. On this branch the same turn logs `… held: its turn is
+still running in this process` per resume and one `tui turn finished …
+status=complete`.
+
+The card's command, `python -m pytest
+tests/tui_gateway/test_auto_continue_inprocess_pg.py
+tests/tui_gateway/test_auto_continue.py
+tests/tui_gateway/test_submit_idempotency_pg.py
+tests/tui_gateway/test_r0_d1b_probe.py -q -p no:warnings`: 84 passed (26 +
+20 + 35 + 3; `test_auto_continue.py` unmodified).
+
+No-regression sweep, one file at a time (`scripts/run_tests.sh -j 1`, file
+retries off, no xdist; the head tree's run finished before the base tree's
+started): all 140 `tests/tui_gateway` files plus
+`tests/test_tui_gateway_{server,server_crash_history,ws,event_replay,loop_noise,queue_on_busy}.py`,
+`tests/test_lazy_session_regressions.py`, `tests/test_overlap_c03_pg_authority.py`
+(the PostgreSQL marker/owner tests) and `tests/test_v3_no_file_state_authority.py`.
+Head: 149 files, 1949 passed, 3 failed; base `b48c99e`: 148 files, 1922 passed,
+3 failed. The failing tests are the same three on both trees
+(`tests/test_tui_gateway_server.py::test_config_set_model_recovers_failed_profile_resume_after_build_completes`
+×2, `::test_get_db_degrades_cleanly_when_sessiondb_init_fails`, as in §7.6);
+every other file has the same result except the new file (26 passed) and
+`tests/tui_gateway/test_heartbeat_tui_tick.py`, which had one import-lock
+error (`KeyError` in `_ModuleLock('tools.environments')`) on the base tree only
+and passed there three times out of three when run again alone.
+
+**Not tested / not verified**: a real broker (session plane) — the room task
+ending `failed` / `expired` is its state machine; a production pod restarted
+under the same owner id; a room conversation compressed under an earlier core
+and resumed by its tip key (not the key `session.create` gave): its rows say
+`tui`, so it is not recognised as a room; `./scripts/check` (absent on
+`levos/pg3`, see the card report).
