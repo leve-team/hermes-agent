@@ -29,6 +29,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -436,6 +437,30 @@ def test_levos_room_turn_is_not_auto_continued_after_its_pod_died(core, entry, m
     # Every agent of the room ran on the room's platform, created or resumed.
     assert {platform for _session, platform in core.built} == {"levos-room"}
     core.drop(ws, key)
+
+
+# T3 — a room conversation compressed under an earlier core (its tip row says "tui") is still the room's:
+# the broker resumes the key session.create gave it, and that row is a room's
+def test_levos_room_compressed_before_this_fix_is_left_to_the_room(core):
+    from tui_gateway.turn_marker import record_turn_start
+
+    root, tip = "acroot_" + uuid.uuid4().hex[:8], "actip_" + uuid.uuid4().hex[:8]
+    core.db.create_session(root, "levos-room")
+    core.db.append_message(root, "user", "before compression")
+    core.db.end_session(root, "compression")
+    core.db.create_session(tip, "tui", parent_session_id=root)
+    core.db.append_message(tip, "user", "after compression")
+    record_turn_start(server._hermes_home, tip, "after compression")  # the tip's turn, then its pod died
+    core.sql("UPDATE core_tui_turn_markers SET owner = %s, lease_expires_at = 0 WHERE session_key = %s",
+             _DEAD_POD, tip)
+    marker = core.marker(tip)
+
+    ws, reply, decision = core.resume(root, "cold")
+    assert reply["session_key"] == tip  # resumed at the compression tip
+    assert decision is None
+    assert _auto_continued(core) == 0 and core.model.requests == []
+    assert core.marker(tip) == marker
+    core.drop(ws, tip)
 
 
 # T4 — the in-core room driver's sessions keep their exclusion, however the resume names the source
