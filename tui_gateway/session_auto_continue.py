@@ -17,6 +17,10 @@ from .method_ctx import bind_module
 # recovered partial transcript speak for itself — the user can ask to continue manually.
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
 
+# Sessions whose turns a hosted room's own durable task/lease state machine recovers: the in-core room driver's
+# (``bot_room``) and the session-plane broker's rooms (``levos-room``, the source of its ``session.create``).
+_HOSTED_ROOM_SOURCES = frozenset({"bot_room", "levos-room"})
+
 
 def _auto_continue_config() -> tuple[bool, float, int]:
     """(enabled, freshness window in seconds, max attempts) from ``desktop.auto_continue`` in config.yaml."""
@@ -54,19 +58,25 @@ def _auto_continue_note(prompt: str) -> str:
             f"finish the task. The interrupted request was:]\n\n{prompt}")
 
 
+def _hosted_room_source(*rows: dict | None) -> str:
+    """The hosted-room source stored on any of *rows* (session rows of one conversation), else ""."""
+    sources = (str((row or {}).get("source") or "") for row in rows)
+    return next((source for source in sources if source in _HOSTED_ROOM_SOURCES), "")
+
+
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:
     """Kick off a continuation turn for a crash-interrupted session (session.resume cold paths). Returns a descriptor
     for the resume payload when scheduled, else None. The turn runs on a background thread after the deferred agent
     build via _run_prompt_submit, so the client that just resumed streams it."""
-    # Hosted room turns are recovered by their durable task/lease state machine; generic auto-continue would bypass
-    # its execution generation and duplicate work.
-    if session.get("source") == "bot_room":
-        return None
     home = _session_home(session)
     if (marker := read_turn_marker(home, session_key)) is None:
         return None
     if not marker.get("auto_continue", True):
         return None  # The mailbox owns recovery and receipt identity for imported turns.
+    # Hosted room turns are recovered by their durable task/lease state machine; generic auto-continue would bypass
+    # its execution generation and duplicate work. A resumed record carries the stored room source (_Resume.mint).
+    if session.get("source") in _HOSTED_ROOM_SOURCES:
+        return None
     if turn_running_here(home, session_key):
         # Not interrupted: a WS drop reaped the turn's record while its thread runs on. That turn clears the marker
         # itself; nothing is cleared or spent here (a long turn's marker is not "stale" either).

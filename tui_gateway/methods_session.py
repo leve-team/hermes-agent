@@ -579,10 +579,17 @@ class _Resume:
         self.omit_messages, self.eager_build = _flag(params, "omit_messages"), _flag(params, "eager_build")
         # A replayed ``client_create_id`` resumes under the runtime sid it was first given (when free).
         self.runtime_sid = ""
+        # The hosted-room source the stored conversation was created with ("" for any other source).
+        self.hosted_source = ""
 
     def mint(self, prompts: bool = True) -> tuple:
-        """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on)."""
+        """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on). A hosted
+        room's record keeps its stored source over the request's (the broker resumes with none): that keeps generic
+        auto-continue off the room's turns and builds its agent for the room's platform, as ``session.create`` did.
+        Every other source resolves as before — the request's, else this backend's platform."""
         ids = _new_runtime_ids(self.params)
+        if self.hosted_source:
+            ids = (ids[0], self.hosted_source)
         if self.runtime_sid and self.runtime_sid not in _sessions:
             ids = (self.runtime_sid, ids[1])
         if prompts:
@@ -929,7 +936,10 @@ def _session_resume(rid, params: dict, runtime_sid: str = "") -> dict:
             return _db_unavailable_error(rid, code=5000)
         if (resp := _resume_locate(ctx)) is not None:
             return resp
+        located = ctx.found
         _resume_follow_tip(ctx)
+        # The row the client named (the broker keeps the key ``session.create`` gave it) or its compression tip.
+        ctx.hosted_source = _hosted_room_source(located, ctx.found)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
         ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_configured_cwd(ctx.profile_home)
