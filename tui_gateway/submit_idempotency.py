@@ -20,6 +20,13 @@ on the stored user row, which is never written again. A reply row (even a
 partial one, or a tool call) after it means the turn already had effects, so it
 is not re-run; the record reports ``needs_attention`` instead.
 
+Result receipt (contract v1, t_b1dcb36c): the owned turn writes its terminal
+outcome and the exact ``message.complete`` text onto the same record before it
+emits that frame, so a broker that missed the frame restores the answer from
+``prompt.accepted`` instead of running the turn again. The record is the
+public result; the assistant message id it carries is a reference into the
+history, checked against the stored rows (never the in-memory history).
+
 Every decision about one id runs in one transaction under a PostgreSQL
 advisory transaction lock, so two concurrent requests with the same id
 start at most one turn — across threads and across pods. Off authority the
@@ -40,10 +47,11 @@ import socket
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterator, Optional, Tuple
 
 from hermes_aux_store import (
+    aux_add_columns,
     aux_schema_transaction,
     aux_store_authority,
     aux_xact_lock,
@@ -68,6 +76,29 @@ STATE_COMPLETED = "completed"
 NO_REPLY = "no_reply"  # nothing after the user row: a same-id re-send resumes the turn
 PARTIAL_REPLY = "partial_reply"  # an assistant/tool row follows it: never re-run
 LATER_MESSAGES = "later_messages"  # only later user rows follow it: never re-run
+
+# Turn result receipt. A record accepted before the contract has ``result_contract`` NULL.
+RESULT_CONTRACT = 1
+RESULT_TEXT_MAX = 2 * 1024 * 1024  # UTF-8 bytes of a final text kept inline; longer: "omitted"
+OUTCOME_MISSING = "missing"  # the owned turn ended without a recorded result
+TEXT_NONE = "none"  # the turn produced no message.complete text (exception, refusal, early exit)
+_RESULT_COLUMNS = (
+    ("result_contract", "INTEGER"),
+    ("outcome", "TEXT"),  # complete | error | interrupted | missing
+    ("text_kind", "TEXT"),  # text | empty | none | omitted | unsupported
+    ("final_text", "TEXT"),  # message.complete payload.text verbatim (text / empty only)
+    ("final_sha256", "TEXT"),  # of its UTF-8 bytes
+    ("final_chars", "INTEGER"),
+    ("error_text", "TEXT"),  # outcome error / missing: why
+    ("result_session_id", "TEXT"),  # the session (compression tip) the turn wrote to
+    ("assistant_message_id", "INTEGER"),
+    ("history_ref_kind", "TEXT"),  # exact | inferred | none
+    ("history_persisted", "BOOLEAN"),
+    ("history_text_match", "BOOLEAN"),  # diagnostic: the stored row's content is the final text
+    ("result_attempt", "INTEGER"),
+    ("result_recorded_at", "REAL"),
+)
+_RESULT_META = ", ".join(name for name, _type in _RESULT_COLUMNS if name != "final_text")
 
 # Claim outcomes.
 NEW = "new"
@@ -144,6 +175,7 @@ def _initialize(conn) -> None:
                  PRIMARY KEY (session_key, client_msg_id)
                )"""
         )
+        aux_add_columns(conn, "core_submit_accepts", _RESULT_COLUMNS)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_submit_accepts_msg ON submit_accepts (client_msg_id)"
         )
@@ -293,14 +325,18 @@ class Acceptance:
     completed_at: Optional[float]
     running: bool = False
     needs_attention: Optional[str] = None
+    lineage_root: Optional[str] = None
+    result_row: dict = field(default_factory=dict)  # the result columns read with the record
 
     @property
     def key(self) -> Tuple[str, str]:
         return (self.session_key, self.client_msg_id)
 
-    def payload(self) -> dict:
-        """The wire view (``stored_session_id`` is the session key it was accepted under)."""
-        return {
+    def payload(self, *, result: bool = True, include_text: bool = False) -> dict:
+        """The wire view (``stored_session_id`` is the session key it was accepted under).
+        ``result``: carry the turn result receipt (session-scoped lookups and claims);
+        ``include_text``: with its final text."""
+        data = {
             "client_msg_id": self.client_msg_id,
             "state": self.state,
             "running": self.running,
@@ -310,7 +346,40 @@ class Acceptance:
             "completed_at": self.completed_at,
             "attempts": self.attempts,
             "needs_attention": self.needs_attention,
+            "fingerprint": self.fingerprint,
+            "lineage_root": self.lineage_root,
+            "result_contract": self.result_row.get("result_contract"),
         }
+        if result:
+            data["result"] = self.result_view(include_text=include_text)
+        return data
+
+    def result_view(self, *, include_text: bool = False) -> Optional[dict]:
+        """The recorded result; None before the contract or while no result is recorded."""
+        row = self.result_row
+        if row.get("result_contract") is None or row.get("outcome") is None:
+            return None
+        view = {
+            "contract": row["result_contract"],
+            "attempt": row["result_attempt"],
+            "outcome": row["outcome"],
+            "text_kind": row["text_kind"],
+        }
+        if include_text:
+            view["text"] = row.get("final_text")
+        view.update({
+            "text_sha256": row["final_sha256"],
+            "text_chars": row["final_chars"],
+            "error": row["error_text"],
+            "result_session_id": row["result_session_id"],
+            "assistant_message_id": row["assistant_message_id"],
+            "history_ref_kind": row["history_ref_kind"],
+            "history_persisted": row["history_persisted"],
+            "history_text_match": row["history_text_match"],
+            "recorded_at": row["result_recorded_at"],
+            "expires_at": self.updated_at + RETENTION_SECONDS,
+        })
+        return view
 
 
 @dataclass
@@ -329,13 +398,24 @@ class Claim:
         return self.record.user_message_id if self.outcome == RESUME and self.record else None
 
 
-def _acceptance(row) -> Acceptance:
+def _acceptance(row, *, with_text: bool = False) -> Acceptance:
     values = {name: row[name] for name in _ACCEPT_COLUMNS.split(", ")}
     values["watermark"] = int(values["watermark"] or 0)
     values["attempts"] = int(values["attempts"] or 1)
     if values["user_message_id"] is not None:
         values["user_message_id"] = int(values["user_message_id"])
-    return Acceptance(**values)
+    record = Acceptance(**values)
+    record.result_row = _result_values(row, with_text=with_text)
+    return record
+
+
+def _result_values(row, *, with_text: bool = False) -> dict:
+    names = _RESULT_META.split(", ") + (["final_text"] if with_text else [])
+    return {name: row[name] for name in names}
+
+
+def _record_columns(*, with_text: bool = False) -> str:
+    return f"{_ACCEPT_COLUMNS}, {_RESULT_META}" + (", final_text" if with_text else "")
 
 
 def _lineage_root(conn, session_key: str) -> str:
@@ -346,14 +426,22 @@ def _lineage_root(conn, session_key: str) -> str:
     return ids[-1] if ids else session_key
 
 
-def _find(conn, session_key: str, client_msg_id: str) -> Optional[Acceptance]:
+def _find(conn, session_key: str, client_msg_id: str, *, with_text: bool = False) -> Optional[Acceptance]:
+    """The record of *client_msg_id* anywhere in *session_key*'s conversation: every
+    compression descendant of its root, so a record kept under the tip is found by the
+    root key a broker got at create time (and by every key in between)."""
+    root = _lineage_root(conn, session_key)
     row = conn.execute(
-        _LINEAGE_UP + f"SELECT {_ACCEPT_COLUMNS} FROM submit_accepts "
-        "WHERE client_msg_id = ? AND session_key IN (SELECT id FROM up) "
+        _LINEAGE_DOWN + f"SELECT {_record_columns(with_text=with_text)} FROM submit_accepts "
+        "WHERE client_msg_id = ? AND session_key IN (SELECT id FROM down) "
         "ORDER BY accepted_at LIMIT 1",
-        (session_key, client_msg_id),
+        (root, client_msg_id),
     ).fetchone()
-    return None if row is None else _acceptance(row)
+    if row is None:
+        return None
+    record = _acceptance(row, with_text=with_text)
+    record.lineage_root = root
+    return record
 
 
 def _watermark(conn, session_key: str) -> int:
@@ -413,6 +501,113 @@ def _reconcile(conn, record: Acceptance, now: float) -> Acceptance:
     return record
 
 
+def _receipt_columns(receipt: dict) -> dict:
+    """Map a turn receipt to result columns. The text is the ``message.complete``
+    ``payload.text`` and is stored byte for byte or not at all: a non-string, or a
+    string PostgreSQL TEXT cannot hold (NUL, lone surrogate), is ``unsupported``."""
+    text, kind = receipt.get("text"), receipt.get("text_kind")
+    final = digest = chars = None
+    if kind != TEXT_NONE:
+        try:
+            data = text.encode("utf-8") if isinstance(text, str) else None
+        except UnicodeEncodeError:
+            data = None
+        if data is None:
+            kind = "unsupported"
+        else:
+            digest, chars = hashlib.sha256(data).hexdigest(), len(text)
+            if "\x00" in text:
+                kind = "unsupported"
+            elif len(data) > RESULT_TEXT_MAX:
+                kind = "omitted"
+            else:
+                kind, final = ("empty" if text == "" else "text"), text
+    outcome = receipt.get("outcome")
+    error = receipt.get("error") if outcome in ("error", OUTCOME_MISSING) else None
+    return {
+        "outcome": outcome, "text_kind": kind, "final_text": final, "final_sha256": digest,
+        "final_chars": chars, "error_text": None if error is None else str(error),
+    }
+
+
+def _history_ref(conn, record: Acceptance, assistant_row_id: Optional[int], final_sha256: Optional[str]) -> dict:
+    """The stored assistant row this result refers to, read from the messages table:
+    the id the agent's flush stamped (``exact``), else the last assistant row of the
+    turn — after its user row, before the next one (``inferred``)."""
+    row, kind, message_id = None, "none", None
+    if assistant_row_id is not None:
+        kind, message_id = "exact", int(assistant_row_id)
+        row = conn.execute(
+            "SELECT id, content FROM messages WHERE id = ? AND role = 'assistant'", (message_id,)
+        ).fetchone()
+    elif record.user_message_id is not None:
+        row = conn.execute(
+            _LINEAGE_DOWN + "SELECT m.id, m.content FROM messages m "
+            "WHERE m.session_id IN (SELECT id FROM down) AND m.role = 'assistant' AND m.id > ? "
+            "AND m.id < COALESCE((SELECT MIN(u.id) FROM messages u WHERE u.session_id IN "
+            "(SELECT id FROM down) AND u.role = 'user' AND u.id > ?), 9223372036854775807) "
+            "ORDER BY m.id DESC LIMIT 1",
+            (record.session_key, record.user_message_id, record.user_message_id),
+        ).fetchone()
+        if row is not None:
+            kind, message_id = "inferred", int(row[0])
+    match = None
+    if row is not None and final_sha256 is not None:
+        from hermes_state import SessionDB
+
+        content = SessionDB._decode_content(row[1])
+        match = isinstance(content, str) and (
+            hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest() == final_sha256)
+    return {
+        "assistant_message_id": message_id, "history_ref_kind": kind,
+        "history_persisted": row is not None, "history_text_match": match,
+    }
+
+
+def _store_result(conn, record: Acceptance, receipt: dict, now: float) -> bool:
+    """Write *receipt* as the result of the record's current attempt (owner-fenced; an
+    attempt that already has a result is never overwritten). True when written."""
+    columns = _receipt_columns(receipt)
+    columns.update(_history_ref(conn, record, receipt.get("assistant_row_id"), columns["final_sha256"]))
+    columns["result_session_id"] = receipt.get("result_session_id") or record.session_key
+    names = ("outcome", "text_kind", "final_text", "final_sha256", "final_chars", "error_text",
+             "result_session_id", "assistant_message_id", "history_ref_kind", "history_persisted",
+             "history_text_match")
+    cursor = conn.execute(
+        "UPDATE submit_accepts SET result_contract = ?, "
+        + "".join(f"{name} = ?, " for name in names)
+        + "result_attempt = attempts, result_recorded_at = ?, updated_at = ? "
+        "WHERE session_key = ? AND client_msg_id = ? AND owner = ? "
+        "AND (result_attempt IS NULL OR result_attempt < attempts)",
+        (RESULT_CONTRACT, *(columns[name] for name in names), now, now,
+         record.session_key, record.client_msg_id, OWNER),
+    )
+    return bool(cursor.rowcount)
+
+
+def _same_result(row: dict, receipt: dict) -> bool:
+    columns = _receipt_columns(receipt)
+    return (row.get("outcome"), row.get("final_sha256")) == (columns["outcome"], columns["final_sha256"])
+
+
+def _result_recorded(record: Acceptance) -> bool:
+    attempt = record.result_row.get("result_attempt")
+    return attempt is not None and attempt >= record.attempts
+
+
+def _refresh_history(conn, record: Acceptance) -> None:
+    """Look the result's history reference up once more (the flush may have landed since)."""
+    row = record.result_row
+    exact = row.get("assistant_message_id") if row.get("history_ref_kind") == "exact" else None
+    history = _history_ref(conn, record, exact, row.get("final_sha256"))
+    conn.execute(
+        "UPDATE submit_accepts SET assistant_message_id = ?, history_ref_kind = ?, "
+        "history_persisted = ?, history_text_match = ? WHERE session_key = ? AND client_msg_id = ?",
+        (history["assistant_message_id"], history["history_ref_kind"], history["history_persisted"],
+         history["history_text_match"], record.session_key, record.client_msg_id),
+    )
+
+
 @contextlib.contextmanager
 def _locked(conn, session_key: str, client_msg_id: str) -> Iterator[float]:
     """Transaction holding the id's advisory lock; yields the server clock."""
@@ -462,10 +657,11 @@ def claim_submit(
             if record is None:
                 watermark = _watermark(conn, session_key)
                 conn.execute(
-                    f"INSERT INTO submit_accepts ({_ACCEPT_COLUMNS}) "
-                    "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, NULL)",
+                    f"INSERT INTO submit_accepts ({_ACCEPT_COLUMNS}, result_contract) "
+                    "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, NULL, ?)",
                     (session_key, client_msg_id, text_fingerprint, STATE_ACCEPTED,
-                     ui_session_id or None, watermark, OWNER, now + LEASE_SECONDS, now, now),
+                     ui_session_id or None, watermark, OWNER, now + LEASE_SECONDS, now, now,
+                     RESULT_CONTRACT),
                 )
                 outcome = NEW
                 record = _find(conn, session_key, client_msg_id)
@@ -521,10 +717,70 @@ def release_submit(claim: Claim) -> None:
         conn.close()
 
 
-def finish_submit(claim: Claim) -> Optional[Acceptance]:
+def record_result(claim: Claim, receipt: dict) -> bool:
+    """Record the owned turn's result *receipt* before its ``message.complete`` frame.
+
+    *receipt*: ``outcome`` (``complete`` / ``error`` / ``interrupted``), ``text`` (the
+    frame's ``payload.text``), ``error``, ``result_session_id``, ``assistant_row_id``
+    and, for a turn that produced no frame text, ``text_kind="none"``. One result per
+    attempt: the same result again is a no-op, a different one is logged and dropped.
+    Never raises — a failed write leaves the turn's outcome alone (``finish_submit``
+    writes it, or ``missing``). True when the attempt's result is this receipt.
+    """
+    record = claim.record
+    if record is None or not claim.owns_turn:
+        return False
+    try:
+        conn = open_store()
+        try:
+            with _locked(conn, record.session_key, record.client_msg_id) as now:
+                current = _find(conn, record.session_key, record.client_msg_id)
+                if current is None or current.owner != OWNER or current.attempts != record.attempts:
+                    return False
+                current = _reconcile(conn, current, now)
+                if _result_recorded(current):
+                    if _same_result(current.result_row, receipt):
+                        return True
+                    logger.warning(
+                        "submit idempotency: attempt %d of %r already has a different result; kept",
+                        current.attempts, current.client_msg_id)
+                    return False
+                return _store_result(conn, current, receipt, now)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("submit idempotency: recording the turn result failed", exc_info=True)
+        return False
+
+
+def _settle_result(conn, record: Acceptance, receipt: Optional[dict], now: float) -> None:
+    """``finish_submit``'s part of the result: the attempt ends with a result row — the
+    receipt ``record_result`` could not write, else ``missing`` — and an unpersisted
+    history reference is looked up once more."""
+    if _result_recorded(record):
+        if not record.result_row.get("history_persisted"):
+            _refresh_history(conn, record)
+        return
+    reason = "no_receipt"
+    if receipt is not None:
+        conn.execute("SAVEPOINT submit_result")
+        try:
+            if _store_result(conn, record, receipt, now):
+                conn.execute("RELEASE SAVEPOINT submit_result")
+                return
+        except Exception:
+            logger.warning("submit idempotency: storing the turn result failed", exc_info=True)
+        conn.execute("ROLLBACK TO SAVEPOINT submit_result")
+        reason = "result_store_error"
+    _store_result(conn, record, {"outcome": OUTCOME_MISSING, "text_kind": TEXT_NONE, "error": reason}, now)
+
+
+def finish_submit(claim: Claim, receipt: Optional[dict] = None) -> Optional[Acceptance]:
     """The owned turn ended in this process: ``completed`` when its user row
     exists, else back to ownerless ``accepted`` so a retry runs it once more.
     Fenced on the owner: a record another process reclaimed is left alone.
+    *receipt*: the turn's result, written here when ``record_result`` did not;
+    without one the attempt's result is ``missing``.
     """
     record = claim.record
     if record is None or not claim.owns_turn:
@@ -537,6 +793,10 @@ def finish_submit(claim: Claim) -> Optional[Acceptance]:
             if current is None or current.owner != OWNER:
                 return current
             current = _reconcile(conn, current, now)
+            _settle_result(conn, current, receipt, now)
+            current.result_row = _result_values(conn.execute(
+                f"SELECT {_RESULT_META} FROM submit_accepts WHERE session_key = ? AND client_msg_id = ?",
+                (current.session_key, current.client_msg_id)).fetchone())
             if current.user_message_id is not None:
                 conn.execute(
                     "UPDATE submit_accepts SET state = ?, owner = '', lease_until = 0, "
@@ -556,9 +816,10 @@ def finish_submit(claim: Claim) -> Optional[Acceptance]:
         conn.close()
 
 
-def lookup_submit(client_msg_id: str, session_key: str = "") -> Optional[Acceptance]:
-    """The record for *client_msg_id* (within *session_key*'s lineage when given,
-    else the most recent one of any session), reconciled against the messages."""
+def lookup_submit(client_msg_id: str, session_key: str = "", *, with_text: bool = False) -> Optional[Acceptance]:
+    """The record for *client_msg_id* (anywhere in *session_key*'s conversation when
+    given, else the most recent one of any session), reconciled against the messages.
+    ``with_text``: also read the result's final text (session-scoped lookups only)."""
     conn = open_store()
     try:
         with conn:
@@ -566,14 +827,16 @@ def lookup_submit(client_msg_id: str, session_key: str = "") -> Optional[Accepta
                 root = _lineage_root(conn, session_key)
                 aux_xact_lock(
                     conn, f"submit:{root}\0{client_msg_id}", timeout_seconds=LOCK_TIMEOUT_SECONDS)
-                record = _find(conn, session_key, client_msg_id)
+                record = _find(conn, session_key, client_msg_id, with_text=with_text)
             else:
                 row = conn.execute(
-                    f"SELECT {_ACCEPT_COLUMNS} FROM submit_accepts WHERE client_msg_id = ? "
+                    f"SELECT {_record_columns()} FROM submit_accepts WHERE client_msg_id = ? "
                     "ORDER BY accepted_at DESC LIMIT 1",
                     (client_msg_id,),
                 ).fetchone()
                 record = None if row is None else _acceptance(row)
+                if record is not None:
+                    record.lineage_root = _lineage_root(conn, record.session_key)
             if record is None:
                 return None
             return _reconcile(conn, record, _server_now(conn))

@@ -566,3 +566,230 @@ the base tree; the PostgreSQL-backed files there (`test_routing_pg_authority.py`
 `AGENTS.md` rules were followed (real imports against a temp `HERMES_HOME`, a
 real PostgreSQL, behaviour-contract tests red on the base tree, no new
 `HERMES_*` env var).
+
+## 7. turn result receipt (prompt.accepted result contract v1)
+
+Card `t_b1dcb36c`. Base: `levos/pg3` `951e8a650`. Live (2026-10-01): while
+the broker restarted, a room answer (≈1000 lines) was `completed` on the core
+ledger and stored in the conversation, but the broker missed the turn's
+`message.complete`, expired the task after 600 s and never posted it. This is
+the core provider half (operator decision: core contract first, broker / UI
+recovery afterwards): the existing acceptance record (`submit_accepts`) and
+the existing lookup (`prompt.accepted`) carry the turn's final outcome and its
+exact public text, so the answer is restored without running the turn again.
+No new table, RPC, service or read path; the broker side is a follow-up.
+
+### 7.1 Preconditions (base `951e8a650`)
+
+1. **The agent's flush commits before `run_conversation` returns.** Normal
+   path: `finalize_turn` runs `_persist_step` → `agent._persist_session`
+   (`agent/turn_finalizer.py:477-488`) before `return result` (`:643`);
+   `_persist_session` (`agent/session_persistence.py:296`) →
+   `_flush_messages_to_session_db` (`:338`) → `_db_flush_write` (`:212`) →
+   `SessionDB.append_messages_batch` (`hermes_state_messages.py:364`, one
+   `_execute_write` transaction, committed when it returns). The failure
+   returns persist too (`agent/conversation_loop.py:1041`, `:1082`). But
+   `_guarded_cleanup("persist_session", …)` (`agent/turn_finalizer.py:488`)
+   swallows a failed persist, and the reply can still change after it (file
+   mutation footer, `_explain_abnormal_exit`, output hooks, `:497-511`). So
+   the history is never assumed: `record_result` and `finish_submit` read the
+   `messages` table, `finish_submit` once more when the first read found no row,
+   and `history_text_match` is diagnostic only.
+2. **`_row_id` on the returned assistant dicts: yes.** `_insert_message_rows`
+   stamps `msg["_row_id"] = cur.lastrowid` (`hermes_state_messages.py:514`;
+   PostgreSQL `RETURNING id`, `hermes_state_postgres.py:364-366`) on the dicts
+   `resolve_and_repair_transcript_batch` returns — the batch's own objects
+   (`agent/transcript_repair.py:24-55`) — and `sync_flushed_message_markers`
+   copies it onto the live dicts after the commit
+   (`agent/transcript_repair.py:79-86`, called at
+   `agent/session_persistence.py:223`); `result["messages"]` is that live list
+   (`agent/turn_finalizer.py:541`). The receipt takes the last assistant item
+   after the turn's last user item (`prompt_turn._final_assistant_row_id`), so
+   an earlier turn's reply is never referenced.
+3. **`_emit_terminal_turn_error` frame text** is `partial or f"Error: {message}"`
+   (`tui_gateway/session_auto_continue.py:382`). Its two turn paths (an
+   exception, an agent build failure) record `text_kind: "none"`; the frame
+   text is not used as the final text.
+4. **`ALTER TABLE … ADD COLUMN IF NOT EXISTS` inside `aux_schema_transaction`
+   works** (real PostgreSQL 16.15): `aux_add_columns`
+   (`hermes_aux_store.py:895`, as in `cron/delivery_queue.py:97`) runs in the
+   store's `aux_schema_transaction` (`hermes_aux_store.py:332`, `with conn:` +
+   advisory lock). `test_record_from_before_the_contract_has_no_result` creates
+   the pre-contract table with a row first and finds all 14 columns after the
+   first open; every other test creates the table and then alters it. The
+   core role creates the table itself (same initializer), so it owns it and
+   the ALTER needs no GRANT in code or on the test server. **Production
+   PostgreSQL privileges: not verified** (no production DB access).
+5. **`prompt.accepted`** (`tui_gateway/methods_prompt.py:671`, pool list
+   `tui_gateway/server.py:177`) has no in-repo caller besides the tests. There
+   is no per-session permission check on it: `dispatch` → `handle_request`
+   (`tui_gateway/server.py:757`) → the handler; the boundary is the transport's
+   authentication (WS upgrade credential / stdio). Hidden sessions are a listing
+   filter (`methods_session.py:518-520`; `session.set_hidden`, `:1108`: "stays
+   resumable by its owner"), not an access boundary. With `include_result` the
+   final text is readable by any client of that transport that knows the
+   `client_msg_id` and a key of the conversation — the boundary `session.resume`
+   and the history already have. Left as is.
+6. Image build (`builder-hermes-fork-build`): not applicable (dave).
+
+### 7.2 Columns (`core_submit_accepts`, added by `aux_add_columns`)
+
+| Column | Meaning |
+|---|---|
+| `result_contract` INTEGER | `1` on every record accepted by this code (`RESULT_CONTRACT`); NULL on a record from before. A result write also sets it. |
+| `outcome` TEXT | `complete` / `error` / `interrupted` (the frame's `_result_status`), or `missing` (the attempt ended without a result) |
+| `text_kind` TEXT | `text`, `empty`, `none` (no frame text: exception, context refusal, agent build failure, cancel before ready, missing), `omitted` (over `RESULT_TEXT_MAX` = 2 MiB of UTF-8), `unsupported` (not a string, or a string PostgreSQL TEXT cannot hold: NUL, lone surrogate) |
+| `final_text` TEXT | `message.complete` `payload.text`, byte for byte, for `text` / `empty` only |
+| `final_sha256` TEXT, `final_chars` INTEGER | sha256 of the UTF-8 bytes and `len(str)`; also for `omitted`, and for an `unsupported` string that encodes |
+| `error_text` TEXT | outcome `error`: `payload.error` / the exception / `Context injection refused.` / `agent_init_failed` / `cancelled_before_ready`; outcome `missing`: `no_receipt` or `result_store_error` |
+| `result_session_id` TEXT | `agent.session_id` when the turn ended (the compression tip), else the session key |
+| `assistant_message_id` INTEGER, `history_ref_kind` TEXT | `exact` (the `_row_id` the flush stamped), `inferred` (the last assistant row of the conversation after the turn's user row and before the next user row), `none` |
+| `history_persisted` BOOLEAN | that row exists in `messages` (database read, never the in-memory history) |
+| `history_text_match` BOOLEAN | diagnostic: that row's content has the final text's sha256 (NULL without one) |
+| `result_attempt` INTEGER, `result_recorded_at` REAL | the attempt (`attempts`) the result belongs to; when it was written |
+
+### 7.3 Rules
+
+- **Text**: `final_text == message.complete payload.text` — `_turn_outcome`'s
+  result (the `Error: …` substitution, the interrupt sentinel removed), never
+  reasoning, `rendered`, `warning`, deltas or tool output, never trimmed or
+  normalized (whitespace-only text is kept).
+- **Outcome** is the frame's status (interrupted > error > complete). A failed
+  result write never turns the turn into an error and never stops the frame
+  or the hooks after it.
+- **Order**: result → `message.complete` → `finish_submit` (`completed`). On a
+  v1 record, `state = completed` therefore always has a non-null `outcome`.
+  The cancel-before-ready path emits an `error` event, not `message.complete`;
+  its receipt is written right after it, outside `history_lock`.
+- **One result per attempt**, owner-fenced: `UPDATE … WHERE owner = OWNER AND
+  (result_attempt IS NULL OR result_attempt < attempts)`. The same result again
+  is a no-op; a different one is logged and dropped. A RESTART / RESUME retry
+  is a new attempt and replaces it. While a retry runs, `result.attempt` is the
+  previous attempt's (compare it with `submit.attempts`).
+- **Settle** (`finish_submit(claim, receipt)`, same locked transaction as the
+  state change): no result for this attempt → the receipt (a savepoint), else
+  `missing` (`no_receipt` / `result_store_error`); a recorded result whose row
+  was not found yet → one more history read. `state`, `_reconcile`,
+  `needs_attention`, RESTART / RESUME, `attempts` are unchanged.
+- **Lookup**: `prompt.accepted` writes nothing beyond `_reconcile`'s
+  bookkeeping and starts no session, resume, turn, model or tool. A
+  session-scoped lookup (`session_id`, `stored_session_id` or `session_key`)
+  carries `submit.result`, with `text` only for `include_result: true`; the
+  unscoped lookup (latest record of the id) carries no `result`.
+- **Lineage**: every record lookup (`_find`: claim, settle, record, lookup)
+  searches the whole conversation — every compression descendant of the key's
+  root — a superset of the old ancestor walk, so a record kept under the tip is
+  found by the root key the broker got at create time (R0-2 reversed).
+- **Wire**: `prompt.accepted` adds `result_contract: {"version": 1,
+  "retention_s": 604800}` (on authority); `submit` adds `fingerprint`,
+  `lineage_root`, `result_contract` (the record's value) and `result`. The
+  `prompt.submit` replies that carry the record (`duplicate`, `streaming`,
+  `resumed`, the 4141 conflict) carry the same metadata, never the text. Off
+  authority: `{"enabled": false, "found": false}` as before.
+
+### 7.4 Retention and `found: false`
+
+Unchanged `_prune`: a record untouched for 7 days (`updated_at < now -
+RETENTION_SECONDS`) is deleted with its result. `result.expires_at =
+updated_at + RETENTION_SECONDS`. There is no tombstone: `found: false` does not
+tell "never accepted" from "expired".
+
+### 7.5 `prompt.accepted` responses (test output, verbatim)
+
+Printed by the tests with `json.dumps` (`pytest -s`, the `D1B-RESPONSE`
+lines of `tests/tui_gateway/test_submit_idempotency_pg.py`), copied unchanged.
+`include_result: true` throughout.
+
+complete (real AIAgent turn, exact history reference):
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "9f00f01bd26d4cbcb4fa53c000a21f52", "state": "completed", "running": false, "stored_session_id": "20261001_045655_f6dbf9", "user_message_id": 1, "accepted_at": 1790830616.637247, "completed_at": 1790830617.226261, "attempts": 1, "needs_attention": null, "fingerprint": "0ef40ff94a13d726ae9e929aad3cfb264fc52b42260fe0a598b66d717fed8686", "lineage_root": "20261001_045655_f6dbf9", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "complete", "text_kind": "text", "text": "The answer is 42.", "text_sha256": "97b38b2ebda1ca4cf4ea291005d97d07c7053db2aed3ef866c04b49ecfb3448d", "text_chars": 17, "error": null, "result_session_id": "20261001_045655_f6dbf9", "assistant_message_id": 2, "history_ref_kind": "exact", "history_persisted": true, "history_text_match": true, "recorded_at": 1790830617.030951, "expires_at": 1791435417.226261}}, "found": true}
+```
+
+empty (complete with `""`):
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "b67e124103bc4ac1a96e778c5e3a8ac8", "state": "completed", "running": false, "stored_session_id": "20261001_045659_fbbb71", "user_message_id": 6, "accepted_at": 1790830619.66606, "completed_at": 1790830619.980845, "attempts": 1, "needs_attention": null, "fingerprint": "fbeb23cdb5675ad2106624f92b8ccc19e2a4630fd4a9a7eb2af8e4ce5627fbbc", "lineage_root": "20261001_045659_fbbb71", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "complete", "text_kind": "empty", "text": "", "text_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "text_chars": 0, "error": null, "result_session_id": "20261001_045659_fbbb71", "assistant_message_id": 7, "history_ref_kind": "exact", "history_persisted": true, "history_text_match": true, "recorded_at": 1790830619.835196, "expires_at": 1791435419.980845}}, "found": true}
+```
+
+error (returned error; the frame text is `Error: …`):
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "d390c4e4479e41d498b901f85b215a21", "state": "completed", "running": false, "stored_session_id": "20261001_045657_00a23b", "user_message_id": 3, "accepted_at": 1790830617.934862, "completed_at": 1790830618.263974, "attempts": 1, "needs_attention": null, "fingerprint": "d9cb5c4c2859dfb263d8f5cf4507e1f94e5ff78637b40c7438eac4a27ccce562", "lineage_root": "20261001_045657_00a23b", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "error", "text_kind": "text", "text": "Error: provider exploded", "text_sha256": "2c1aaa54e6338f5c5bd825749a03f29160fc1a9611361e9a0398d94de4c0ca19", "text_chars": 24, "error": "provider exploded", "result_session_id": "20261001_045657_00a23b", "assistant_message_id": null, "history_ref_kind": "none", "history_persisted": false, "history_text_match": null, "recorded_at": 1790830618.109672, "expires_at": 1791435418.263974}}, "found": true}
+```
+
+interrupted:
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "d329e68cb90c4bf88621dbbfe9f2bf4c", "state": "completed", "running": false, "stored_session_id": "20261001_045658_afe552", "user_message_id": 4, "accepted_at": 1790830618.796607, "completed_at": 1790830619.137016, "attempts": 1, "needs_attention": null, "fingerprint": "a0c523df47b4600a43fb5c19affb542be26b5a7ed292e6766ddf0a412e7fd504", "lineage_root": "20261001_045658_afe552", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "interrupted", "text_kind": "text", "text": "half an answer", "text_sha256": "4768e8ba8660d178558e951b3c0448fe99a7babd80863bb0d0fb960916b141c4", "text_chars": 14, "error": null, "result_session_id": "20261001_045658_afe552", "assistant_message_id": 5, "history_ref_kind": "exact", "history_persisted": true, "history_text_match": true, "recorded_at": 1790830618.969226, "expires_at": 1791435419.137016}}, "found": true}
+```
+
+missing (the turn reported no result):
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "a10f43c46da747f78d818b2a3120c8af", "state": "completed", "running": false, "stored_session_id": "20261001_045700_7a4c6f", "user_message_id": 8, "accepted_at": 1790830620.187664, "completed_at": 1790830620.264703, "attempts": 1, "needs_attention": null, "fingerprint": "3705ec416bec6fc77441cc7e2e4bdcb35ce6e8bfebcdf40ca032477473f1200c", "lineage_root": "20261001_045700_7a4c6f", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "missing", "text_kind": "none", "text": null, "text_sha256": null, "text_chars": null, "error": "no_receipt", "result_session_id": "20261001_045700_7a4c6f", "assistant_message_id": null, "history_ref_kind": "none", "history_persisted": false, "history_text_match": null, "recorded_at": 1790830620.264703, "expires_at": 1791435420.264703}}, "found": true}
+```
+
+record from before the contract:
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "0d866cb2492a495781daf4857eb67b9f", "state": "completed", "running": false, "stored_session_id": "20261001_045700_a289e3", "user_message_id": 1, "accepted_at": 1.0, "completed_at": 2.0, "attempts": 1, "needs_attention": null, "fingerprint": "fp", "lineage_root": "20261001_045700_a289e3", "result_contract": null, "result": null}, "found": true}
+```
+
+compression lineage (kept under the tip, looked up by the root key):
+
+```json
+{"enabled": true, "result_contract": {"version": 1, "retention_s": 604800}, "submit": {"client_msg_id": "f88e40cebe5e4cfe8336af045cc2d472", "state": "completed", "running": false, "stored_session_id": "d1btip_dfb2bd6f", "user_message_id": 10, "accepted_at": 1790830620.491027, "completed_at": 1790830620.631582, "attempts": 1, "needs_attention": null, "fingerprint": "ac883578df3f319d7a21609f3f95e723ddf074c6ddccd83cb80a715d220e81aa", "lineage_root": "d1broot_ea98043e", "result_contract": 1, "result": {"contract": 1, "attempt": 1, "outcome": "complete", "text_kind": "text", "text": "compressed reply", "text_sha256": "fa306b67b3426775a9c8d7ff2c787e9d8a4887459e6a2bcca8d78b4cf9804bb8", "text_chars": 16, "error": null, "result_session_id": "d1btip_dfb2bd6f", "assistant_message_id": 11, "history_ref_kind": "exact", "history_persisted": true, "history_text_match": true, "recorded_at": 1790830620.569077, "expires_at": 1791435420.631582}}, "found": true}
+```
+
+### 7.6 Tests and verification (2026-10-01, real PostgreSQL 16.15, `PG3_PERCENT_PG_BIN`)
+
+`tests/tui_gateway/test_submit_idempotency_pg.py` keeps its 15 tests (the
+`FakeTurns` stand-in takes the new `result_callback` keyword and can hand it a
+receipt; ①'s exact `prompt.accepted` equality now includes `result_contract`)
+and adds 20 on the same `authority` / `postgres_dsn` fixtures:
+
+| Test | Contract |
+|---|---|
+| `test_completed_turn_result_is_restored_from_prompt_accepted` (T1, T6) | real AIAgent turn: every column, `text == message.complete text == stored row`, exact row id; result committed before the frame (state still `persisted` then); no `text` without `include_result`; no `result` unscoped; a lookup runs no turn |
+| `test_returned_turn_outcome_is_recorded_as_its_frame` ×3 (T2) | `error` (text `Error: provider exploded`), `interrupted`, `empty` |
+| `test_turn_without_frame_text_records_why` ×4 (T2) | exception, context refusal, agent build failure, cancel before ready: `text_kind: none` + the cause |
+| `test_turn_without_a_receipt_is_missing` (T2) | `missing` / `no_receipt`, `completed` unchanged |
+| `test_history_reference_is_read_from_the_messages_table` (T3) | none / exact-but-absent / inferred after the settle's second read / stored text differs |
+| `test_result_kept_under_the_tip_is_found_by_the_root_key` (T4) | root-key lookup finds the tip's record; a root-key re-send is a duplicate |
+| `test_final_text_kinds` ×4 (T5) | over 2 MiB of UTF-8 (fewer chars) → `omitted`; not a string, NUL → `unsupported`; whitespace kept |
+| `test_result_store_failure_falls_back_at_settle` (T6) | a failed write: the frame goes out, the settle writes the receipt; failing again → `missing` / `result_store_error` |
+| `test_resumed_attempt_replaces_the_dead_attempts_result`, `test_restarted_attempt_replaces_the_result_and_an_attempt_keeps_its_first` (T7) | RESUME / RESTART replace it (`attempt` 2); one attempt keeps its first result |
+| `test_pruned_result_is_not_found_and_state_fields_are_unchanged` (T8) | duplicate reply's `status`/`state`/`running`/`needs_attention` as before; after the 7-day prune `found: false` |
+| `test_record_from_before_the_contract_has_no_result` | pre-contract table + row: columns added, `result_contract`/`result` null |
+
+`tests/tui_gateway/test_r0_d1b_probe.py` is opsi's R0 probe with each assertion
+reversed. On the base tree (`951e8a650`, probe file copied in) all three fail:
+
+```
+test_r0_accepted_shape_has_the_result_contract:  >  assert res["result_contract"] == {"version": 1, "retention_s": 604800}  E  KeyError: 'result_contract'
+test_r0_completed_without_reply_row_says_so:  >  assert res["result"]["history_persisted"] is False  E  KeyError: 'result'
+test_r0_compression_lineage_root_lookup_finds_the_tip_record:  >  assert by_root["found"] is True  E  assert False is True
+```
+
+No-regression sweep (one file per run, no xdist, the head tree's run finished
+before the base tree's started): the 34 `tests/tui_gateway` files that touch
+the prompt / submit / turn paths, plus `tests/test_lazy_session_regressions.py`,
+`tests/test_tui_gateway_queue_on_busy.py` and `tests/test_tui_gateway_server.py`
+(they stub `_run_prompt_submit`). Every file has the same result on both trees
+except `test_submit_idempotency_pg.py` (15 → 35 passed); the only failures are
+three in `tests/test_tui_gateway_server.py`
+(`test_config_set_model_recovers_failed_profile_resume_after_build_completes` ×2,
+`test_get_db_degrades_cleanly_when_sessiondb_init_fails`), identical on the base
+tree.
+
+**Not tested / not verified**: ALTER privileges of the production core role
+(no production DB access); a real broker reading the receipt (out of scope);
+a model provider or a real compression rotating `agent.session_id` mid-turn
+(the tip key is exercised through stored rows); two pods racing the first ALTER
+(the advisory schema lock serializes them, not exercised here).
+
+`docs/quality/rule-index.md` is still absent in this repository; the root
+`AGENTS.md` rules were followed (real imports and a real PostgreSQL,
+behaviour-contract tests red on the base tree, extend existing code — no new
+table, RPC or `HERMES_*` variable).

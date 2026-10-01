@@ -475,16 +475,26 @@ def _release_unstarted_turn(session):
         _release_active_session_slot(session)
 
 
+def _early_turn_result(session, result_callback, error):
+    """Result receipt of a turn that ended before the agent ran (no frame text)."""
+    if result_callback is not None:
+        result_callback(
+            outcome="error", text="", error=error, text_kind="none",
+            result_session_id=session.get("session_key"))
+
+
 def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None,
-                           stored_user_row=None):
+                           stored_user_row=None, result_callback=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run. ``stored_user_row``: a resumed ``client_msg_id``
-    turn answers that stored user row instead of writing one."""
+    turn answers that stored user row instead of writing one. ``result_callback``: receives
+    the turn's result receipt once, before its terminal frame (``_run_prompt_submit``)."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
     err = _wait_agent_for_prompt(session, rid, sid)
     if err:
+        _early_turn_result(session, result_callback, "agent_init_failed")
         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
         # the only way resume shows this to a disconnected client.
         _emit_terminal_turn_error(
@@ -496,7 +506,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
         _emit("session.info", sid, _session_info(session.get("agent"), session))
         return
     with session["history_lock"]:
-        if session.get("_turn_cancel_requested") or not session.get("running"):
+        cancelled = session.get("_turn_cancel_requested") or not session.get("running")
+        if cancelled:
             session["running"] = False
             _clear_inflight_turn(session)
             # Without this emit the turn vanishes silently after {"status": "streaming"}.
@@ -504,11 +515,14 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
                 "Turn cancelled before the agent was ready"
                 if session.get("_turn_cancel_requested")
                 else "Session no longer running before the agent was ready")})
-            return
+    if cancelled:
+        # No message.complete on this path; the receipt is written outside history_lock.
+        _early_turn_result(session, result_callback, "cancelled_before_ready")
+        return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
         terminal_callback=hosted_terminal_callback, turn_author=turn_author,
-        stored_user_row=stored_user_row)
+        stored_user_row=stored_user_row, result_callback=result_callback)
 
 
 _TRUNCATION_PARAMS = (
@@ -642,17 +656,26 @@ def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_ter
     """Turn thread body for a claimed ``client_msg_id``: run the turn (a resumed claim on
     its stored user row), wait for the agent thread it hands off to, then settle the
     record (``completed`` once the user row exists, else ownerless ``accepted`` so a retry
-    runs the turn once more)."""
+    runs the turn once more). The turn's result receipt is recorded before its terminal
+    frame; the settle writes it again if that failed, or ``missing`` if none came."""
     from tui_gateway import submit_idempotency
+    holder: dict = {}
+
+    def result_callback(**receipt):
+        holder["receipt"] = receipt
+        holder["recorded"] = submit_idempotency.record_result(claim, receipt)
+
     try:
         _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
-                               stored_user_row=claim.stored_user_row)
+                               stored_user_row=claim.stored_user_row, result_callback=result_callback)
         turn_thread = session.get("_run_thread")
         if turn_thread is not None and turn_thread is not threading.current_thread():
             turn_thread.join()
     finally:
+        if "receipt" in holder and not holder["recorded"]:
+            logger.info("prompt.submit: client_msg_id %r result is written at settle", claim.record.client_msg_id)
         try:
-            submit_idempotency.finish_submit(claim)
+            submit_idempotency.finish_submit(claim, holder.get("receipt"))
         except Exception:
             logger.warning("prompt.submit: settling client_msg_id record failed", exc_info=True)
 
@@ -672,7 +695,12 @@ def _accepted_session_key(params) -> str:
 def _(rid, params: dict) -> dict:
     """Acceptance record of a client request id, for a broker to ask before re-sending a
     parked message (``client_msg_id``) or re-creating a session (``client_create_id``).
-    Off PostgreSQL authority the ids are not recorded: ``{"enabled": false}``."""
+    Off PostgreSQL authority the ids are not recorded: ``{"enabled": false}``.
+
+    A session-scoped submit lookup carries the turn result receipt (``submit.result``;
+    its final text only with ``include_result: true``), so a broker that missed the
+    turn's terminal frame restores the answer without running it again. Read-only
+    apart from the record's own bookkeeping: no session, resume, turn or tool runs."""
     from tui_gateway import submit_idempotency as idem
     msg_raw, create_raw = params.get("client_msg_id"), params.get("client_create_id")
     if msg_raw is None and create_raw is None:
@@ -680,11 +708,17 @@ def _(rid, params: dict) -> dict:
     try:
         if not idem.active():
             return _ok(rid, {"enabled": False, "found": False})
-        result: dict = {"enabled": True}
+        result: dict = {
+            "enabled": True,
+            "result_contract": {"version": idem.RESULT_CONTRACT, "retention_s": idem.RETENTION_SECONDS}}
         if msg_raw is not None:
+            # The latest record of any session (no scope) is not this caller's result to read.
+            session_key = _accepted_session_key(params)
+            include_text = bool(session_key) and params.get("include_result") is True
             record = idem.lookup_submit(
-                idem.normalize_client_id(msg_raw, "client_msg_id"), _accepted_session_key(params))
-            result["submit"] = None if record is None else record.payload()
+                idem.normalize_client_id(msg_raw, "client_msg_id"), session_key, with_text=include_text)
+            result["submit"] = None if record is None else record.payload(
+                result=bool(session_key), include_text=include_text)
         if create_raw is not None:
             created = idem.lookup_create(
                 _create_request_profile(params), idem.normalize_client_id(create_raw, "client_create_id"))

@@ -430,6 +430,39 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    result_callback: Any = None  # client_msg_id result receipt (methods_prompt._run_claimed_submit)
+    result_reported: bool = False
+
+
+def _final_assistant_row_id(result: Any) -> int | None:
+    """The stored row id of this turn's last assistant message (stamped by the agent's flush);
+    only messages after the turn's user message count, so an earlier turn's reply never does."""
+    messages = result.get("messages") if isinstance(result, dict) else None
+    for message in reversed(messages if isinstance(messages, list) else []):
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "user":
+            return None
+        if role == "assistant":
+            row_id = message.get("_row_id")
+            return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
+    return None
+
+
+def _report_turn_result(session: dict, st: _TurnRun, outcome: str, text: Any, error: Any, *,
+                        text_kind: str | None = None, assistant_row_id: int | None = None) -> None:
+    """Hand the turn's result receipt to ``st.result_callback`` once, before the terminal frame.
+    A failure is logged and never changes the turn (its frame, hooks and outcome go on).
+    Callers check ``st.result_callback`` first: a turn without one runs no receipt code."""
+    if st.result_reported:
+        return
+    st.result_reported = True
+    try:
+        st.result_callback(
+            outcome=outcome, text=text, error=error, text_kind=text_kind,
+            result_session_id=getattr(st.agent, "session_id", None) or session.get("session_key"),
+            assistant_row_id=assistant_row_id)
+    except Exception:
+        logger.warning("turn result receipt failed", exc_info=True)
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
@@ -721,6 +754,8 @@ def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseExcept
     print(f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
     # A finalizer exception can leave in-memory history at the turn-start snapshot.
     _restore_agent_history_after_turn_error(session, st.agent)
+    if st.result_callback is not None:
+        _report_turn_result(session, st, "error", "", str(e), text_kind="none")
     if st.terminal_callback is not None and not st.receipt_attempted:
         st.receipt_attempted = True
         try:
@@ -818,7 +853,10 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, stored_user_row: int | None = None) -> bool:
+    turn_author: dict | None = None, stored_user_row: int | None = None,
+    result_callback: Callable[..., None] | None = None) -> bool:
+    """``result_callback``: the turn's result receipt (outcome, the ``message.complete``
+    text, error, session, assistant row id), once, before that frame is emitted."""
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -847,11 +885,14 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
+        st.result_callback = result_callback
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
         goal_followup = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
+                if st.result_callback is not None:
+                    _report_turn_result(session, st, "error", "", "Context injection refused.", text_kind="none")
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
                     st.terminal_callback({
@@ -865,6 +906,10 @@ def _run_prompt_submit(
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
+            if st.result_callback is not None:
+                _report_turn_result(
+                    session, st, status, raw, payload.get("error"),
+                    assistant_row_id=_final_assistant_row_id(st.result))
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
             if status == "complete":
