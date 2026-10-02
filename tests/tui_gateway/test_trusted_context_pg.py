@@ -321,7 +321,21 @@ def test_delegate_child_does_not_inherit_the_ticket(authority, probe, monkeypatc
     db, _turns, sids = authority
     ticket = _ticket()
     delegate_def = {"type": "function", "function": registry.get_schema("delegate_task")}
-    room = Room(db, sids, monkeypatch, Model([("delegate_task", {"goal": "look it up"})]),
+    live_during_child: list = []
+
+    class ParentModel(Model):
+        """The parent's follow-up request waits for the child's probe call, so the child
+        runs while the parent's ticket is still registered (a background delegation would
+        otherwise let the parent turn end first and make the check vacuous)."""
+
+        def __call__(self, **kwargs):
+            if kwargs["messages"][-1].get("role") == "tool":
+                _await(lambda: probe.tokens("child"), "the delegate child's tool call")
+                live_during_child.append(
+                    any(tc.token == ticket for tc in trusted_context._by_turn.values()))
+            return super().__call__(**kwargs)
+
+    room = Room(db, sids, monkeypatch, ParentModel([("delegate_task", {"goal": "look it up"})]),
                 tools=(_PROBE_DEF, delegate_def))
     child_model = Model([(PROBE, {"label": "child"})])
     real_build = delegate_tool._build_child_agent
@@ -338,6 +352,9 @@ def test_delegate_child_does_not_inherit_the_ticket(authority, probe, monkeypatc
     assert room.submit("delegate it", ticket)["result"]["status"] == "streaming"
     room.settle()
     assert child_model.requests, "the child never ran"
+    # Only the ticketed turn's own follow-up counts: a later turn (the background delegation's
+    # completion notice) runs without a ticket by design.
+    assert live_during_child[:1] == [True], "the child did not run inside the ticketed turn"
     # The child's model stand-in may be re-asked and call the probe more than once; every
     # call must read nothing.
     assert probe.tokens("child") and set(probe.tokens("child")) == {None}
