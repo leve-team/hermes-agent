@@ -239,7 +239,10 @@ def all_logs(caplog):
 
 
 def _log_text(caplog) -> str:
-    return "\n".join(
+    # caplog.text is formatted when each record was emitted, as a real log handler writes it;
+    # getMessage() re-renders args later (a params dict logged before the pop would no
+    # longer show the ticket).
+    return caplog.text + "\n" + "\n".join(
         f"{record.getMessage()} {record.exc_text or ''} {record.args!r}" for record in caplog.records)
 
 
@@ -335,7 +338,9 @@ def test_delegate_child_does_not_inherit_the_ticket(authority, probe, monkeypatc
     assert room.submit("delegate it", ticket)["result"]["status"] == "streaming"
     room.settle()
     assert child_model.requests, "the child never ran"
-    assert probe.tokens("child") == [None]
+    # The child's model stand-in may be re-asked and call the probe more than once; every
+    # call must read nothing.
+    assert probe.tokens("child") and set(probe.tokens("child")) == {None}
     room.assert_turn_released()
 
 
