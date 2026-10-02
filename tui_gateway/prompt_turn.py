@@ -851,15 +851,26 @@ def _reopen_routed_session_row(db, sid: str, session: dict) -> None:
         logger.debug("routing-provenance reopen failed for %s", session_id, exc_info=True)
 
 
+def _release_trusted_context(agent) -> None:
+    """End of a ticketed turn, on every exit and first in its ``finally``: the agent holds
+    no ticket and the turn table none for this turn."""
+    from tools.trusted_context import unregister
+    agent._pending_trusted_context = None
+    agent._current_trusted_context = None
+    unregister(getattr(agent, "_current_turn_id", None))
+
+
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None, stored_user_row: int | None = None,
-    result_callback: Callable[..., None] | None = None) -> bool:
+    result_callback: Callable[..., None] | None = None, trusted_context=None) -> bool:
     """``result_callback``: the turn's result receipt (outcome, the ``message.complete``
-    text, error, session, assistant row id), once, before that frame is emitted."""
+    text, error, session, assistant row id), once, before that frame is emitted.
+    ``trusted_context``: the submit's turn ticket (``prompt.submit`` only; synthesized
+    turns pass none); readable by this turn's tool handlers, released in ``finally``."""
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -903,6 +914,9 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
+            if trusted_context is not None:
+                # Consumed once by _bind_turn_identity, which registers it under the turn id.
+                st.agent._pending_trusted_context = trusted_context
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, stored_user_row)
@@ -923,6 +937,8 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if trusted_context is not None:
+                _release_trusted_context(st.agent)
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)

@@ -805,7 +805,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
                   *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
-    dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    # _trusted_turn_id: registry.dispatch binds that turn's trusted context around the handler
+    # (the turn id lives only here; a ContextVar would follow delegate children).
+    dispatch_kwargs: Dict[str, Any] = {
+        "task_id": ids.task_id, "session_id": ids.session_id, "_trusted_turn_id": ids.turn_id}
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.

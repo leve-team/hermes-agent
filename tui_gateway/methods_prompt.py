@@ -484,11 +484,12 @@ def _early_turn_result(session, result_callback, error):
 
 
 def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None,
-                           stored_user_row=None, result_callback=None):
+                           stored_user_row=None, result_callback=None, trusted_context=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run. ``stored_user_row``: a resumed ``client_msg_id``
     turn answers that stored user row instead of writing one. ``result_callback``: receives
-    the turn's result receipt once, before its terminal frame (``_run_prompt_submit``)."""
+    the turn's result receipt once, before its terminal frame (``_run_prompt_submit``).
+    ``trusted_context``: the submit's turn ticket, for this turn's tool handlers only."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
@@ -522,7 +523,25 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
         terminal_callback=hosted_terminal_callback, turn_author=turn_author,
-        stored_user_row=stored_user_row, result_callback=result_callback)
+        stored_user_row=stored_user_row, result_callback=result_callback,
+        **_trusted_context_kwargs(trusted_context))
+
+
+def _take_trusted_context(params):
+    """Pop the broker's ``_levos_turn`` ticket off ``params`` and wrap it (None unless a
+    non-empty string). Popped before anything reads ``params``: no log, record, reply or
+    compute-host dispatch of this submit may hold the raw value."""
+    raw = params.pop("_levos_turn", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    from tools.trusted_context import TrustedContext
+    return TrustedContext(raw)
+
+
+def _trusted_context_kwargs(trusted_context) -> dict:
+    """Only a ticketed turn passes ``trusted_context=``: an unticketed submit calls the turn
+    functions exactly as before."""
+    return {} if trusted_context is None else {"trusted_context": trusted_context}
 
 
 _TRUNCATION_PARAMS = (
@@ -652,7 +671,8 @@ def _release_submit_claim(claim):
         logger.warning("prompt.submit: releasing client_msg_id claim failed", exc_info=True)
 
 
-def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author):
+def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+                        trusted_context=None):
     """Turn thread body for a claimed ``client_msg_id``: run the turn (a resumed claim on
     its stored user row), wait for the agent thread it hands off to, then settle the
     record (``completed`` once the user row exists, else ownerless ``accepted`` so a retry
@@ -667,7 +687,8 @@ def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_ter
 
     try:
         _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
-                               stored_user_row=claim.stored_user_row, result_callback=result_callback)
+                               stored_user_row=claim.stored_user_row, result_callback=result_callback,
+                               **_trusted_context_kwargs(trusted_context))
         turn_thread = session.get("_run_thread")
         if turn_thread is not None and turn_thread is not threading.current_thread():
             turn_thread.join()
@@ -739,6 +760,9 @@ _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
+    # The broker's user-authority ticket (``_levos_turn``): off ``params`` before anything
+    # else reads them; only this turn's tool handlers see it (tools.trusted_context).
+    trusted_context = _take_trusted_context(params)
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
@@ -813,6 +837,8 @@ def _(rid, params: dict) -> dict:
     # finished between the two acquisitions, retry the claim rather than strand this
     # prompt in a queue whose drain already ran.  An id-carrying submit skips this: the
     # steer/redirect/queue it would get are in-memory, so its claim refuses a busy session.
+    # A busy/queued submit drops its ticket: the steer joins a turn that has its own, and a
+    # queued prompt runs later as a turn of no submit.
     while client_msg_id is None:
         with session["history_lock"]:
             if not session.get("running"):
@@ -841,6 +867,9 @@ def _(rid, params: dict) -> dict:
             return reply
         survivor_fields = {}
     if turn_isolation:
+        # A compute-host turn (and its inline fallback) runs without the ticket: it is never
+        # sent to another process.
+        trusted_context = None
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
                          turn_author.get("id"))
@@ -871,12 +900,14 @@ def _(rid, params: dict) -> dict:
     if claim is None:
         run_thread = threading.Thread(
             target=lambda: _run_after_agent_ready(
-                rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+                rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+                **_trusted_context_kwargs(trusted_context)),
             daemon=True)
     else:
         run_thread = threading.Thread(
             target=lambda: _run_claimed_submit(
-                claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+                claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+                **_trusted_context_kwargs(trusted_context)),
             daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

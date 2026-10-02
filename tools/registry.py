@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 from hermes_constants import hermes_home_key
+from tools import trusted_context
 
 logger = logging.getLogger(__name__)
 
@@ -808,18 +809,26 @@ class ToolRegistry:
             error_type="tool_result_contract", tool=name, result_type=result_type)
 
     def dispatch(
-        self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+        self, name: str, args: dict, *, scope: Optional[str] = None,
+        _trusted_turn_id: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
-        results normalized, every exception returned as ``{"error": ...}``."""
+        results normalized, every exception returned as ``{"error": ...}``.
+        ``_trusted_turn_id``: the calling turn; its trusted context (if any) is
+        ``trusted_context.current()`` on this thread while the handler runs. Never passed
+        to the handler (most handlers take no ``**kwargs``)."""
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
+            previous = trusted_context._bind(trusted_context.lookup(_trusted_turn_id))
+            try:
+                if entry.is_async:
+                    from model_tools import _run_async
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
+            finally:
+                trusted_context._reset(previous)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

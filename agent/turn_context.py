@@ -475,6 +475,14 @@ def _bind_turn_identity(
     )
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
+    # A prompt.submit ticket staged for THIS turn only: consumed here so neither the next
+    # turn nor a child agent finds it; tool handlers reach it through the turn id.
+    trusted = getattr(agent, "_pending_trusted_context", None)
+    agent._pending_trusted_context = None
+    agent._current_trusted_context = trusted
+    if trusted is not None:
+        from tools.trusted_context import register
+        register(turn_id, trusted)
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist
     # (concurrent turns interleave transcript writes). Cleared in _persist_session.

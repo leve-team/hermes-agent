@@ -943,3 +943,110 @@ under the same owner id; a room conversation compressed under an earlier core
 and resumed by its tip key (not the key `session.create` gave): its rows say
 `tui`, so it is not recognised as a room; `./scripts/check` (absent on
 `levos/pg3`, see the card report).
+
+## 8. turn trusted context (`_levos_turn`)
+
+Card `t_74963c68` (P2 ④), on `3b95e040`. In P2 a Liv tool reads Company Brain
+with the user's authority: the broker attaches a short-lived turn ticket (a JWT
+string) to each user `prompt.submit` as `params["_levos_turn"]`, and the
+core keeps it for that turn's tool handlers only. No flag, setting or
+environment variable: a submit without the key (every submit today) runs
+exactly as before.
+
+**Accepted at.** The first statement of the `prompt.submit` handler
+(`_take_trusted_context`) pops the key off `params` and wraps a non-empty string
+in `tools.trusted_context.TrustedContext`; any other value is dropped. Every
+later reader of `params` — the submit record, the compute-host dispatch, logs,
+the reply — sees no key, including a refused submit (unknown session, a
+client-forged author). No other method accepts the key (`session.steer`,
+`session.redirect`, … are unchanged; it stays an unknown param there).
+
+**Lifetime: turn start → the turn's `finally`.** The handler passes it as
+`trusted_context=` through the turn thread (`_run_after_agent_ready` /
+`_run_claimed_submit`) to `_run_prompt_submit`, only when there is one — an
+unticketed submit calls those functions with the same arguments as before.
+`run()` stages it on the agent (`_pending_trusted_context`) right before
+`run_conversation`; `_bind_turn_identity` consumes the staged value once
+(pending → `_current_trusted_context`, pending cleared, as with
+`_relay_pending_turn_id`) and registers it under the turn id. A tool call of
+the turn reaches it by that id: `model_tools._execute_tool` passes
+`_trusted_turn_id=ids.turn_id` to `registry.dispatch`, which binds
+`lookup(turn id)` on the calling thread for the handler call and restores the
+previous binding in a `finally`. The reserved keyword is a parameter of
+`dispatch`, never forwarded to the handler (most handlers take no `**kwargs`).
+The first thing `run()`'s `finally` does on every exit (completed, raised,
+interrupted) is to clear both agent attributes and unregister the turn id.
+
+**Consumer API.** `tools.trusted_context.current()` — the ticket
+(`.token`) inside a tool handler of a ticketed turn, else `None`. A handler
+dispatched without a turn id (`ctx.dispatch_tool`, `execute_code`'s RPC tools,
+a nested `registry.dispatch` from a handler) sees `None`; an `async` handler
+sees it when its coroutine runs on the dispatching thread (a turn's tool
+worker) and `None` when `_run_async` has to move it to a fresh thread (called
+from inside a running event loop).
+
+**Never exposed.** The value is not written to the conversation history
+(PostgreSQL `messages`), a transcript, the system prompt, the model's input
+(`text` or messages), a log record, an event frame sent to a client, the RPC
+reply, the submit's `core_submit_accepts` row or the compute host.
+`TrustedContext` renders as `<redacted>` (`repr`, `str`, f-strings), compares
+by identity and refuses pickle and copy (`TypeError`: a pickled or copied
+ticket is one the turn's `finally` cannot take back).
+
+**Dropped (the turn's `current()` is `None`).**
+- A busy session (steer / queued / interrupt-and-queue): the steer joins a turn
+  that has its own ticket, and a queued prompt runs later as a turn of no
+  submit.
+- A compute-host turn, and its inline fallback when the dispatch fails: the
+  ticket is never sent to another process.
+- Turns that call `_run_prompt_submit` themselves — auto-continue, queued-prompt
+  drains, goal / loop follow-ups, wake-ups, synthesized turns — pass none.
+
+**Not inherited.** Thread-local plus a turn-id table, deliberately not a
+ContextVar: tool pools (`tools/daemon_pool.py`) and delegate children
+(`delegate_tool_child_run`, `copy_context().run`) copy contextvars. A
+`delegate_task` child runs under its own turn id, so its handlers find
+nothing; `delegate_task` itself is an inline tool and never runs inside a
+binding. A background, cron or gateway turn never registers one.
+
+**Tests.** `tests/tools/test_trusted_context.py` (the accessor through a real
+`ToolRegistry`) and `tests/tui_gateway/test_trusted_context_pg.py` (a real
+PostgreSQL authority store, the real turn thread and a real AIAgent whose
+model is a stand-in calling a real registered tool whose handler takes no
+`**kwargs`):
+
+| Test | Contract |
+|---|---|
+| `test_ticket_reaches_only_the_turns_tool_handlers` (C-10, C-11) | the handler reads the ticket on the sequential path and on both workers of a parallel batch (a barrier holds them in flight together); after each dispatch nothing is bound on its thread; no table of the store (`messages`, `sessions`, the `core_submit_accepts` row), no file under `HERMES_HOME`, model request, system prompt, client frame, RPC reply, log record (every logger at DEBUG) or the session record holds it |
+| `test_turn_end_releases_the_ticket` ×2 (C-11) | a turn that raised after its tools ran, a turn interrupted inside its tool: no ticket on the agent, the turn table empty (the completed turn: the test above) |
+| `test_delegate_child_does_not_inherit_the_ticket` (C-12) | a real `delegate_task` child of the ticketed turn: its handler reads `None` |
+| `test_queued_turn_behind_a_ticketed_turn_reads_nothing` (C-12) | a ticketed `queued=True` submit to a busy session: reply `queued`, the drained turn reads `None`, its ticket in no log, frame or session record |
+| `test_background_and_cron_turns_read_nothing` (C-12) | a cron-platform AIAgent turn running while the ticket is registered, then an auto-continue `_run_prompt_submit`: both read `None` |
+| `test_submit_without_the_key_reads_nothing` (C-13) | no key, `""`, blanks, a number, a dict: `None` |
+| `test_refused_submit_takes_the_ticket_off_its_params` (C-10) | unknown session, client-forged `_turn_author`: the key is gone from `params`, the ticket is not in the error reply or a log |
+| `test_compute_host_turn_drops_the_ticket` | the compute-host dispatch receives no ticket; nothing registered |
+
+`docs/quality/rule-index.md` is still absent in this repository; the root
+`AGENTS.md` rules were followed (extend existing code — no new RPC, table or
+`HERMES_*` variable; tests of behaviour through the real registry and turn
+path; no source-reading tests).
+
+**Verification (2026-10-02, the implementing worker).** The worker had no
+PostgreSQL (no `initdb` / `pg_ctl`, `PG3_PERCENT_PG_BIN` unset, no `psycopg`), so
+`test_trusted_context_pg.py` — like the other `*_pg.py` files — was **not run on
+PostgreSQL here**. Its bodies were run unchanged against a SQLite store (a local
+copy swapping only the `authority` fixture and the store dump; the
+`core_submit_accepts` row and the claimed-submit path are PostgreSQL-only and
+were therefore not exercised): 9 passed; on the tree with `tools/trusted_context.py`
+but without the wiring the same copy failed 8 of 8 (`assert '_levos_turn' not in
+{… '_levos_turn': 'TKT-…'}`). `test_trusted_context.py`: 9 passed (base: `ImportError:
+cannot import name 'trusted_context' from 'tools'`). Mutations, each reverted:
+no release in the turn's `finally` → the turn table keeps the ticket
+(`assert {'…': <redacted>} == {}`); no `_reset` in `dispatch` → the ticket stays
+bound after the handler; the pop moved below `_sess_nowait` → a refused submit
+keeps `_levos_turn` in its params; `_trusted_turn_id` passed to the handler →
+`got an unexpected keyword argument '_trusted_turn_id'`. No-regression sweep, one
+file per run, head then base: 46 files (the prompt / submit / turn files of
+`tests/tui_gateway`, `tests/test_tui_gateway_{server,queue_on_busy}.py`,
+`tests/test_lazy_session_regressions.py`, the registry / `model_tools` dispatch
+tests) — identical results on both trees.
