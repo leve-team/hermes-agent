@@ -1,0 +1,49 @@
+{
+  "base_note": "모든 경로는 levos/pg3(ead5725) 기준이다. 현재 작업 브랜치(main 기준)에는 tool_progress.py/hermes_state_messages.py/prompt_turn.py 가 없어 구현 불가 — levos/pg3 base 브랜치와 반영 경로 확인 전 구현·머지 금지(design.md 0절).",
+  "needs_replan": true,
+  "replan_reason": "작업 브랜치 base 가 main 이라 대상 파일이 존재하지 않음. levos/pg3 를 base 로 한 브랜치 재생성 및 배포(landing) 경로 지원이 필요 — 현재 미지원으로 차단.",
+  "files": [
+    "tui_gateway/tool_progress.py",
+    "tui_gateway/prompt_turn.py",
+    "hermes_state_messages.py",
+    "tests/tui_gateway/test_tool_duration_persist.py",
+    "tests/hermes_state/test_tool_duration_metadata.py",
+    "tests/fixtures/tool_duration_contract.json",
+    "docs/tool-duration-contract.md"
+  ],
+  "tests": [
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_parallel_same_name_calls_isolated_by_tool_call_id", "asserts": "같은 이름 병렬 2건의 start/complete 를 교차 순서로 호출하면 pending 과 tool.complete duration_s 가 각 tool_call_id 의 실제 경과값으로 분리된다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_zero_second_duration_recorded", "asserts": "monotonic 고정 시 duration 0.0 이 pending 과 payload 에 0.0 으로 기록된다(결측으로 취급되지 않음)"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_failed_result_duration_recorded", "asserts": "에러 결과 문자열로 완료돼도 duration 이 기록되고 결과 payload 는 기존과 동일"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_missing_start_records_nothing", "asserts": "start 없이 complete 만 오면 payload 에 duration_s 키가 없고 pending 에도 없다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_duplicate_complete_first_wins", "asserts": "같은 tool_call_id 두 번째 complete 는 pending 값을 바꾸지 않고 duration_s 를 싣지 않는다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_other_session_start_not_matched", "asserts": "sid A 의 start 는 sid B 의 같은 tool_call_id complete 와 매칭되지 않는다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_unfinished_call_not_persisted_as_zero", "asserts": "start 만 있고 complete 가 없으면 턴 종료 처리 후에도 set_tool_call_durations 에 해당 id 가 전달되지 않는다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_pending_recorded_when_tool_progress_off", "asserts": "tool_progress off 로 이벤트가 emit 되지 않아도 pending 에 duration 이 기록된다"},
+    {"path": "tests/tui_gateway/test_tool_duration_persist.py", "name": "test_absorb_turn_flushes_pending_and_keeps_unmatched", "asserts": "_absorb_turn_result 가 agent._session_db.set_tool_call_durations 를 현재 session_id 로 호출하고, 적용된 id 만 pending 에서 제거하며 DB 예외는 턴을 실패시키지 않는다"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_set_durations_merges_into_tool_row_display_metadata", "asserts": "role=tool 행의 display_metadata.tool_duration_s 에 값이 들어가고 기존 reactions 키는 보존, content/api_content 불변"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_first_wins_and_invalid_values_rejected", "asserts": "이미 값이 있으면 덮어쓰지 않고, NaN/inf/음수/비문자 id 는 무시되며 반환 집합에서 빠진다"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_other_session_rows_untouched", "asserts": "다른 session_id 의 같은 tool_call_id 행은 변경되지 않는다"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_reopen_returns_same_value", "asserts": "저장 후 SessionDB close → 새 인스턴스로 재오픈하면 get_tool_call_durations 와 get_messages 의 display_metadata 값이 동일"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_archive_and_compact_preserves_duration", "asserts": "archive_and_compact(메모리 dict 재삽입 + watermark 꼬리 복제) 후 active tool 행에 동일 tool_duration_s, content·display identity 동일, 호출자 dict 불변"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_replace_messages_preserves_duration", "asserts": "replace_messages 후에도 같은 tool_call_id tool 행에 동일 값, 내용 동일"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_legacy_rows_stay_missing", "asserts": "키 없는 과거 tool 행은 압축/재작성 후에도 키가 없다(0 이나 null 로 채우지 않음)"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_conversation_content_has_no_duration_text", "asserts": "get_messages_as_conversation 의 tool 메시지 content 가 저장 전과 동일하고 시간 문자열이 섞이지 않는다"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_contract_fixture_roundtrip", "asserts": "tests/fixtures/tool_duration_contract.json 의 각 사례(정상/0초/결측/거부값)가 저장→조회 왕복에서 기대값(값 또는 키 없음)과 일치"},
+    {"path": "tests/hermes_state/test_tool_duration_metadata.py", "name": "test_postgres_backend_parity", "asserts": "기존 cross-backend PG 하네스(가용 시)에서 set/get/압축 보존 결과가 SQLite 와 동일; PG 미가용 시 기존 하네스 규칙대로 처리(새 skip 추가 금지)"}
+  ],
+  "chunks": [
+    {
+      "name": "state-store",
+      "files": ["hermes_state_messages.py", "tests/hermes_state/test_tool_duration_metadata.py", "tests/fixtures/tool_duration_contract.json", "docs/tool-duration-contract.md"],
+      "tests": ["test_set_durations_merges_into_tool_row_display_metadata", "test_first_wins_and_invalid_values_rejected", "test_other_session_rows_untouched", "test_reopen_returns_same_value", "test_archive_and_compact_preserves_duration", "test_replace_messages_preserves_duration", "test_legacy_rows_stay_missing", "test_conversation_content_has_no_duration_text", "test_contract_fixture_roundtrip", "test_postgres_backend_parity"]
+    },
+    {
+      "name": "gateway-instrumentation",
+      "files": ["tui_gateway/tool_progress.py", "tui_gateway/prompt_turn.py", "tests/tui_gateway/test_tool_duration_persist.py"],
+      "tests": ["test_parallel_same_name_calls_isolated_by_tool_call_id", "test_zero_second_duration_recorded", "test_failed_result_duration_recorded", "test_missing_start_records_nothing", "test_duplicate_complete_first_wins", "test_other_session_start_not_matched", "test_unfinished_call_not_persisted_as_zero", "test_pending_recorded_when_tool_progress_off", "test_absorb_turn_flushes_pending_and_keeps_unmatched"]
+    }
+  ],
+  "notes": "state-store 가 SessionDB.set_tool_call_durations/get_tool_call_durations 공개 인터페이스를 소유하고, gateway-instrumentation 은 그 시그니처만 사용(테스트는 fake db)한다. 파일 겹침 없음.",
+  "budget": {"iterations": 4}
+}
