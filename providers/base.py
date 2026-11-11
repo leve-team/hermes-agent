@@ -78,6 +78,20 @@ class ProviderProfile:
     # top-level fields rather than ignoring them.
     supports_prompt_cache_key: bool = False
 
+    # External-process launch contract (backported from 0.21).
+    process_command: str = ""
+    process_args: tuple = ()
+    process_command_env_vars: tuple = ()
+    process_args_env_var: str = ""
+
+    def create_client(self, **client_kwargs: Any) -> Any | None:
+        """Supply an OpenAI-shaped client, or None for the standard HTTP client.
+
+        Accept unknown kwargs for forward compatibility. External-process
+        providers must return a client: they cannot fall through to HTTP.
+        """
+        return None
+
     # ── Model catalog ─────────────────────────────────────────
     # fallback_models: curated list shown in /model picker when live fetch fails.
     # Only agentic models that support tool calling should appear here.

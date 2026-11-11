@@ -12,6 +12,10 @@ from providers.base import ProviderProfile
 class CopilotACPProfile(ProviderProfile):
     """GitHub Copilot ACP — external process, no REST models endpoint."""
 
+    def create_client(self, **client_kwargs):
+        from agent.copilot_acp_client import CopilotACPClient
+        return CopilotACPClient(**client_kwargs)
+
     def fetch_models(
         self,
         *,
@@ -30,6 +34,10 @@ copilot_acp = CopilotACPProfile(
     env_vars=(),  # Managed by ACP subprocess
     base_url="acp://copilot",  # ACP internal scheme
     auth_type="external_process",
+    process_command="copilot",
+    process_args=("--acp", "--stdio"),
+    process_command_env_vars=("HERMES_COPILOT_ACP_COMMAND", "COPILOT_CLI_PATH"),
+    process_args_env_var="HERMES_COPILOT_ACP_ARGS",
 )
 
 register_provider(copilot_acp)

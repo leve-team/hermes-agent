@@ -5522,6 +5522,14 @@ class AIAgent:
             if cache["client"] is client:
                 cache["poisoned"] = True
         try:
+            # Process clients have no httpx sockets to shutdown. Their public
+            # close() must be idempotent/thread-safe and cancel active children.
+            # Keep the FD-safe stranger-thread path unchanged for HTTP clients.
+            from providers import get_provider_profile
+            profile = get_provider_profile(getattr(self, "provider", ""))
+            if profile is not None and profile.auth_type == "external_process":
+                client.close()
+                return
             shutdown_count = self._force_close_tcp_sockets(client)
             # tcp_force_closed=0 means the stranger-thread abort found no
             # sockets to shut down — the worker stays blocked in recv and the
