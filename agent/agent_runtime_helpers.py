@@ -2490,6 +2490,41 @@ def anthropic_prompt_cache_policy(
 
 
 
+def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
+    """0.21 provider factory seam, fail-closed for non-HTTP providers.
+
+    A broken process factory must not silently send a request to an HTTP
+    fallback. Ordinary HTTP profiles retain the standard construction path.
+    """
+    from providers import get_provider_profile, list_providers
+
+    name = getattr(agent, "provider", "") or ""
+    profile = get_provider_profile(name)
+    base_url = str(client_kwargs.get("base_url") or "").rstrip("/")
+    if profile is None and base_url:
+        for candidate in list_providers():
+            own = str(candidate.base_url or "").rstrip("/")
+            if own and (base_url == own or base_url.startswith(own + "/")):
+                profile = candidate
+                break
+    external = profile is not None and profile.auth_type == "external_process"
+    process_url = base_url.startswith(("process://", "acp://", "acp+tcp://"))
+    if profile is not None:
+        factory = getattr(profile, "create_client", None)
+        try:
+            client = factory(**client_kwargs) if callable(factory) else None
+        except Exception as exc:
+            if external or process_url:
+                raise RuntimeError(f"Provider {profile.name!r} create_client failed") from exc
+            _ra().logger.warning("Provider %r client factory failed; using standard client", name, exc_info=True)
+            return None
+        if client is not None:
+            return client
+    if external or process_url:
+        raise RuntimeError(f"Provider {name!r} requires a callable create_client returning a client")
+    return None
+
+
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
@@ -2518,17 +2553,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-        from agent.copilot_acp_client import CopilotACPClient
-
-        client = CopilotACPClient(**client_kwargs)
-        _ra().logger.info(
-            "Copilot ACP client created (%s, shared=%s) %s",
-            reason,
-            shared,
-            agent._client_log_context(),
-        )
-        return client
+    provider_client = _provider_supplied_client(agent, client_kwargs)
+    if provider_client is not None:
+        return provider_client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

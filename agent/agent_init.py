@@ -641,6 +641,20 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Local process providers own authentication; direct AIAgent callers need
+    # the same launch resolution as CLI/gateway callers, never an HTTP key lookup.
+    from providers import get_provider_profile as _get_process_profile
+    _process_profile = _get_process_profile((provider or "").strip().lower())
+    if (_process_profile is not None and _process_profile.auth_type == "external_process"
+            and not (api_key and base_url)):
+        from hermes_cli.auth import resolve_external_process_provider_credentials
+        _process_creds = resolve_external_process_provider_credentials(_process_profile.name)
+        api_key = api_key or _process_creds["api_key"]
+        base_url = base_url or _process_creds["base_url"]
+        command = command or _process_creds["command"]
+        if args is None:
+            args = _process_creds["args"]
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
@@ -1280,7 +1294,9 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            from providers import get_provider_profile as _client_profile
+            _process_profile = _client_profile(agent.provider)
+            if _process_profile is not None and _process_profile.auth_type == "external_process":
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url

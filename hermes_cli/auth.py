@@ -571,6 +571,14 @@ try:
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
             continue
+        if _pp.auth_type == "external_process":
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name, name=_pp.display_name or _pp.name,
+                auth_type="external_process", inference_base_url=_pp.base_url,
+            )
+            for _alias in _pp.aliases:
+                PROVIDER_REGISTRY.setdefault(_alias, PROVIDER_REGISTRY[_pp.name])
+            continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
         # Skip providers that need custom token resolution or are special-cased
@@ -2329,6 +2337,8 @@ def resolve_provider(
         return "openrouter"
     if normalized == "custom":
         return "custom"
+    if normalized not in PROVIDER_REGISTRY:
+        _register_external_process_provider(normalized)
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -7325,23 +7335,13 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
 
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
-    """Status snapshot for providers that run a local subprocess."""
+    """Structural availability only; the subprocess owns actual authentication."""
+    _register_external_process_provider(provider_id)
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    resolved_command = shutil.which(command) if command else None
+    command, args, base_url, resolved_command, _ = _external_process_spec(pconfig)
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
@@ -7351,6 +7351,8 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         "resolved_command": resolved_command,
         "base_url": base_url,
         "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "auth_verified": False,
+        "auth_source": None,
     }
 
 
@@ -7371,7 +7373,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    _register_external_process_provider(target)
+    if getattr(PROVIDER_REGISTRY.get(target), "auth_type", None) == "external_process":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7547,8 +7550,39 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _register_external_process_provider(provider_id: str) -> None:
+    """Support profiles registered after auth module import without changing HTTP auth."""
+    if provider_id in PROVIDER_REGISTRY:
+        return
+    from providers import get_provider_profile
+    profile = get_provider_profile(provider_id)
+    if profile is not None and profile.auth_type == "external_process":
+        config = ProviderConfig(id=profile.name, name=profile.display_name or profile.name,
+                                auth_type="external_process", inference_base_url=profile.base_url)
+        PROVIDER_REGISTRY.setdefault(profile.name, config)
+        for alias in profile.aliases:
+            PROVIDER_REGISTRY.setdefault(alias, config)
+
+
+def _external_process_spec(pconfig: ProviderConfig):
+    """0.21 launch contract: profile defaults overridden by its declared env names."""
+    from providers import get_provider_profile
+    profile = get_provider_profile(pconfig.id)
+    base_url = (os.getenv(pconfig.base_url_env_var, "").strip()
+                if pconfig.base_url_env_var else "") or pconfig.inference_base_url
+    command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
+    command = (next((os.getenv(var, "").strip() for var in command_env_vars
+                     if os.getenv(var, "").strip()), "")
+               or str(getattr(profile, "process_command", "") or ""))
+    args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
+    raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
+    args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
+    return command, args, base_url, shutil.which(command) if command else None, command_env_vars
+
+
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
     """Resolve runtime details for local subprocess-backed providers."""
+    _register_external_process_provider(provider_id)
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         raise AuthError(
@@ -7557,29 +7591,18 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+    command, args, base_url, resolved_command, command_env_vars = _external_process_spec(pconfig)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            f"Could not find the '{provider_id}' CLI command '{command or '(none configured)'}'. "
+            + ("Install it or set " + "/".join(command_env_vars) if command_env_vars else "Install it."),
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_copilot_cli" if provider_id == "copilot-acp" else "missing_external_process_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": pconfig.id or provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
