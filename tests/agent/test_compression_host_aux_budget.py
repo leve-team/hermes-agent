@@ -10,12 +10,16 @@ import pytest
 
 @pytest.mark.parametrize("idle,ceiling,aux", [
     (120, 600, 120), (90, 30, 420), (800, 900, 420),
-    (0, 600, 700), (-1, 600, 700),
+    (0, 600, 700), (-1, 600, 700), (90, 0, 120), (90, -1, 120),
+    (120, 600, float("inf")),
 ])
 def test_host_wait_covers_real_auxiliary_budget(idle, ceiling, aux):
+    import math
     # Real config loaders and imports; only the provider I/O is replaced.
     from agent.auxiliary_client import _effective_aux_timeout, call_llm
-    from agent.conversation_compression import resolve_context_compression_timeouts
+    from agent.conversation_compression import (
+        DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS, resolve_context_compression_timeouts,
+    )
 
     home = Path(os.environ["HERMES_HOME"])
     (home / "config.yaml").write_text(json.dumps({
@@ -39,8 +43,9 @@ def test_host_wait_covers_real_auxiliary_budget(idle, ceiling, aux):
     assert effective >= aux
     host_idle, host_ceiling = resolve_context_compression_timeouts()
     if idle > 0:
-        assert host_idle == max(idle, effective)
-        assert host_ceiling == max(ceiling, host_idle)
+        # An unbounded auxiliary config must not remove the finite host deadline.
+        assert host_idle == (max(idle, effective) if math.isfinite(effective) else idle)
+        assert host_ceiling == max(ceiling if ceiling > 0 else DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS, host_idle)
     else:
         assert (host_idle, host_ceiling) == (idle, ceiling)
 

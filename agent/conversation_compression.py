@@ -702,7 +702,7 @@ def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None)
         # the summary call's full budget before the host sees progress.
         from agent.auxiliary_client import _effective_aux_timeout
         aux_budget = float(_effective_aux_timeout("compression", None))
-        if aux_budget > 0:
+        if math.isfinite(aux_budget) and aux_budget > 0:
             idle = max(idle, aux_budget)
             ceiling = max(ceiling, idle)
     return idle, ceiling
@@ -723,12 +723,40 @@ def request_exceeds_model_window(agent: Any, request_tokens: Any) -> Optional[bo
         return None
     if isinstance(request_tokens, bool) or not isinstance(request_tokens, int) or request_tokens < 0:
         return None
-    reserve = 0
-    for value in (
+    reservations = [
         getattr(compressor, "max_tokens", None),
         getattr(agent, "max_tokens", None),
         getattr(agent, "_ephemeral_max_output_tokens", None),
-    ):
+    ]
+    # Some transports supply a cap even when agent.max_tokens is unset. Read
+    # their existing resolvers, without building a request (which consumes
+    # one-shot overrides and may mutate prompt-cache state).
+    mode = getattr(agent, "api_mode", None)
+    model = getattr(agent, "model", "")
+    try:
+        if mode == "anthropic_messages":
+            from agent.anthropic_adapter import _resolve_anthropic_messages_max_tokens
+            cap = _resolve_anthropic_messages_max_tokens(reservations[2] or reservations[1], model)
+            reservations.append(max(window - 1, 1) if cap > window else cap)
+        if mode == "chat_completions":
+            from providers import get_provider_profile
+            from agent.transports.chat_completions import _raise_gemini_thinking_max_tokens
+            cap = reservations[2] if reservations[2] is not None else reservations[1]
+            if cap is None:
+                profile = get_provider_profile(getattr(agent, "provider", ""))
+                cap = profile.get_max_tokens(model) if profile else None
+            if cap is not None:
+                cap = _raise_gemini_thinking_max_tokens(model, getattr(agent, "reasoning_config", None), cap)
+            reservations.append(cap)
+    except Exception:
+        logger.debug("Cannot resolve output reservation after compression timeout", exc_info=True)
+        return None
+    overrides = getattr(agent, "request_overrides", None) or {}
+    if not isinstance(overrides, dict):
+        return None
+    reservations.extend(overrides.get(key) for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"))
+    reserve = 0
+    for value in reservations:
         if value is None:
             continue
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

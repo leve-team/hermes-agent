@@ -1,0 +1,19 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 2 test files (~7 tests) under ['tests/agent/test_compression_host_aux_budget.py', 'tests/agent/test_auxiliary_compression_timeout_floor.py']; running with -j 2
+[ 71.4% |     5/~7 | ✓5 | ✗0] ✓ tests/agent/test_auxiliary_compression_timeout_floor.py (5✓, 2.9s)
+[100.0% |     7/~7 | ✓14 | ✗ 0] ✓ tests/agent/test_compression_host_aux_budget.py (9✓, 3.4s)
+
+=== Summary: 2 files, 14 tests passed, 0 failed (100% complete) in 3.4s (2 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 6.3s  (runner wall: 3.4s, parallelism: 2x)
+  P50: 3.39s  P90: 3.39s  P95: 3.39s  P99: 3.39s  Max: 3.39s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      3.39s  tests/agent/test_compression_host_aux_budget.py
+      2.93s  tests/agent/test_auxiliary_compression_timeout_floor.py

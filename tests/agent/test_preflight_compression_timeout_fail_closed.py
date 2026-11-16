@@ -53,3 +53,31 @@ def test_timeout_resume_requires_known_input_window(tokens, window, reserve, all
             _fail_closed_after_preflight_timeout(agent, tokens)
     # Continuing a request must never erase the failed compression outcome.
     assert agent._last_compression_timed_out is True
+
+
+@pytest.mark.parametrize("mode,provider,model,requested,reasoning", [
+    ("chat_completions", "nvidia", "probe-model", None, None),
+    ("anthropic_messages", "anthropic", "claude-sonnet-4-5", None, None),
+    ("chat_completions", "gemini", "gemini-2.5-pro", 1000, {"enabled": True, "effort": "high"}),
+])
+def test_timeout_fit_accounts_for_cap_added_by_real_transport(mode, provider, model, requested, reasoning):
+    from agent.conversation_compression import request_exceeds_model_window
+    from agent.transports.anthropic import AnthropicTransport
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from providers import get_provider_profile
+
+    transport = AnthropicTransport() if mode == "anthropic_messages" else ChatCompletionsTransport()
+    kwargs = transport.build_kwargs(
+        model, [{"role": "user", "content": "test"}],
+        max_tokens=requested, reasoning_config=reasoning, context_length=900_000,
+        provider_profile=get_provider_profile(provider),
+        max_tokens_param_fn=lambda value: {"max_tokens": value},
+    )
+    actual_cap = kwargs["max_tokens"]
+    assert actual_cap > (requested or 0)
+    agent = SimpleNamespace(
+        api_mode=mode, provider=provider, model=model, max_tokens=requested, reasoning_config=reasoning,
+        context_compressor=SimpleNamespace(context_length=900_000, max_tokens=requested),
+    )
+    assert request_exceeds_model_window(agent, 900_000 - actual_cap) is False
+    assert request_exceeds_model_window(agent, 900_000 - actual_cap + 1) is True

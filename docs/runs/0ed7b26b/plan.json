@@ -5,13 +5,44 @@
   "upstream_revision": "4162ecf11f611400fa6e5c42d2f360188ce50b39",
   "goal": "Align positive host compression budgets with the existing auxiliary budget and resume only requests proven within the model input window after timeout.",
   "steps": [
-    {"name": "Trace fork and pinned upstream contracts", "status": "complete"},
-    {"name": "Add red budget/config and turn-start/pre-API behavior tests", "status": "in_progress"},
-    {"name": "Port minimal timeout floor and shared window predicate with fork output reservation", "status": "pending"},
-    {"name": "Run relevant canonical regressions and isolated real-import HTTP probe", "status": "pending"},
-    {"name": "Commit immutable candidate, declare gates, request managed verification and levos/pg3 merge", "status": "pending"}
+    {
+      "name": "Trace fork and pinned upstream contracts",
+      "status": "complete"
+    },
+    {
+      "name": "Add red budget/config and turn-start/pre-API behavior tests",
+      "status": "complete"
+    },
+    {
+      "name": "Port minimal timeout floor and shared window predicate with fork output reservation",
+      "status": "complete"
+    },
+    {
+      "name": "Run relevant canonical regressions and isolated real-import HTTP probe",
+      "status": "complete"
+    },
+    {
+      "name": "Commit immutable candidate, declare gates, request managed verification and levos/pg3 merge",
+      "status": "in_progress"
+    }
   ],
-  "scope": ["agent/conversation_compression.py", "agent/turn_context.py", "agent/turn_context_compaction.py", "agent/turn_preflight.py", "tests/agent/", "tests/run_agent/", "docs/runs/0ed7b26b/"],
-  "constraints": ["No upstream wholesale upgrade", "Preserve PostgreSQL authority, cancellation fences, locks, cooldown, prompt cache and role order", "No deployment claim from merge alone"],
-  "validation_rationale": "Compile/import the changed Python core, then canonical file-isolated behavior tests covering both entry points, provider overflow, timeout lifecycle and unchanged transcript/late commit invariants. Use a local HTTP provider and isolated HERMES_HOME for an actual SDK/turn-loop request. No image build is required before merge; deployment belongs to the subsequent Dave operational path."
+  "scope": [
+    "agent/conversation_compression.py",
+    "agent/turn_context.py",
+    "agent/turn_context_compaction.py",
+    "agent/turn_preflight.py",
+    "tests/agent/",
+    "tests/run_agent/",
+    "docs/runs/0ed7b26b/"
+  ],
+  "constraints": [
+    "No upstream wholesale upgrade",
+    "Preserve PostgreSQL authority, cancellation fences, locks, cooldown, prompt cache and role order",
+    "No deployment claim from merge alone"
+  ],
+  "validation_rationale": "Compile/import the changed Python core, then canonical file-isolated behavior tests covering both entry points, provider overflow, timeout lifecycle and unchanged transcript/late commit invariants. Use a local HTTP provider and isolated HERMES_HOME for an actual SDK/turn-loop request. No image build is required before merge; deployment belongs to the subsequent Dave operational path. The required behavior gate collects the 29 relevant files already exercised in focused local groups; the runner owns the combined candidate execution. The HTTP live probe is the same real SDK/fenced-worker scenario served on loopback after both entry paths pass. Verification bootstrap installs pinned test-only packages in a disposable venv if the runtime lacks a development venv.",
+  "remaining": [
+    "Immutable candidate verification by managed runner",
+    "Merge to levos/pg3; downstream Dave deployment is post-merge"
+  ]
 }
