@@ -1,0 +1,23 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 4 test files (~10 tests) under ['tests/agent/test_preflight_compression_timeout_fail_closed.py', 'tests/run_agent/test_compression_timeout_terminal.py', 'tests/run_agent/test_compression_timeout_http.py', 'tests/agent/test_compression_host_aux_budget.py']; running with -j 2
+[ 40.0% |     4/~10 | ✓19 | ✗ 0] ✓ tests/agent/test_preflight_compression_timeout_fail_closed.py (19✓, 1.2s)
+[ 60.0% |     6/~10 | ✓25 | ✗ 0] ✓ tests/agent/test_compression_host_aux_budget.py (6✓, 3.1s)
+[ 70.0% |     7/~10 | ✓27 | ✗ 0] ✓ tests/run_agent/test_compression_timeout_http.py (2✓, 5.3s)
+[100.0% |    10/~10 | ✓39 | ✗ 0] ✓ tests/run_agent/test_compression_timeout_terminal.py (12✓, 5.1s)
+
+=== Summary: 4 files, 39 tests passed, 0 failed (100% complete) in 8.2s (2 workers) ===
+  Durations cached to test_durations.json (4 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   4
+  Total subprocess CPU-wall: 14.8s  (runner wall: 8.2s, parallelism: 2x)
+  P50: 5.13s  P90: 5.33s  P95: 5.33s  P99: 5.33s  Max: 5.33s
+  <1s: 0 files (0%)  <2s: 1 files (25%)
+  Top 10 slowest:
+      5.33s  tests/run_agent/test_compression_timeout_http.py
+      5.13s  tests/run_agent/test_compression_timeout_terminal.py
+      3.09s  tests/agent/test_compression_host_aux_budget.py
+      1.20s  tests/agent/test_preflight_compression_timeout_fail_closed.py

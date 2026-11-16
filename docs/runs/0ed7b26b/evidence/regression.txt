@@ -1,0 +1,20 @@
+Condensed development run output; failures retained, no PASS inferred.
+Full output SHA-256: 6febbcdea110e4f3331c0b3ac664fe1003ffb80ddd9c3a831895e6a8b769b6ae
+[ 11.2% |    10/~89 | ✓10 | ✗ 0] ✓ tests/agent/test_compression_attempt_ownership.py (10✓, 0.9s)
+[ 14.6% |    13/~89 | ✓13 | ✗ 0] ✓ tests/agent/test_compression_fallback_budget.py (3✓, 3.0s)
+[ 18.0% |    16/~89 | ✓16 | ✗ 0] ✓ tests/agent/test_compression_attempt_telemetry.py (3✓, 3.1s)
+[ 20.2% |    18/~89 | ✓22 | ✗ 0] ✓ tests/agent/test_compression_host_aux_budget.py (6✓, 3.4s)
+[ 28.1% |    25/~89 | ✓29 | ✗ 0] ✓ tests/agent/test_compression_interrupt_protection.py (7✓, 2.7s)
+[ 37.1% |    33/~89 | ✓37 | ✗ 0] ✓ tests/agent/test_native_preflight_estimate.py (8✓, 0.9s)
+[ 39.3% |    35/~89 | ✓39 | ✗ 0] ✓ tests/agent/test_preflight_lock_defer.py (2✓, 1.8s)
+[ 55.1% |    49/~89 | ✓53 | ✗ 0] ✓ tests/agent/test_usage_anchor.py (14✓, 2.2s)
+[ 67.4% |    60/~89 | ✓64 | ✗ 0] ✓ tests/agent/test_compression_stall_interrupt_96775.py (11✓, 12.2s)
+[ 71.9% |    64/~89 | ✓74 | ✗ 0] ✓ tests/run_agent/test_compression_budget_refund.py (10✓, 6.1s)
+[ 79.8% |    71/~89 | ✓81 | ✗ 0] ✓ tests/run_agent/test_compression_lock_defer.py (7✓, 3.7s)
+[ 84.3% |    75/~89 | ✓85 | ✗ 0] ✓ tests/agent/test_compression_worker_isolation_76354.py (4✓, 17.9s)
+[ 85.4% |    76/~89 | ✓85 | ✗ 2] ✗ tests/run_agent/test_compression_timeout_http.py (2✗, 5.8s)
+[ 86.5% |    77/~89 | ✓86 | ✗ 2] ✓ tests/run_agent/test_preflight_compression_cap_e2e.py (1✓, 4.2s)
+[100.0% |    89/~89 | ✓ 98 | ✗  2] ✓ tests/run_agent/test_compression_persistence.py (12✓, 11.9s)
+=== Summary: 15 files, 98 tests passed, 2 failed (100% complete) in 28.6s (3 workers) ===
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[turn_start]
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[pre_api]

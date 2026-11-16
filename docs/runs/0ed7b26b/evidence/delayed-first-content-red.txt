@@ -1,0 +1,120 @@
+▶ no local venv — using Nix dev venv via HERMES_PYTHON: /tmp/lr-_y8lv8nu/.venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 1 test files (~2 tests) under ['tests/agent/test_compression_host_aux_budget.py']; running with -j 1
+[100.0% |     2/~2 | ✓0 | ✗1] ✗ tests/agent/test_compression_host_aux_budget.py (1✗, 1.5s)
+
+  ╔╍ Failed: tests/agent/test_compression_host_aux_budget.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║             timer.start()
+  ║             try:
+  ║                 assert release.wait(5)
+  ║                 fence.touch_progress()
+  ║                 committed.append(fence.begin_commit())
+  ║                 if committed[-1]:
+  ║                     fence.finish_commit()
+  ║                 return summary, "stable system"
+  ║             finally:
+  ║                 timer.cancel()
+  ║                 timer.join(5)
+  ║                 finished.set()
+  ║     
+  ║         try:
+  ║             result = run_compress_context_with_progress_timeout(
+  ║                 worker=worker, messages=original, system_prompt_fallback="stable system",
+  ║                 idle_timeout_seconds=idle, total_ceiling_seconds=ceiling,
+  ║             )
+  ║ >           assert result == (summary, "stable system")
+  ║ E           AssertionError: assert ([{'content':...table system') == ([{'content':...table system')
+  ║ E             
+  ║ E             At index 0 diff: [{'role': 'user', 'content': 'original'}] != [{'role': 'assistant', 'content': 'summary'}]
+  ║ E             Use -v to get more diff
+  ║ 
+  ║ tests/agent/test_compression_host_aux_budget.py:94: AssertionError
+  ║ ------------------------------ Captured log call -------------------------------
+  ║ WARNING  agent.conversation_compression:conversation_compression.py:1122 Context compression made no progress for 0.2s (total wait 0.0s, ceiling 5.0s); continuing without compression
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/agent/test_compression_host_aux_budget.py::test_configured_wait_allows_delayed_first_content
+  ║ 1 failed, 8 deselected in 0.91s
+  ║
+  ║  Repro: python -m pytest tests/agent/test_compression_host_aux_budget.py -k test_configured_wait_allows_delayed_first_content -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 1 files, 0 tests passed, 1 failed (100% complete) in 1.5s (1 workers) ===
+  Durations cached to test_durations.json (1 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 1.5s  (runner wall: 1.5s, parallelism: 1x)
+  P50: 1.49s  P90: 1.49s  P95: 1.49s  P99: 1.49s  Max: 1.49s
+  <1s: 0 files (0%)  <2s: 1 files (100%)
+  Top 10 slowest:
+      1.49s  tests/agent/test_compression_host_aux_budget.py
+
+=== Failure output ===
+
+--- tests/agent/test_compression_host_aux_budget.py ---
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______________ test_configured_wait_allows_delayed_first_content _______________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xffff94011940>
+
+    def test_configured_wait_allows_delayed_first_content(monkeypatch):
+        import threading
+        from agent.conversation_compression import (
+            resolve_context_compression_timeouts, run_compress_context_with_progress_timeout,
+        )
+    
+        # Scale the auxiliary floor for this real-thread test. First content arrives
+        # after the old host idle budget, but within the auxiliary budget.
+        monkeypatch.setattr("agent.auxiliary_client._COMPRESSION_TIMEOUT_FLOOR_SECONDS", 2.0)
+        home = Path(os.environ["HERMES_HOME"])
+        (home / "config.yaml").write_text(json.dumps({
+            "compression": {"context_timeout_seconds": 0.05, "context_total_ceiling_seconds": 5},
+            "auxiliary": {"compression": {"timeout": 1}},
+        }))
+        idle, ceiling = resolve_context_compression_timeouts()
+        release = threading.Event()
+        finished = threading.Event()
+        committed = []
+        original = [{"role": "user", "content": "original"}]
+        summary = [{"role": "assistant", "content": "summary"}]
+    
+        def worker(fence):
+            timer = threading.Timer(0.25, release.set)
+            timer.start()
+            try:
+                assert release.wait(5)
+                fence.touch_progress()
+                committed.append(fence.begin_commit())
+                if committed[-1]:
+                    fence.finish_commit()
+                return summary, "stable system"
+            finally:
+                timer.cancel()
+                timer.join(5)
+                finished.set()
+    
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker, messages=original, system_prompt_fallback="stable system",
+                idle_timeout_seconds=idle, total_ceiling_seconds=ceiling,
+            )
+>           assert result == (summary, "stable system")
+E           AssertionError: assert ([{'content':...table system') == ([{'content':...table system')
+E             
+E             At index 0 diff: [{'role': 'user', 'content': 'original'}] != [{'role': 'assistant', 'content': 'summary'}]
+E             Use -v to get more diff
+
+tests/agent/test_compression_host_aux_budget.py:94: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  agent.conversation_compression:conversation_compression.py:1122 Context compression made no progress for 0.2s (total wait 0.0s, ceiling 5.0s); continuing without compression
+=========================== short test summary info ============================
+FAILED tests/agent/test_compression_host_aux_budget.py::test_configured_wait_allows_delayed_first_content
+1 failed, 8 deselected in 0.91s
+
+=== 1 file with test failures (1 test failed) ===
+  tests/agent/test_compression_host_aux_budget.py  (1 test failed)

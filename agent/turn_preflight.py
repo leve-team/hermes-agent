@@ -17,7 +17,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, compression_blocked_transiently,
     compression_skipped_due_to_lock, context_compression_timed_out,
-    conversation_history_after_compression,
+    conversation_history_after_compression, request_exceeds_model_window,
 )
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
@@ -81,6 +81,30 @@ def run_preflight_compression(
             agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
             max_compression_attempts,
         )
+
+    def _after_timeout() -> PreflightGateVerdict:
+        if (
+            not provider_overflow_preflight
+            and request_exceeds_model_window(agent, request_pressure_tokens) is False
+        ):
+            # Keep the failed outcome and transcript. This request will reach the
+            # provider, so neither refund its budget nor claim a compaction commit.
+            v._preflight_compression_blocked = True
+            if v.pending_moa_prepared_request is moa_prepared_request:
+                v.pending_moa_prepared_request = None
+            logger.warning("Compression timed out; continuing uncompressed within the model input window")
+            return _done("fallthrough")
+        v.api_call_count = _refund_api_call(agent, v.api_call_count)
+        v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+        v.failed = True
+        v._compression_timeout_exhausted = True
+        v._turn_exit_reason = "context_compression_timeout"
+        return _done("break")
+
+    if v._preflight_compression_blocked and context_compression_timed_out(agent):
+        # Turn-start already spent the wait budget. Recheck the assembled request
+        # (hooks/tool output may have grown it), without starting another summary.
+        return _after_timeout()
 
     _compression_cooldown = getattr(
         compressor, "get_active_compression_failure_cooldown", lambda: None
@@ -146,14 +170,7 @@ def run_preflight_compression(
             task_id=effective_task_id,
         )
         if context_compression_timed_out(agent):
-            # Progress-aware timeout: never reached the provider — refund the
-            # call/budget and stop; an overflow retry would only re-compress.
-            v.api_call_count = _refund_api_call(agent, v.api_call_count)
-            v.final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
-            v.failed = True
-            v._compression_timeout_exhausted = True
-            v._turn_exit_reason = "context_compression_timeout"
-            return _done("break")
+            return _after_timeout()
         if v.messages is _pre_api_input and (
             compression_skipped_due_to_lock(agent) or compression_blocked_transiently(agent)
         ):

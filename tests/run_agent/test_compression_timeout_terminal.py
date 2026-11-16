@@ -120,6 +120,9 @@ def test_overflow_recovery_timeout_ends_turn_without_provider_reentry():
 def test_pre_api_compression_timeout_is_typed_terminal():
     """Mid-turn pre-API pass that hits the host timeout ends the turn."""
     agent = _make_agent()
+    # This fixture tests an over-window terminal; a soft threshold alone
+    # no longer makes a timeout terminal.
+    agent.context_compressor.context_length = 1
     agent.context_compressor.protect_first_n = 0
     agent.context_compressor.protect_last_n = 0
     agent.context_compressor._threshold_tokens = 1
@@ -175,4 +178,65 @@ def test_pre_api_compression_timeout_is_typed_terminal():
     if result is not None:
         assert result["failed"] is True
         assert result["compression_exhausted"] is True
+        assert result["turn_exit_reason"] == "context_compression_timeout"
+
+
+@pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+@pytest.mark.parametrize("window,reserve,assembled_tokens,sends", [
+    (900_000, 20_000, 541_365, True),
+    (561_365, 20_000, 541_365, True),
+    (561_364, 20_000, 541_365, False),
+    (None, 20_000, 541_365, False),
+    # Turn-start can fit, then pre-LLM injections grow the assembled request.
+    (900_000, 20_000, 880_001, False),
+])
+def test_timeout_sends_only_a_request_with_known_model_capacity(monkeypatch, entry, window, reserve, assembled_tokens, sends):
+    import copy
+    from agent.conversation_compression import mark_context_compression_timed_out
+
+    agent = _make_agent()
+    agent.max_tokens = reserve
+    compressor = agent.context_compressor
+    compressor.context_length = window
+    compressor.max_tokens = reserve
+    compressor.threshold_tokens = 540_000
+    compressor.should_compress = lambda tokens=None: True
+    compressor.should_defer_preflight_to_real_usage = lambda tokens: False
+    compressor.get_active_compression_failure_cooldown = lambda: None
+    monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate",
+                        lambda *a: entry == "turn_start")
+    monkeypatch.setattr("agent.turn_context._preflight_request_tokens", lambda *a: 541_365)
+    monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: assembled_tokens)
+    agent.client.chat.completions.create.return_value = _mock_response("continued")
+    attempts = []
+
+    def timeout(messages, *a, **kw):
+        attempts.append(copy.deepcopy(messages))
+        mark_context_compression_timed_out(agent)
+        return messages, agent._cached_system_prompt
+
+    agent._compress_context = timeout
+    history = [{"role": "user", "content": "old request"},
+               {"role": "assistant", "content": "old response"}]
+    original = copy.deepcopy(history)
+    session_id = agent.session_id
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("continue", conversation_history=history)
+    assert len(attempts) == 1
+    assert agent.client.chat.completions.create.call_count == int(sends)
+    assert history == original
+    assert agent.session_id == session_id
+    assert compressor.compression_count == 0
+    if sends:
+        assert result["final_response"] == "continued"
+        assert not result.get("compression_exhausted", False)
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+        assert sent[0]["content"] == agent._cached_system_prompt
+    else:
+        assert result["failed"] is True
         assert result["turn_exit_reason"] == "context_compression_timeout"

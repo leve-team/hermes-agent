@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "gates": [
+    {
+      "name": "compression-core-build",
+      "kind": "build",
+      "required": true,
+      "timeout_s": 60,
+      "cwd": ".",
+      "cmd": "bash -n docs/runs/0ed7b26b/verify-behavior.sh && python -m compileall -q agent/conversation_compression.py agent/turn_context.py agent/turn_context_compaction.py agent/turn_preflight.py tests/agent/test_compression_host_aux_budget.py tests/agent/test_preflight_compression_timeout_fail_closed.py tests/agent/test_compress_context_progress_timeout.py tests/agent/test_turn_context.py tests/run_agent/test_compression_timeout_terminal.py tests/run_agent/test_compression_timeout_http.py tests/run_agent/test_preflight_timeout_typed_result.py",
+      "applies_to": ["agent/**", "tests/**", "docs/runs/0ed7b26b/**"],
+      "inputs": ["agent/**", "tests/**", "docs/runs/0ed7b26b/**", "pyproject.toml"]
+    },
+    {
+      "name": "compression-timeout-behavior",
+      "kind": "behavior",
+      "required": true,
+      "timeout_s": 600,
+      "cwd": ".",
+      "cmd": "bash docs/runs/0ed7b26b/verify-behavior.sh",
+      "applies_to": ["agent/**", "tests/**", "docs/runs/0ed7b26b/**"],
+      "inputs": ["agent/**", "tests/**", "tools/**", "providers/**", "plugins/**", "gateway/**", "hermes_cli/**", "*.py", "pyproject.toml", "uv.lock", "scripts/run_tests.sh", "scripts/run_tests_parallel.py", "docs/runs/0ed7b26b/**"]
+    }
+  ],
+  "live_probe": {"kind": "http", "url": "http://127.0.0.1:18761/probe", "status": 200}
+}

@@ -1,0 +1,7 @@
+Condensed development run output; failures retained, no PASS inferred.
+Full output SHA-256: 201b1931f9f9d58c9f463df63b902290c4fede5d963a2dcb36c40aa21fdae6bc
+[ 75.0% |     3/~4 | ✓12 | ✗ 0] ✓ tests/run_agent/test_compression_timeout_terminal.py (12✓, 5.8s)
+[100.0% |     4/~4 | ✓12 | ✗ 2] ✗ tests/run_agent/test_compression_timeout_http.py (2✗, 6.7s)
+=== Summary: 2 files, 12 tests passed, 2 failed (100% complete) in 6.7s (2 workers) ===
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[turn_start]
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[pre_api]

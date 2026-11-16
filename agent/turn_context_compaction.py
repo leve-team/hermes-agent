@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
-    compression_skipped_due_to_lock, conversation_history_after_compression,
+    compression_skipped_due_to_lock, context_compression_timed_out, conversation_history_after_compression,
 )
 
 logger = logging.getLogger("agent.turn_context")
@@ -351,7 +351,6 @@ def _run_preflight_passes(
     the loop's sites, default 3)."""
     from agent import turn_context as _tc
 
-    out.compressed = True
     # Compression is actually running — reset the dedup so a future blocked turn can
     # warn again.
     _clear_overflow_warn(agent)
@@ -382,6 +381,8 @@ def _run_preflight_passes(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
             task_id=effective_task_id,
         )
+        if not context_compression_timed_out(agent):
+            out.compressed = True
         if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
             # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
             # incompressibility — don't arm the blocker; stop passes this turn.

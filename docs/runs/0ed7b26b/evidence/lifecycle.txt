@@ -1,0 +1,36 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 11 test files (~95 tests) under ['tests/agent/test_compression_attempt_lifecycle.py', 'tests/agent/test_compression_review_76354.py', 'tests/test_compression_watermark_commit.py', 'tests/agent/test_engine_preflight_wire.py', 'tests/agent/test_compression_stall_fallback_78981.py', 'tests/agent/test_compress_context_progress_timeout.py', 'tests/agent/test_turn_context.py', 'tests/run_agent/test_preflight_timeout_typed_result.py', 'tests/run_agent/test_compression_abort_state_reset.py', 'tests/run_agent/test_compression_boundary.py', 'tests/agent/test_preflight_compression_gate.py']; running with -j 3
+[ 21.1% |    20/~95 | ✓20 | ✗ 0] ✓ tests/agent/test_compress_context_progress_timeout.py (20✓, 5.9s)
+[ 30.5% |    29/~95 | ✓30 | ✗ 0] ✓ tests/agent/test_compression_review_76354.py (10✓, 7.4s)
+[ 42.1% |    40/~95 | ✓41 | ✗ 0] ✓ tests/agent/test_compression_stall_fallback_78981.py (11✓, 2.9s)
+[ 45.3% |    43/~95 | ✓44 | ✗ 0] ✓ tests/agent/test_engine_preflight_wire.py (3✓, 1.9s)
+[ 48.4% |    46/~95 | ✓47 | ✗ 0] ✓ tests/agent/test_preflight_compression_gate.py (3✓, 0.8s)
+[ 61.1% |    58/~95 | ✓59 | ✗ 0] ✓ tests/agent/test_compression_attempt_lifecycle.py (12✓, 10.6s)
+[ 64.2% |    61/~95 | ✓62 | ✗ 0] ✓ tests/run_agent/test_compression_boundary.py (3✓, 1.1s)
+[ 65.3% |    62/~95 | ✓63 | ✗ 0] ✓ tests/run_agent/test_preflight_timeout_typed_result.py (1✓, 2.6s)
+[ 83.2% |    79/~95 | ✓86 | ✗ 0] ✓ tests/agent/test_turn_context.py (23✓, 5.2s)
+[ 84.2% |    80/~95 | ✓87 | ✗ 0] ✓ tests/run_agent/test_compression_abort_state_reset.py (1✓, 5.4s)
+[100.0% |    95/~95 | ✓103 | ✗  0] ✓ tests/test_compression_watermark_commit.py (16✓, 24.6s)
+
+=== Summary: 11 files, 103 tests passed, 0 failed (100% complete) in 39.0s (3 workers) ===
+  Durations cached to test_durations.json (11 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   11
+  Total subprocess CPU-wall: 68.6s  (runner wall: 39.0s, parallelism: 3x)
+  P50: 5.22s  P90: 10.61s  P95: 24.64s  P99: 24.64s  Max: 24.64s
+  <1s: 1 files (9%)  <2s: 3 files (27%)
+  Top 10 slowest:
+     24.64s  tests/test_compression_watermark_commit.py
+     10.61s  tests/agent/test_compression_attempt_lifecycle.py
+      7.43s  tests/agent/test_compression_review_76354.py
+      5.94s  tests/agent/test_compress_context_progress_timeout.py
+      5.42s  tests/run_agent/test_compression_abort_state_reset.py
+      5.22s  tests/agent/test_turn_context.py
+      2.86s  tests/agent/test_compression_stall_fallback_78981.py
+      2.62s  tests/run_agent/test_preflight_timeout_typed_result.py
+      1.91s  tests/agent/test_engine_preflight_wire.py
+      1.12s  tests/run_agent/test_compression_boundary.py
