@@ -83,7 +83,10 @@ def run_preflight_compression(
         )
 
     def _after_timeout() -> PreflightGateVerdict:
-        if not provider_overflow_preflight and request_exceeds_model_window(agent, request_pressure_tokens) is False:
+        if (
+            not provider_overflow_preflight
+            and request_exceeds_model_window(agent, request_pressure_tokens) is False
+        ):
             # Keep the failed outcome and transcript. This request will reach the
             # provider, so neither refund its budget nor claim a compaction commit.
             v._preflight_compression_blocked = True
