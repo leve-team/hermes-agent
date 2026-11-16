@@ -237,7 +237,8 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
 
     agent._compress_context = MagicMock(side_effect=stalled_compression)
     oversized_history = [
-        {"role": "assistant", "content": "x" * 8_000},
+        # Exceed the real window, not just the compression threshold.
+        {"role": "assistant", "content": "x" * 32_000},
     ]
     provider_call = MagicMock()
 

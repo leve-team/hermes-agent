@@ -1,0 +1,808 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 3 test files (~7 tests) under ['tests/agent/test_compression_host_aux_budget.py', 'tests/agent/test_preflight_compression_timeout_fail_closed.py', 'tests/run_agent/test_compression_timeout_terminal.py']; running with -j 2
+[ 42.9% |     3/~7 | ✓10 | ✗ 4] ✗ tests/agent/test_preflight_compression_timeout_fail_closed.py (10✓ 4✗, 0.9s)
+
+  ╔╍ Failed: tests/agent/test_preflight_compression_timeout_fail_closed.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         )
+  ║         if allowed:
+  ║ >           _fail_closed_after_preflight_timeout(agent, tokens)
+  ║ 
+  ║ tests/agent/test_preflight_compression_timeout_fail_closed.py:48: 
+  ║ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+  ║ 
+  ║ agent = namespace(_last_compression_timed_out=True, context_compressor=namespace(context_length=900000, max_tokens=None, threshold_tokens=540000), _context_compression_timeout_state_lock=<unlocked _thread.lock object at 0xffff97c3e490>)
+  ║ request_tokens = 900000
+  ║ 
+  ║     def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+  ║         """Stop an oversized turn instead of sending its unchanged provider payload."""
+  ║         from agent.conversation_compression import context_compression_timed_out
+  ║     
+  ║         if not context_compression_timed_out(agent):
+  ║             return
+  ║ >       raise PreflightCompressionTimedOut(
+  ║             "Context compression timed out before it could commit while the request "
+  ║             f"was still approximately {request_tokens:,} tokens. The provider call "
+  ║             "was not sent. Run /compress and wait for it to finish, then retry."
+  ║         )
+  ║ E       agent.turn_context.PreflightCompressionTimedOut: Context compression timed out before it could commit while the request was still approximately 900,000 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+  ║ 
+  ║ agent/turn_context.py:314: PreflightCompressionTimedOut
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[400000-900000-20000-True]
+  ║ FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[541365-900000-20000-True]
+  ║ FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[880000-900000-20000-True]
+  ║ FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[900000-900000-None-True]
+  ║ 4 failed, 10 passed in 0.40s
+  ║
+  ║  Repro: python -m pytest tests/agent/test_preflight_compression_timeout_fail_closed.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[ 57.1% |     4/~7 | ✓13 | ✗ 6] ✗ tests/agent/test_compression_host_aux_budget.py (3✓ 2✗, 2.7s)
+
+  ╔╍ Failed: tests/agent/test_compression_host_aux_budget.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║         (home / "config.yaml").write_text(json.dumps({
+  ║             "compression": {"context_timeout_seconds": idle,
+  ║                             "context_total_ceiling_seconds": ceiling},
+  ║             "auxiliary": {"compression": {"timeout": aux}},
+  ║         }))
+  ║         client = MagicMock()
+  ║         client.base_url = "http://127.0.0.1:1/v1"
+  ║         response = {"ok": True}
+  ║         client.chat.completions.create.return_value = response
+  ║         with (
+  ║             patch("agent.auxiliary_client._resolve_task_provider_model",
+  ║                   return_value=("custom", "test-model", None, None, None)),
+  ║             patch("agent.auxiliary_client._get_cached_client", return_value=(client, "test-model")),
+  ║             patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda r, *a, **k: r),
+  ║         ):
+  ║             call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+  ║         effective = client.chat.completions.create.call_args.kwargs["timeout"]
+  ║         assert effective == _effective_aux_timeout("compression", None)
+  ║         assert effective >= aux
+  ║         host_idle, host_ceiling = resolve_context_compression_timeouts()
+  ║         if idle > 0:
+  ║ >           assert host_idle == max(idle, effective)
+  ║ E           assert 90.0 == 420.0
+  ║ E            +  where 420.0 = max(90, 420.0)
+  ║ 
+  ║ tests/agent/test_compression_host_aux_budget.py:42: AssertionError
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/agent/test_compression_host_aux_budget.py::test_host_wait_covers_real_auxiliary_budget[120-600-120]
+  ║ FAILED tests/agent/test_compression_host_aux_budget.py::test_host_wait_covers_real_auxiliary_budget[90-30-420]
+  ║ 2 failed, 3 passed in 1.98s
+  ║
+  ║  Repro: python -m pytest tests/agent/test_compression_host_aux_budget.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+[100.0% |     7/~7 | ✓19 | ✗10] ✗ tests/run_agent/test_compression_timeout_terminal.py (6✓ 4✗, 4.6s)
+
+  ╔╍ Failed: tests/run_agent/test_compression_timeout_terminal.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+  ║ INFO     agent.model_metadata:model_metadata.py:1968 No model id provided for context length resolution — defaulting to 256,000 tokens.
+  ║ INFO     agent.turn_context:turn_context.py:919 conversation turn: session=20261116_023902_d67598 model= provider=unknown platform=unknown history=2 msg='continue'
+  ║ INFO     agent.conversation_loop:turn_preflight.py:118 Pre-API compression: ~541,365 request tokens >= 540,000 threshold (context=561,365, attempt=1/3)
+  ║ INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=context_compression_timeout model= api_calls=0/9223372036854775807 budget=0/9223372036854775807 tool_turns=0 last_msg_role=assistant response_len=182 session=20261116_023902_d67598
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-turn_start]
+  ║ FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-pre_api]
+  ║ FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-turn_start]
+  ║ FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-pre_api]
+  ║ 4 failed, 6 passed in 3.88s
+  ║
+  ║  Repro: python -m pytest tests/run_agent/test_compression_timeout_terminal.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 3 files, 19 tests passed, 10 failed (100% complete) in 5.5s (2 workers) ===
+  Durations cached to test_durations.json (3 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   3
+  Total subprocess CPU-wall: 8.2s  (runner wall: 5.5s, parallelism: 2x)
+  P50: 2.69s  P90: 4.61s  P95: 4.61s  P99: 4.61s  Max: 4.61s
+  <1s: 1 files (33%)  <2s: 1 files (33%)
+  Top 10 slowest:
+      4.61s  tests/run_agent/test_compression_timeout_terminal.py
+      2.69s  tests/agent/test_compression_host_aux_budget.py
+      0.86s  tests/agent/test_preflight_compression_timeout_fail_closed.py
+
+=== Failure output ===
+
+--- tests/agent/test_preflight_compression_timeout_fail_closed.py ---
+..FFF..F......                                                           [100%]
+=================================== FAILURES ===================================
+__ test_timeout_resume_requires_known_input_window[400000-900000-20000-True] ___
+
+tokens = 400000, window = 900000, reserve = 20000, allowed = True
+
+    @pytest.mark.parametrize("tokens,window,reserve,allowed", [
+        (400_000, 900_000, 20_000, True),
+        (541_365, 900_000, 20_000, True),
+        (880_000, 900_000, 20_000, True),
+        (880_001, 900_000, 20_000, False),
+        (900_001, 900_000, None, False),
+        (900_000, 900_000, None, True),
+        (541_365, None, 20_000, False),
+        (541_365, True, 20_000, False),
+        (541_365, 0, 20_000, False),
+        (541_365, 900_000, "unknown", False),
+        (-1, 900_000, None, False),
+        (True, 900_000, None, False),
+    ])
+    def test_timeout_resume_requires_known_input_window(tokens, window, reserve, allowed):
+        agent = SimpleNamespace(
+            _last_compression_timed_out=True,
+            context_compressor=SimpleNamespace(
+                context_length=window, max_tokens=reserve, threshold_tokens=540_000,
+            ),
+        )
+        if allowed:
+>           _fail_closed_after_preflight_timeout(agent, tokens)
+
+tests/agent/test_preflight_compression_timeout_fail_closed.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+agent = namespace(_last_compression_timed_out=True, context_compressor=namespace(context_length=900000, max_tokens=20000, threshold_tokens=540000), _context_compression_timeout_state_lock=<unlocked _thread.lock object at 0xffff97d95750>)
+request_tokens = 400000
+
+    def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+        """Stop an oversized turn instead of sending its unchanged provider payload."""
+        from agent.conversation_compression import context_compression_timed_out
+    
+        if not context_compression_timed_out(agent):
+            return
+>       raise PreflightCompressionTimedOut(
+            "Context compression timed out before it could commit while the request "
+            f"was still approximately {request_tokens:,} tokens. The provider call "
+            "was not sent. Run /compress and wait for it to finish, then retry."
+        )
+E       agent.turn_context.PreflightCompressionTimedOut: Context compression timed out before it could commit while the request was still approximately 400,000 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+
+agent/turn_context.py:314: PreflightCompressionTimedOut
+__ test_timeout_resume_requires_known_input_window[541365-900000-20000-True] ___
+
+tokens = 541365, window = 900000, reserve = 20000, allowed = True
+
+    @pytest.mark.parametrize("tokens,window,reserve,allowed", [
+        (400_000, 900_000, 20_000, True),
+        (541_365, 900_000, 20_000, True),
+        (880_000, 900_000, 20_000, True),
+        (880_001, 900_000, 20_000, False),
+        (900_001, 900_000, None, False),
+        (900_000, 900_000, None, True),
+        (541_365, None, 20_000, False),
+        (541_365, True, 20_000, False),
+        (541_365, 0, 20_000, False),
+        (541_365, 900_000, "unknown", False),
+        (-1, 900_000, None, False),
+        (True, 900_000, None, False),
+    ])
+    def test_timeout_resume_requires_known_input_window(tokens, window, reserve, allowed):
+        agent = SimpleNamespace(
+            _last_compression_timed_out=True,
+            context_compressor=SimpleNamespace(
+                context_length=window, max_tokens=reserve, threshold_tokens=540_000,
+            ),
+        )
+        if allowed:
+>           _fail_closed_after_preflight_timeout(agent, tokens)
+
+tests/agent/test_preflight_compression_timeout_fail_closed.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+agent = namespace(_last_compression_timed_out=True, context_compressor=namespace(context_length=900000, max_tokens=20000, threshold_tokens=540000), _context_compression_timeout_state_lock=<unlocked _thread.lock object at 0xffff98d0e710>)
+request_tokens = 541365
+
+    def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+        """Stop an oversized turn instead of sending its unchanged provider payload."""
+        from agent.conversation_compression import context_compression_timed_out
+    
+        if not context_compression_timed_out(agent):
+            return
+>       raise PreflightCompressionTimedOut(
+            "Context compression timed out before it could commit while the request "
+            f"was still approximately {request_tokens:,} tokens. The provider call "
+            "was not sent. Run /compress and wait for it to finish, then retry."
+        )
+E       agent.turn_context.PreflightCompressionTimedOut: Context compression timed out before it could commit while the request was still approximately 541,365 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+
+agent/turn_context.py:314: PreflightCompressionTimedOut
+__ test_timeout_resume_requires_known_input_window[880000-900000-20000-True] ___
+
+tokens = 880000, window = 900000, reserve = 20000, allowed = True
+
+    @pytest.mark.parametrize("tokens,window,reserve,allowed", [
+        (400_000, 900_000, 20_000, True),
+        (541_365, 900_000, 20_000, True),
+        (880_000, 900_000, 20_000, True),
+        (880_001, 900_000, 20_000, False),
+        (900_001, 900_000, None, False),
+        (900_000, 900_000, None, True),
+        (541_365, None, 20_000, False),
+        (541_365, True, 20_000, False),
+        (541_365, 0, 20_000, False),
+        (541_365, 900_000, "unknown", False),
+        (-1, 900_000, None, False),
+        (True, 900_000, None, False),
+    ])
+    def test_timeout_resume_requires_known_input_window(tokens, window, reserve, allowed):
+        agent = SimpleNamespace(
+            _last_compression_timed_out=True,
+            context_compressor=SimpleNamespace(
+                context_length=window, max_tokens=reserve, threshold_tokens=540_000,
+            ),
+        )
+        if allowed:
+>           _fail_closed_after_preflight_timeout(agent, tokens)
+
+tests/agent/test_preflight_compression_timeout_fail_closed.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+agent = namespace(_last_compression_timed_out=True, context_compressor=namespace(context_length=900000, max_tokens=20000, threshold_tokens=540000), _context_compression_timeout_state_lock=<unlocked _thread.lock object at 0xffff97f24790>)
+request_tokens = 880000
+
+    def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+        """Stop an oversized turn instead of sending its unchanged provider payload."""
+        from agent.conversation_compression import context_compression_timed_out
+    
+        if not context_compression_timed_out(agent):
+            return
+>       raise PreflightCompressionTimedOut(
+            "Context compression timed out before it could commit while the request "
+            f"was still approximately {request_tokens:,} tokens. The provider call "
+            "was not sent. Run /compress and wait for it to finish, then retry."
+        )
+E       agent.turn_context.PreflightCompressionTimedOut: Context compression timed out before it could commit while the request was still approximately 880,000 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+
+agent/turn_context.py:314: PreflightCompressionTimedOut
+___ test_timeout_resume_requires_known_input_window[900000-900000-None-True] ___
+
+tokens = 900000, window = 900000, reserve = None, allowed = True
+
+    @pytest.mark.parametrize("tokens,window,reserve,allowed", [
+        (400_000, 900_000, 20_000, True),
+        (541_365, 900_000, 20_000, True),
+        (880_000, 900_000, 20_000, True),
+        (880_001, 900_000, 20_000, False),
+        (900_001, 900_000, None, False),
+        (900_000, 900_000, None, True),
+        (541_365, None, 20_000, False),
+        (541_365, True, 20_000, False),
+        (541_365, 0, 20_000, False),
+        (541_365, 900_000, "unknown", False),
+        (-1, 900_000, None, False),
+        (True, 900_000, None, False),
+    ])
+    def test_timeout_resume_requires_known_input_window(tokens, window, reserve, allowed):
+        agent = SimpleNamespace(
+            _last_compression_timed_out=True,
+            context_compressor=SimpleNamespace(
+                context_length=window, max_tokens=reserve, threshold_tokens=540_000,
+            ),
+        )
+        if allowed:
+>           _fail_closed_after_preflight_timeout(agent, tokens)
+
+tests/agent/test_preflight_compression_timeout_fail_closed.py:48: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+agent = namespace(_last_compression_timed_out=True, context_compressor=namespace(context_length=900000, max_tokens=None, threshold_tokens=540000), _context_compression_timeout_state_lock=<unlocked _thread.lock object at 0xffff97c3e490>)
+request_tokens = 900000
+
+    def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+        """Stop an oversized turn instead of sending its unchanged provider payload."""
+        from agent.conversation_compression import context_compression_timed_out
+    
+        if not context_compression_timed_out(agent):
+            return
+>       raise PreflightCompressionTimedOut(
+            "Context compression timed out before it could commit while the request "
+            f"was still approximately {request_tokens:,} tokens. The provider call "
+            "was not sent. Run /compress and wait for it to finish, then retry."
+        )
+E       agent.turn_context.PreflightCompressionTimedOut: Context compression timed out before it could commit while the request was still approximately 900,000 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+
+agent/turn_context.py:314: PreflightCompressionTimedOut
+=========================== short test summary info ============================
+FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[400000-900000-20000-True]
+FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[541365-900000-20000-True]
+FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[880000-900000-20000-True]
+FAILED tests/agent/test_preflight_compression_timeout_fail_closed.py::test_timeout_resume_requires_known_input_window[900000-900000-None-True]
+4 failed, 10 passed in 0.40s
+
+--- tests/agent/test_compression_host_aux_budget.py ---
+FF...                                                                    [100%]
+=================================== FAILURES ===================================
+___________ test_host_wait_covers_real_auxiliary_budget[120-600-120] ___________
+
+idle = 120, ceiling = 600, aux = 120
+
+    @pytest.mark.parametrize("idle,ceiling,aux", [
+        (120, 600, 120), (90, 30, 420), (800, 900, 420),
+        (0, 600, 700), (-1, 600, 700),
+    ])
+    def test_host_wait_covers_real_auxiliary_budget(idle, ceiling, aux):
+        # Real config loaders and imports; only the provider I/O is replaced.
+        from agent.auxiliary_client import _effective_aux_timeout, call_llm
+        from agent.conversation_compression import resolve_context_compression_timeouts
+    
+        home = Path(os.environ["HERMES_HOME"])
+        (home / "config.yaml").write_text(json.dumps({
+            "compression": {"context_timeout_seconds": idle,
+                            "context_total_ceiling_seconds": ceiling},
+            "auxiliary": {"compression": {"timeout": aux}},
+        }))
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:1/v1"
+        response = {"ok": True}
+        client.chat.completions.create.return_value = response
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("custom", "test-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "test-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda r, *a, **k: r),
+        ):
+            call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        effective = client.chat.completions.create.call_args.kwargs["timeout"]
+        assert effective == _effective_aux_timeout("compression", None)
+        assert effective >= aux
+        host_idle, host_ceiling = resolve_context_compression_timeouts()
+        if idle > 0:
+>           assert host_idle == max(idle, effective)
+E           assert 120.0 == 300.0
+E            +  where 300.0 = max(120, 300.0)
+
+tests/agent/test_compression_host_aux_budget.py:42: AssertionError
+____________ test_host_wait_covers_real_auxiliary_budget[90-30-420] ____________
+
+idle = 90, ceiling = 30, aux = 420
+
+    @pytest.mark.parametrize("idle,ceiling,aux", [
+        (120, 600, 120), (90, 30, 420), (800, 900, 420),
+        (0, 600, 700), (-1, 600, 700),
+    ])
+    def test_host_wait_covers_real_auxiliary_budget(idle, ceiling, aux):
+        # Real config loaders and imports; only the provider I/O is replaced.
+        from agent.auxiliary_client import _effective_aux_timeout, call_llm
+        from agent.conversation_compression import resolve_context_compression_timeouts
+    
+        home = Path(os.environ["HERMES_HOME"])
+        (home / "config.yaml").write_text(json.dumps({
+            "compression": {"context_timeout_seconds": idle,
+                            "context_total_ceiling_seconds": ceiling},
+            "auxiliary": {"compression": {"timeout": aux}},
+        }))
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:1/v1"
+        response = {"ok": True}
+        client.chat.completions.create.return_value = response
+        with (
+            patch("agent.auxiliary_client._resolve_task_provider_model",
+                  return_value=("custom", "test-model", None, None, None)),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "test-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda r, *a, **k: r),
+        ):
+            call_llm(task="compression", messages=[{"role": "user", "content": "summarize"}])
+        effective = client.chat.completions.create.call_args.kwargs["timeout"]
+        assert effective == _effective_aux_timeout("compression", None)
+        assert effective >= aux
+        host_idle, host_ceiling = resolve_context_compression_timeouts()
+        if idle > 0:
+>           assert host_idle == max(idle, effective)
+E           assert 90.0 == 420.0
+E            +  where 420.0 = max(90, 420.0)
+
+tests/agent/test_compression_host_aux_budget.py:42: AssertionError
+=========================== short test summary info ============================
+FAILED tests/agent/test_compression_host_aux_budget.py::test_host_wait_covers_real_auxiliary_budget[120-600-120]
+FAILED tests/agent/test_compression_host_aux_budget.py::test_host_wait_covers_real_auxiliary_budget[90-30-420]
+2 failed, 3 passed in 1.98s
+
+--- tests/run_agent/test_compression_timeout_terminal.py ---
+..FFFF....                                                               [100%]
+=================================== FAILURES ===================================
+_ test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-turn_start] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xffff9866d7f0>
+entry = 'turn_start', window = 900000, reserve = 20000, sends = True
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    @pytest.mark.parametrize("window,reserve,sends", [
+        (900_000, 20_000, True),
+        (561_365, 20_000, True),
+        (561_364, 20_000, False),
+        (None, 20_000, False),
+    ])
+    def test_timeout_sends_only_a_request_with_known_model_capacity(monkeypatch, entry, window, reserve, sends):
+        import copy
+        from agent.conversation_compression import mark_context_compression_timed_out
+    
+        agent = _make_agent()
+        agent.max_tokens = reserve
+        compressor = agent.context_compressor
+        compressor.context_length = window
+        compressor.max_tokens = reserve
+        compressor.threshold_tokens = 540_000
+        compressor.should_compress = lambda tokens=None: True
+        compressor.should_defer_preflight_to_real_usage = lambda tokens: False
+        compressor.get_active_compression_failure_cooldown = lambda: None
+        monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate",
+                            lambda *a: entry == "turn_start")
+        monkeypatch.setattr("agent.turn_context._preflight_request_tokens", lambda *a: 541_365)
+        monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: 541_365)
+        agent.client.chat.completions.create.return_value = _mock_response("continued")
+        attempts = []
+    
+        def timeout(messages, *a, **kw):
+            attempts.append(copy.deepcopy(messages))
+            mark_context_compression_timed_out(agent)
+            return messages, agent._cached_system_prompt
+    
+        agent._compress_context = timeout
+        history = [{"role": "user", "content": "old request"},
+                   {"role": "assistant", "content": "old response"}]
+        original = copy.deepcopy(history)
+        session_id = agent.session_id
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+        assert len(attempts) == 1
+>       assert agent.client.chat.completions.create.call_count == int(sends)
+E       AssertionError: assert 0 == 1
+E        +  where 0 = <MagicMock name='mock.chat.completions.create' id='281473238641232'>.call_count
+E        +    where <MagicMock name='mock.chat.completions.create' id='281473238641232'> = <MagicMock name='mock.chat.completions' id='281473238640896'>.create
+E        +      where <MagicMock name='mock.chat.completions' id='281473238640896'> = <MagicMock name='mock.chat' id='281473238640560'>.completions
+E        +        where <MagicMock name='mock.chat' id='281473238640560'> = <MagicMock id='281473238640224'>.chat
+E        +          where <MagicMock id='281473238640224'> = <run_agent.AIAgent object at 0xffff986a34d0>.client
+E        +  and   1 = int(True)
+
+tests/run_agent/test_compression_timeout_terminal.py:225: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Preflight compression: ~541,365 tokens >= 540,000 threshold. This may take a moment.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473348062112 provider= base_url=https://openrouter.ai/api/v1 model=
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+INFO     agent.model_metadata:model_metadata.py:1968 No model id provided for context length resolution — defaulting to 256,000 tokens.
+INFO     agent.turn_context:turn_context.py:919 conversation turn: session=20261116_023901_3dec46 model= provider=unknown platform=unknown history=2 msg='continue'
+INFO     agent.turn_context:turn_context_compaction.py:358 Preflight compression: ~541,365 tokens >= 540,000 threshold (model , ctx 900,000)
+WARNING  agent.conversation_loop:conversation_loop.py:1304 Turn-start preflight compression timed out — ending turn with typed recovery result: Context compression timed out before it could commit while the request was still approximately 541,365 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+_ test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-pre_api] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xffff9c1be9c0>
+entry = 'pre_api', window = 900000, reserve = 20000, sends = True
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    @pytest.mark.parametrize("window,reserve,sends", [
+        (900_000, 20_000, True),
+        (561_365, 20_000, True),
+        (561_364, 20_000, False),
+        (None, 20_000, False),
+    ])
+    def test_timeout_sends_only_a_request_with_known_model_capacity(monkeypatch, entry, window, reserve, sends):
+        import copy
+        from agent.conversation_compression import mark_context_compression_timed_out
+    
+        agent = _make_agent()
+        agent.max_tokens = reserve
+        compressor = agent.context_compressor
+        compressor.context_length = window
+        compressor.max_tokens = reserve
+        compressor.threshold_tokens = 540_000
+        compressor.should_compress = lambda tokens=None: True
+        compressor.should_defer_preflight_to_real_usage = lambda tokens: False
+        compressor.get_active_compression_failure_cooldown = lambda: None
+        monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate",
+                            lambda *a: entry == "turn_start")
+        monkeypatch.setattr("agent.turn_context._preflight_request_tokens", lambda *a: 541_365)
+        monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: 541_365)
+        agent.client.chat.completions.create.return_value = _mock_response("continued")
+        attempts = []
+    
+        def timeout(messages, *a, **kw):
+            attempts.append(copy.deepcopy(messages))
+            mark_context_compression_timed_out(agent)
+            return messages, agent._cached_system_prompt
+    
+        agent._compress_context = timeout
+        history = [{"role": "user", "content": "old request"},
+                   {"role": "assistant", "content": "old response"}]
+        original = copy.deepcopy(history)
+        session_id = agent.session_id
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+        assert len(attempts) == 1
+>       assert agent.client.chat.completions.create.call_count == int(sends)
+E       AssertionError: assert 0 == 1
+E        +  where 0 = <MagicMock name='mock.chat.completions.create' id='281473238645264'>.call_count
+E        +    where <MagicMock name='mock.chat.completions.create' id='281473238645264'> = <MagicMock name='mock.chat.completions' id='281473238645600'>.create
+E        +      where <MagicMock name='mock.chat.completions' id='281473238645600'> = <MagicMock name='mock.chat' id='281473238645936'>.completions
+E        +        where <MagicMock name='mock.chat' id='281473238645936'> = <MagicMock id='281473238646272'>.chat
+E        +          where <MagicMock id='281473238646272'> = <run_agent.AIAgent object at 0xffff98d7c050>.client
+E        +  and   1 = int(True)
+
+tests/run_agent/test_compression_timeout_terminal.py:225: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Pre-API compression: ~541,365 tokens near the context/output limit. Compacting before the next model call.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473348062112 provider= base_url=https://openrouter.ai/api/v1 model=
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+INFO     agent.model_metadata:model_metadata.py:1968 No model id provided for context length resolution — defaulting to 256,000 tokens.
+INFO     agent.turn_context:turn_context.py:919 conversation turn: session=20261116_023902_637b49 model= provider=unknown platform=unknown history=2 msg='continue'
+INFO     agent.conversation_loop:turn_preflight.py:118 Pre-API compression: ~541,365 request tokens >= 540,000 threshold (context=900,000, attempt=1/3)
+INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=context_compression_timeout model= api_calls=0/9223372036854775807 budget=0/9223372036854775807 tool_turns=0 last_msg_role=assistant response_len=182 session=20261116_023902_637b49
+_ test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-turn_start] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xffff984ae690>
+entry = 'turn_start', window = 561365, reserve = 20000, sends = True
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    @pytest.mark.parametrize("window,reserve,sends", [
+        (900_000, 20_000, True),
+        (561_365, 20_000, True),
+        (561_364, 20_000, False),
+        (None, 20_000, False),
+    ])
+    def test_timeout_sends_only_a_request_with_known_model_capacity(monkeypatch, entry, window, reserve, sends):
+        import copy
+        from agent.conversation_compression import mark_context_compression_timed_out
+    
+        agent = _make_agent()
+        agent.max_tokens = reserve
+        compressor = agent.context_compressor
+        compressor.context_length = window
+        compressor.max_tokens = reserve
+        compressor.threshold_tokens = 540_000
+        compressor.should_compress = lambda tokens=None: True
+        compressor.should_defer_preflight_to_real_usage = lambda tokens: False
+        compressor.get_active_compression_failure_cooldown = lambda: None
+        monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate",
+                            lambda *a: entry == "turn_start")
+        monkeypatch.setattr("agent.turn_context._preflight_request_tokens", lambda *a: 541_365)
+        monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: 541_365)
+        agent.client.chat.completions.create.return_value = _mock_response("continued")
+        attempts = []
+    
+        def timeout(messages, *a, **kw):
+            attempts.append(copy.deepcopy(messages))
+            mark_context_compression_timed_out(agent)
+            return messages, agent._cached_system_prompt
+    
+        agent._compress_context = timeout
+        history = [{"role": "user", "content": "old request"},
+                   {"role": "assistant", "content": "old response"}]
+        original = copy.deepcopy(history)
+        session_id = agent.session_id
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+        assert len(attempts) == 1
+>       assert agent.client.chat.completions.create.call_count == int(sends)
+E       AssertionError: assert 0 == 1
+E        +  where 0 = <MagicMock name='mock.chat.completions.create' id='281473245334896'>.call_count
+E        +    where <MagicMock name='mock.chat.completions.create' id='281473245334896'> = <MagicMock name='mock.chat.completions' id='281473245334224'>.create
+E        +      where <MagicMock name='mock.chat.completions' id='281473245334224'> = <MagicMock name='mock.chat' id='281473245341616'>.completions
+E        +        where <MagicMock name='mock.chat' id='281473245341616'> = <MagicMock id='281473245341952'>.chat
+E        +          where <MagicMock id='281473245341952'> = <run_agent.AIAgent object at 0xffff9c1420d0>.client
+E        +  and   1 = int(True)
+
+tests/run_agent/test_compression_timeout_terminal.py:225: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Preflight compression: ~541,365 tokens >= 540,000 threshold. This may take a moment.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473348062112 provider= base_url=https://openrouter.ai/api/v1 model=
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+INFO     agent.model_metadata:model_metadata.py:1968 No model id provided for context length resolution — defaulting to 256,000 tokens.
+INFO     agent.turn_context:turn_context.py:919 conversation turn: session=20261116_023902_5a1411 model= provider=unknown platform=unknown history=2 msg='continue'
+INFO     agent.turn_context:turn_context_compaction.py:358 Preflight compression: ~541,365 tokens >= 540,000 threshold (model , ctx 561,365)
+WARNING  agent.conversation_loop:conversation_loop.py:1304 Turn-start preflight compression timed out — ending turn with typed recovery result: Context compression timed out before it could commit while the request was still approximately 541,365 tokens. The provider call was not sent. Run /compress and wait for it to finish, then retry.
+_ test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-pre_api] _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xffff984c3150>
+entry = 'pre_api', window = 561365, reserve = 20000, sends = True
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    @pytest.mark.parametrize("window,reserve,sends", [
+        (900_000, 20_000, True),
+        (561_365, 20_000, True),
+        (561_364, 20_000, False),
+        (None, 20_000, False),
+    ])
+    def test_timeout_sends_only_a_request_with_known_model_capacity(monkeypatch, entry, window, reserve, sends):
+        import copy
+        from agent.conversation_compression import mark_context_compression_timed_out
+    
+        agent = _make_agent()
+        agent.max_tokens = reserve
+        compressor = agent.context_compressor
+        compressor.context_length = window
+        compressor.max_tokens = reserve
+        compressor.threshold_tokens = 540_000
+        compressor.should_compress = lambda tokens=None: True
+        compressor.should_defer_preflight_to_real_usage = lambda tokens: False
+        compressor.get_active_compression_failure_cooldown = lambda: None
+        monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate",
+                            lambda *a: entry == "turn_start")
+        monkeypatch.setattr("agent.turn_context._preflight_request_tokens", lambda *a: 541_365)
+        monkeypatch.setattr("agent.conversation_loop._midturn_request_pressure_tokens", lambda *a: 541_365)
+        agent.client.chat.completions.create.return_value = _mock_response("continued")
+        attempts = []
+    
+        def timeout(messages, *a, **kw):
+            attempts.append(copy.deepcopy(messages))
+            mark_context_compression_timed_out(agent)
+            return messages, agent._cached_system_prompt
+    
+        agent._compress_context = timeout
+        history = [{"role": "user", "content": "old request"},
+                   {"role": "assistant", "content": "old response"}]
+        original = copy.deepcopy(history)
+        session_id = agent.session_id
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+        assert len(attempts) == 1
+>       assert agent.client.chat.completions.create.call_count == int(sends)
+E       AssertionError: assert 0 == 1
+E        +  where 0 = <MagicMock name='mock.chat.completions.create' id='281473234541200'>.call_count
+E        +    where <MagicMock name='mock.chat.completions.create' id='281473234541200'> = <MagicMock name='mock.chat.completions' id='281473234540864'>.create
+E        +      where <MagicMock name='mock.chat.completions' id='281473234540864'> = <MagicMock name='mock.chat' id='281473234540528'>.completions
+E        +        where <MagicMock name='mock.chat' id='281473234540528'> = <MagicMock id='281473234540192'>.chat
+E        +          where <MagicMock id='281473234540192'> = <run_agent.AIAgent object at 0xffff9c142210>.client
+E        +  and   1 = int(True)
+
+tests/run_agent/test_compression_timeout_terminal.py:225: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Pre-API compression: ~541,365 tokens near the context/output limit. Compacting before the next model call.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473348062112 provider= base_url=https://openrouter.ai/api/v1 model=
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+INFO     agent.model_metadata:model_metadata.py:1968 No model id provided for context length resolution — defaulting to 256,000 tokens.
+INFO     agent.turn_context:turn_context.py:919 conversation turn: session=20261116_023902_d67598 model= provider=unknown platform=unknown history=2 msg='continue'
+INFO     agent.conversation_loop:turn_preflight.py:118 Pre-API compression: ~541,365 request tokens >= 540,000 threshold (context=561,365, attempt=1/3)
+INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=context_compression_timeout model= api_calls=0/9223372036854775807 budget=0/9223372036854775807 tool_turns=0 last_msg_role=assistant response_len=182 session=20261116_023902_d67598
+=========================== short test summary info ============================
+FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-turn_start]
+FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[900000-20000-True-pre_api]
+FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-turn_start]
+FAILED tests/run_agent/test_compression_timeout_terminal.py::test_timeout_sends_only_a_request_with_known_model_capacity[561365-20000-True-pre_api]
+4 failed, 6 passed in 3.88s
+
+=== 3 files with test failures (10 tests failed) ===
+  tests/agent/test_preflight_compression_timeout_fail_closed.py  (4 tests failed)
+  tests/agent/test_compression_host_aux_budget.py  (2 tests failed)
+  tests/run_agent/test_compression_timeout_terminal.py  (4 tests failed)

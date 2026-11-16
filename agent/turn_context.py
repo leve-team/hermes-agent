@@ -306,14 +306,26 @@ class PreflightCompressionTimedOut(RuntimeError):
 
 
 def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
-    """Stop an oversized turn instead of sending its unchanged provider payload."""
-    from agent.conversation_compression import context_compression_timed_out
+    """A timeout blocks unknown/over-window requests, not merely over-threshold ones."""
+    from agent.conversation_compression import context_compression_timed_out, request_exceeds_model_window
 
     if not context_compression_timed_out(agent):
         return
+    if request_exceeds_model_window(agent, request_tokens) is False:
+        logger.warning(
+            "Preflight compression timed out but the request (~%s input tokens) fits "
+            "the model window with output reserved; continuing uncompressed",
+            request_tokens,
+        )
+        return
+    tokens_label = (
+        f"{request_tokens:,}"
+        if isinstance(request_tokens, int) and not isinstance(request_tokens, bool) and request_tokens >= 0
+        else "unknown"
+    )
     raise PreflightCompressionTimedOut(
         "Context compression timed out before it could commit while the request "
-        f"was still approximately {request_tokens:,} tokens. The provider call "
+        f"was still approximately {tokens_label} tokens. The provider call "
         "was not sent. Run /compress and wait for it to finish, then retry."
     )
 

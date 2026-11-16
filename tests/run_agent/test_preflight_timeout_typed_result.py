@@ -37,6 +37,8 @@ def test_turn_start_preflight_timeout_returns_typed_result_not_exception():
     agent.tool_delay = 0
     agent.save_trajectories = False
     agent.compression_enabled = True
+    # Keep the typed terminal assertion on a genuinely over-window request.
+    agent.context_compressor.context_length = 1
     agent.context_compressor.protect_first_n = 0
     agent.context_compressor.protect_last_n = 0
     agent.context_compressor.threshold_tokens = 1

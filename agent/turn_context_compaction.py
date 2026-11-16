@@ -351,7 +351,6 @@ def _run_preflight_passes(
     the loop's sites, default 3)."""
     from agent import turn_context as _tc
 
-    out.compressed = True
     # Compression is actually running — reset the dedup so a future blocked turn can
     # warn again.
     _clear_overflow_warn(agent)
@@ -406,6 +405,7 @@ def _run_preflight_passes(
             _tc._fail_closed_after_preflight_timeout(agent, _preflight_tokens)
             out.blocked = True
             break  # Cannot compress further: neither rows nor tokens moved
+        out.compressed = True
         out.conversation_history = conversation_history_after_compression(
             agent, out.messages, out.conversation_history
         )

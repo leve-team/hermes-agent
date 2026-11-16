@@ -1,0 +1,367 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 2 test files (~4 tests) under ['tests/run_agent/test_compression_timeout_http.py', 'tests/run_agent/test_compression_timeout_terminal.py']; running with -j 2
+[ 75.0% |     3/~4 | ✓12 | ✗ 0] ✓ tests/run_agent/test_compression_timeout_terminal.py (12✓, 5.8s)
+[100.0% |     4/~4 | ✓12 | ✗ 2] ✗ tests/run_agent/test_compression_timeout_http.py (2✗, 6.7s)
+
+  ╔╍ Failed: tests/run_agent/test_compression_timeout_http.py ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+  ║ INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+  ║ INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+  ║ INFO     agent.model_metadata:model_metadata.py:1803 Could not detect context length for model 'probe-model' at http://127.0.0.1:45427/v1 — defaulting to 256,000 tokens (probe-down). Set model.context_length in config.yaml to override.
+  ║ WARNING  agent.model_metadata:model_metadata.py:310 Could not determine context length for model 'probe-model' (base_url=http://127.0.0.1:45427/v1) — falling back to 256,000 tokens. Set model.context_length in config.yaml to override.
+  ║ INFO     agent.turn_context:turn_context.py:926 conversation turn: session=20261116_024248_d79bc9 model=probe-model provider=custom platform=unknown history=2 msg='continue'
+  ║ INFO     agent.conversation_loop:turn_preflight.py:139 Pre-API compression: ~4,246 request tokens >= 1,000 threshold (context=20,000, attempt=1/3)
+  ║ WARNING  run_agent:compression_facade.py:45 Context compression made no progress for 0.1s (total wait 0.1s, ceiling 0.2s); continuing without compression
+  ║ WARNING  agent.conversation_loop:turn_preflight.py:92 Compression timed out; continuing uncompressed within the model input window
+  ║ INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (chat_completion_stream_request, shared=False) thread=Thread-27 (<lambda>):281472881586528 provider=custom base_url=http://127.0.0.1:45427/v1 model=probe-model
+  ║ INFO     agent.conversation_loop:turn_usage.py:197 API call #1: model=probe-model provider=custom in=100 out=1 total=101 latency=0.0s id=probe-response
+  ║ INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=text_response(finish_reason=stop) model=probe-model api_calls=1/2 budget=1/2 tool_turns=0 last_msg_role=assistant response_len=9 session=20261116_024248_d79bc9
+  ║ =========================== short test summary info ============================
+  ║ FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[turn_start]
+  ║ FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[pre_api]
+  ║ 2 failed in 5.63s
+  ║
+  ║  Repro: python -m pytest tests/run_agent/test_compression_timeout_http.py -q
+  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍
+
+
+=== Summary: 2 files, 12 tests passed, 2 failed (100% complete) in 6.7s (2 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 12.4s  (runner wall: 6.7s, parallelism: 2x)
+  P50: 6.65s  P90: 6.65s  P95: 6.65s  P99: 6.65s  Max: 6.65s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+      6.65s  tests/run_agent/test_compression_timeout_http.py
+      5.78s  tests/run_agent/test_compression_timeout_terminal.py
+
+=== Failure output ===
+
+--- tests/run_agent/test_compression_timeout_http.py ---
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+________ test_timeout_resumes_over_http_without_late_commit[turn_start] ________
+
+entry = 'turn_start'
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    def test_timeout_resumes_over_http_without_late_commit(entry):
+>       exercise_timeout(entry)
+
+tests/run_agent/test_compression_timeout_http.py:150: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+entry = 'turn_start'
+
+    def exercise_timeout(entry):
+        from openai import OpenAI
+        from run_agent import AIAgent
+        from agent.conversation_compression import context_compression_timed_out
+    
+        requests = []
+    
+        class Provider(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+    
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                response = {
+                    "id": "probe-response", "object": "chat.completion", "created": 1,
+                    "model": "probe-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "continued"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101},
+                }
+                streaming = requests[-1].get("stream")
+                if streaming:
+                    response["object"] = "chat.completion.chunk"
+                    response["choices"][0]["delta"] = response["choices"][0].pop("message")
+                    body = ("data: " + json.dumps(response) + "\n\ndata: [DONE]\n\n").encode()
+                else:
+                    body = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+    
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/v1"
+        release = threading.Event()
+        finished = threading.Event()
+        attempts = []
+        commits = []
+        tools = [{"type": "function", "function": {
+            "name": "probe_tool", "description": "A stable tool schema " * 100,
+            "parameters": {"type": "object", "properties": {}},
+        }}]
+        client = OpenAI(api_key="local-probe-only", base_url=url, max_retries=0)
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=tools),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.process_bootstrap.OpenAI", return_value=client),
+            ):
+                agent = AIAgent(
+                    api_key="local-probe-only", base_url=url, provider="custom", model="probe-model",
+                    max_tokens=1000, quiet_mode=True, skip_context_files=True, skip_memory=True,
+                    save_trajectories=False, max_iterations=2,
+                )
+            agent.client = client
+            agent._cached_system_prompt = "Stable system prompt. " * 100
+            agent.tools = tools
+            agent.tool_delay = 0
+            compressor = agent.context_compressor
+            compressor.context_length = 20_000
+            compressor.threshold_tokens = 1000
+            # Prior provider usage makes the real compressor's preflight actionable;
+            # a first-turn heuristic alone is deliberately deferred by production.
+            compressor.last_real_prompt_tokens = 4000
+            compressor.protect_first_n = 0
+            compressor.protect_last_n = 0
+            history = [{"role": "user", "content": "old request " * 500},
+                       {"role": "assistant", "content": "old response " * 500}]
+            original = copy.deepcopy(history)
+            session_id = agent.session_id
+            cached_prompt = agent._cached_system_prompt
+    
+            def slow_worker(_agent, messages, system_message, **kwargs):
+                attempts.append(1)
+                fence = kwargs["commit_fence"]
+                try:
+                    assert release.wait(10), "probe failed to release compression worker"
+                    # A misbehaving late worker may mutate its private snapshot, but
+                    # must never publish this after the host has resumed the request.
+                    messages[0]["content"] = "late worker mutation"
+                    commits.append(fence.begin_commit())
+                    return [{"role": "assistant", "content": "late summary"}], "changed prompt"
+                finally:
+                    finished.set()
+    
+            with (
+                patch("agent.conversation_compression.compress_context", side_effect=slow_worker),
+                # Scale only the wait, not the predicate, estimators, HTTP, or cancellation fence.
+                patch("agent.conversation_compression.resolve_context_compression_timeouts", return_value=(0.05, 0.2)),
+                patch("agent.conversation_compression.resolve_compression_fallback_route", return_value=None),
+                patch("agent.turn_context._should_run_preflight_estimate", return_value=entry == "turn_start"),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("continue", conversation_history=history)
+                release.set()
+                assert finished.wait(5)
+            assert attempts == [1]
+            assert commits == [False]
+            assert context_compression_timed_out(agent)
+>           assert len(requests) == 1
+E           AssertionError: assert 2 == 1
+E            +  where 2 = len([{'name': 'probe-model'}, {'max_tokens': 1000, 'messages': [{'content': 'Stable system prompt. Stable system prompt. S...esponse', 'role': 'assistant'}, {'content': 'continue', 'role': 'user'}], 'model': 'probe-model', 'stream': True, ...}])
+
+tests/run_agent/test_compression_timeout_http.py:122: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Preflight compression: ~4,238 tokens >= 1,000 threshold. This may take a moment.
+⚠ Context compression timed out after 0.1s with no output from the summary model. No messages were dropped — continuing without compression. Run /compress to retry, /new for a clean session, or check auxiliary.compression.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473262205856 provider=custom base_url=http://127.0.0.1:42983/v1 model=probe-model
+INFO     agent.model_metadata:model_metadata.py:1803 Could not detect context length for model 'probe-model' at http://127.0.0.1:42983/v1 — defaulting to 256,000 tokens (probe-down). Set model.context_length in config.yaml to override.
+WARNING  agent.model_metadata:model_metadata.py:310 Could not determine context length for model 'probe-model' (base_url=http://127.0.0.1:42983/v1) — falling back to 256,000 tokens. Set model.context_length in config.yaml to override.
+INFO     agent.turn_context:turn_context.py:926 conversation turn: session=20261116_024246_1f8157 model=probe-model provider=custom platform=unknown history=2 msg='continue'
+INFO     agent.turn_context:turn_context_compaction.py:357 Preflight compression: ~4,238 tokens >= 1,000 threshold (model probe-model, ctx 20,000)
+WARNING  run_agent:compression_facade.py:45 Context compression made no progress for 0.1s (total wait 0.0s, ceiling 0.2s); continuing without compression
+WARNING  agent.turn_context:turn_context.py:315 Preflight compression timed out but the request (~4238 input tokens) fits the model window with output reserved; continuing uncompressed
+WARNING  agent.conversation_loop:turn_preflight.py:92 Compression timed out; continuing uncompressed within the model input window
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (chat_completion_stream_request, shared=False) thread=Thread-14 (<lambda>):281472881586528 provider=custom base_url=http://127.0.0.1:42983/v1 model=probe-model
+INFO     agent.conversation_loop:turn_usage.py:197 API call #1: model=probe-model provider=custom in=100 out=1 total=101 latency=0.4s id=probe-response
+INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=text_response(finish_reason=stop) model=probe-model api_calls=1/2 budget=1/2 tool_turns=0 last_msg_role=assistant response_len=9 session=20261116_024246_1f8157
+_________ test_timeout_resumes_over_http_without_late_commit[pre_api] __________
+
+entry = 'pre_api'
+
+    @pytest.mark.parametrize("entry", ["turn_start", "pre_api"])
+    def test_timeout_resumes_over_http_without_late_commit(entry):
+>       exercise_timeout(entry)
+
+tests/run_agent/test_compression_timeout_http.py:150: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+entry = 'pre_api'
+
+    def exercise_timeout(entry):
+        from openai import OpenAI
+        from run_agent import AIAgent
+        from agent.conversation_compression import context_compression_timed_out
+    
+        requests = []
+    
+        class Provider(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+    
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                response = {
+                    "id": "probe-response", "object": "chat.completion", "created": 1,
+                    "model": "probe-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "continued"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101},
+                }
+                streaming = requests[-1].get("stream")
+                if streaming:
+                    response["object"] = "chat.completion.chunk"
+                    response["choices"][0]["delta"] = response["choices"][0].pop("message")
+                    body = ("data: " + json.dumps(response) + "\n\ndata: [DONE]\n\n").encode()
+                else:
+                    body = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+    
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/v1"
+        release = threading.Event()
+        finished = threading.Event()
+        attempts = []
+        commits = []
+        tools = [{"type": "function", "function": {
+            "name": "probe_tool", "description": "A stable tool schema " * 100,
+            "parameters": {"type": "object", "properties": {}},
+        }}]
+        client = OpenAI(api_key="local-probe-only", base_url=url, max_retries=0)
+        try:
+            with (
+                patch("model_tools.get_tool_definitions", return_value=tools),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.process_bootstrap.OpenAI", return_value=client),
+            ):
+                agent = AIAgent(
+                    api_key="local-probe-only", base_url=url, provider="custom", model="probe-model",
+                    max_tokens=1000, quiet_mode=True, skip_context_files=True, skip_memory=True,
+                    save_trajectories=False, max_iterations=2,
+                )
+            agent.client = client
+            agent._cached_system_prompt = "Stable system prompt. " * 100
+            agent.tools = tools
+            agent.tool_delay = 0
+            compressor = agent.context_compressor
+            compressor.context_length = 20_000
+            compressor.threshold_tokens = 1000
+            # Prior provider usage makes the real compressor's preflight actionable;
+            # a first-turn heuristic alone is deliberately deferred by production.
+            compressor.last_real_prompt_tokens = 4000
+            compressor.protect_first_n = 0
+            compressor.protect_last_n = 0
+            history = [{"role": "user", "content": "old request " * 500},
+                       {"role": "assistant", "content": "old response " * 500}]
+            original = copy.deepcopy(history)
+            session_id = agent.session_id
+            cached_prompt = agent._cached_system_prompt
+    
+            def slow_worker(_agent, messages, system_message, **kwargs):
+                attempts.append(1)
+                fence = kwargs["commit_fence"]
+                try:
+                    assert release.wait(10), "probe failed to release compression worker"
+                    # A misbehaving late worker may mutate its private snapshot, but
+                    # must never publish this after the host has resumed the request.
+                    messages[0]["content"] = "late worker mutation"
+                    commits.append(fence.begin_commit())
+                    return [{"role": "assistant", "content": "late summary"}], "changed prompt"
+                finally:
+                    finished.set()
+    
+            with (
+                patch("agent.conversation_compression.compress_context", side_effect=slow_worker),
+                # Scale only the wait, not the predicate, estimators, HTTP, or cancellation fence.
+                patch("agent.conversation_compression.resolve_context_compression_timeouts", return_value=(0.05, 0.2)),
+                patch("agent.conversation_compression.resolve_compression_fallback_route", return_value=None),
+                patch("agent.turn_context._should_run_preflight_estimate", return_value=entry == "turn_start"),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("continue", conversation_history=history)
+                release.set()
+                assert finished.wait(5)
+            assert attempts == [1]
+            assert commits == [False]
+            assert context_compression_timed_out(agent)
+>           assert len(requests) == 1
+E           AssertionError: assert 2 == 1
+E            +  where 2 = len([{'name': 'probe-model'}, {'max_tokens': 1000, 'messages': [{'content': 'Stable system prompt. Stable system prompt. S...esponse', 'role': 'assistant'}, {'content': 'continue', 'role': 'user'}], 'model': 'probe-model', 'stream': True, ...}])
+
+tests/run_agent/test_compression_timeout_http.py:122: AssertionError
+----------------------------- Captured stdout call -----------------------------
+📦 Pre-API compression: ~4,246 tokens near the context/output limit. Compacting before the next model call.
+⚠ Context compression timed out after 0.1s with no output from the summary model. No messages were dropped — continuing without compression. Run /compress to retry, /new for a clean session, or check auxiliary.compression.
+------------------------------ Captured log call -------------------------------
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (agent_init, shared=True) thread=MainThread:281473262205856 provider=custom base_url=http://127.0.0.1:45427/v1 model=probe-model
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browser-use' registered browser provider: browser-use
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-browserbase' registered browser provider: browserbase
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'browser-firecrawl' registered browser provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered image_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered image_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'krea' registered image_gen provider: krea
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'meta-ai-image-gen' registered image_gen provider: meta-ai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai' registered image_gen provider: openai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openai-codex' registered image_gen provider: openai-codex
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: openrouter
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'openrouter' registered image_gen provider: nous
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered image_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'deepinfra' registered video_gen provider: deepinfra
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'fal' registered video_gen provider: fal
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'xai' registered video_gen provider: xai
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-brave-free' registered web provider: brave-free
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-ddgs' registered web provider: ddgs
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-exa' registered web provider: exa
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-firecrawl' registered web provider: firecrawl
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-keenable' registered web provider: keenable
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-parallel' registered web provider: parallel
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-perplexity' registered web provider: perplexity
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-searxng' registered web provider: searxng
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-tavily' registered web provider: tavily
+INFO     hermes_cli.plugins:plugins.py:378 Plugin 'web-xai' registered web provider: xai
+INFO     hermes_cli.plugins:plugins.py:1322 Plugin discovery complete: 57 found, 51 enabled
+INFO     agent.model_metadata:model_metadata.py:1803 Could not detect context length for model 'probe-model' at http://127.0.0.1:45427/v1 — defaulting to 256,000 tokens (probe-down). Set model.context_length in config.yaml to override.
+WARNING  agent.model_metadata:model_metadata.py:310 Could not determine context length for model 'probe-model' (base_url=http://127.0.0.1:45427/v1) — falling back to 256,000 tokens. Set model.context_length in config.yaml to override.
+INFO     agent.turn_context:turn_context.py:926 conversation turn: session=20261116_024248_d79bc9 model=probe-model provider=custom platform=unknown history=2 msg='continue'
+INFO     agent.conversation_loop:turn_preflight.py:139 Pre-API compression: ~4,246 request tokens >= 1,000 threshold (context=20,000, attempt=1/3)
+WARNING  run_agent:compression_facade.py:45 Context compression made no progress for 0.1s (total wait 0.1s, ceiling 0.2s); continuing without compression
+WARNING  agent.conversation_loop:turn_preflight.py:92 Compression timed out; continuing uncompressed within the model input window
+INFO     run_agent:agent_runtime_helpers.py:1805 OpenAI client created (chat_completion_stream_request, shared=False) thread=Thread-27 (<lambda>):281472881586528 provider=custom base_url=http://127.0.0.1:45427/v1 model=probe-model
+INFO     agent.conversation_loop:turn_usage.py:197 API call #1: model=probe-model provider=custom in=100 out=1 total=101 latency=0.0s id=probe-response
+INFO     agent.conversation_loop:turn_finalizer.py:334 Turn ended: reason=text_response(finish_reason=stop) model=probe-model api_calls=1/2 budget=1/2 tool_turns=0 last_msg_role=assistant response_len=9 session=20261116_024248_d79bc9
+=========================== short test summary info ============================
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[turn_start]
+FAILED tests/run_agent/test_compression_timeout_http.py::test_timeout_resumes_over_http_without_late_commit[pre_api]
+2 failed in 5.63s
+
+=== 1 file with test failures (2 tests failed) ===
+  tests/run_agent/test_compression_timeout_http.py  (2 tests failed)

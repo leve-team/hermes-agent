@@ -125,9 +125,11 @@ class TestContextCompressionTimeoutState:
 
 class TestResolveContextCompressionTimeouts:
     def test_defaults_when_empty_cfg(self):
+        from agent.auxiliary_client import _effective_aux_timeout
+
         idle, ceiling = resolve_context_compression_timeouts({})
-        assert idle == 120.0
-        assert ceiling == 600.0
+        assert idle == max(cc.DEFAULT_CONTEXT_TIMEOUT_SECONDS, _effective_aux_timeout("compression", None))
+        assert ceiling == max(cc.DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS, idle)
 
     def test_zero_idle_disables_wrapper(self):
         idle, ceiling = resolve_context_compression_timeouts(
@@ -137,14 +139,16 @@ class TestResolveContextCompressionTimeouts:
         assert ceiling == 600.0
 
     def test_ceiling_clamped_to_idle(self):
+        from agent.auxiliary_client import _effective_aux_timeout
+
         idle, ceiling = resolve_context_compression_timeouts(
             {
                 "context_timeout_seconds": 90,
                 "context_total_ceiling_seconds": 30,
             }
         )
-        assert idle == 90.0
-        assert ceiling == 90.0
+        assert idle == max(90.0, _effective_aux_timeout("compression", None))
+        assert ceiling == idle
 
 
 class TestRunCompressContextWithProgressTimeout:

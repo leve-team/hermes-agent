@@ -698,7 +698,44 @@ def resolve_context_compression_timeouts(compression_cfg: Optional[dict] = None)
                 ceiling = float(cfg["context_total_ceiling_seconds"])
     if idle > 0:
         ceiling = max(ceiling, idle)
+        # Upstream 4162ecf11f61 (#114594): preparation/first content can consume
+        # the summary call's full budget before the host sees progress.
+        from agent.auxiliary_client import _effective_aux_timeout
+        aux_budget = float(_effective_aux_timeout("compression", None))
+        if aux_budget > 0:
+            idle = max(idle, aux_budget)
+            ceiling = max(ceiling, idle)
     return idle, ceiling
+
+
+def request_exceeds_model_window(agent: Any, request_tokens: Any) -> Optional[bool]:
+    """Tri-state fit of the existing full INPUT estimate, independent of the soft threshold.
+
+    Adapted from upstream 4162ecf11f61. This fork reserves output separately
+    (ContextCompressor.max_tokens includes the native Gemini default). Subtract
+    it once, never system/tools again; those are already in request_tokens.
+    None means the provider default, as in the existing compressor contract.
+    Unknown/invalid values cannot authorize sending after a timeout.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    window = getattr(compressor, "context_length", None)
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        return None
+    if isinstance(request_tokens, bool) or not isinstance(request_tokens, int) or request_tokens < 0:
+        return None
+    reserve = 0
+    for value in (
+        getattr(compressor, "max_tokens", None),
+        getattr(agent, "max_tokens", None),
+        getattr(agent, "_ephemeral_max_output_tokens", None),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        # A live override may increase output after compressor initialization.
+        reserve = max(reserve, value)
+    return request_tokens > window - reserve
 
 
 def compression_attempt_stalled(
