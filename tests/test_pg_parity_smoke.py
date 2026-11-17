@@ -989,21 +989,54 @@ def test_search_observes_unindexed_rows_from_another_writer(pg_clean):
         db.close()
 
 
-def test_rewind_to_composite_carrier_on_both_backends(pg_clean, tmp_path):
-    """Rewinding to a composite compaction carrier archives it and its tail and re-inserts the hidden
-    handoff as the new head, returning that row's id — on PostgreSQL exactly as on SQLite."""
+def test_rewind_to_message_on_both_backends(pg_clean, tmp_path):
+    """rewind_to_message deactivates exactly the pinned rows or refuses having changed nothing — rows another
+    connection writes after the caller's read included — and a composite-carrier target re-inserts its hidden
+    handoff, returning that row's id: on PostgreSQL exactly as on SQLite."""
     from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
+    from hermes_state_errors import RewindExpectationMismatch
     carrier = f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n{_SUMMARY_END_MARKER}\n\nREAL ASK"
+    sq_path = tmp_path / "parity_state.db"
 
-    def rewind(db):
-        db.create_session("carrier", "cli")
-        ids = [db.append_message("carrier", "user", carrier), db.append_message("carrier", "assistant", "answer")]
-        result = db.rewind_to_message("carrier", ids[0], preserve_compaction_handoff=True)
-        return ids, result["replacement_message_id"], db.get_active_message_ids("carrier")
+    def sqlite_exec(sql, args):
+        with sqlite3.connect(sq_path) as raw:
+            raw.execute(sql, args)
 
-    for db in (_sqlite_session_db(tmp_path), SessionDB(postgres_dsn=pg_clean)):
+    def pg_exec(sql, args):
+        with psycopg.connect(pg_clean, autocommit=True) as raw:
+            raw.execute(sql.replace("?", "%s"), args)
+
+    def scenario(db, other, other_exec):
+        db.create_session("s", "cli")
+        q0, a0, target, answer = (db.append_message("s", role, content) for role, content in (
+            ("user", "q0"), ("assistant", "a0"), ("user", carrier), ("assistant", "answer")))
+        card = other.append_message("s", "assistant", "card", display_only=True)  # after the caller's read
+        with pytest.raises(RewindExpectationMismatch) as tail_drift:
+            db.rewind_to_message("s", target, preserve_compaction_handoff=True, expected_tail_row_ids=[target, answer])
+        assert (tail_drift.value.condition, tail_drift.value.actual) == ("expected_tail_row_ids", [target, answer, card])
+        assert db.get_active_message_ids("s") == [q0, a0, target, answer, card]
+
+        seen = db.get_active_message_ids("s")
+        other_exec("UPDATE messages SET active = 0 WHERE id = ?", (a0,))  # a change before the target
+        with pytest.raises(RewindExpectationMismatch) as moved:
+            db.rewind_to_message("s", target, preserve_compaction_handoff=True, expected_active_ids=seen,
+                                 expected_tail_row_ids=[target, answer, card])
+        assert moved.value.condition == "expected_active_ids"
+        assert db.get_active_message_ids("s") == [q0, target, answer, card]
+
+        result = db.rewind_to_message("s", target, preserve_compaction_handoff=True, expected_active_ids=[
+            q0, target, answer, card], expected_tail_row_ids=[target, answer, card])
+        assert db.get_active_message_ids("s") == [q0, result["replacement_message_id"]]
+        assert result["replacement_message_id"] > card
+        return result["rewound_count"]
+
+    outcomes = []
+    for open_db, other_exec in ((lambda: SessionDB(db_path=sq_path), sqlite_exec),
+                                (lambda: SessionDB(postgres_dsn=pg_clean), pg_exec)):
+        db, other = open_db(), open_db()
         try:
-            ids, replacement_id, active = rewind(db)
+            outcomes.append(scenario(db, other, other_exec))
         finally:
+            other.close()
             db.close()
-        assert active == [replacement_id] and replacement_id > ids[-1]
+    assert outcomes == [3, 3]

@@ -160,6 +160,18 @@ class StaleLeaseError(SessionTurnLeaseLostError):
     ``classify_persistence_error`` keep treating it as a lost lease."""
 
 
+class RewindExpectationMismatch(RuntimeError):
+    """A rewind refused before any mutation because the transcript is not what the rewind was
+    told to expect. ``condition`` names the expectation: a ``rewind_to_message`` keyword
+    (``expected_tail_row_ids``, ``expected_active_ids``, ``expected_target_content``), the
+    ``session.undo`` param ``expect_row_id``, or ``loaded_history`` (the core's loaded transcript
+    disagrees with the table). A RuntimeError so callers that predate it keep handling it."""
+
+    def __init__(self, condition: str, expected, actual, message: str | None = None):
+        self.condition, self.expected, self.actual = condition, expected, actual
+        super().__init__(message or f"rewind {condition} mismatch: expected {expected!r}, found {actual!r}")
+
+
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened
     (out-of-band cp/mv/restore). In-place FTS repair and fail-open trigger

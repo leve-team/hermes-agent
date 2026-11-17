@@ -1202,28 +1202,41 @@ class SessionMessagesMixin:
         if isinstance(live_content, str):
             live_content = sanitize_context(live_content).strip()
         if expected_target_content is not None and live_content != expected_target_content:
-            raise RuntimeError("rewind target changed before it could be persisted")
+            from hermes_state_errors import RewindExpectationMismatch
+            raise RewindExpectationMismatch(
+                "expected_target_content", expected_target_content, live_content,
+                "rewind target changed before it could be persisted")
         if preserve_compaction_handoff and handoff is None:
             raise ValueError("preserve_compaction_handoff requires an active composite carrier")
         return handoff if preserve_compaction_handoff else None
 
     def rewind_to_message(self, session_id: str, target_message_id: int, *, preserve_compaction_handoff: bool = False,
                           expected_active_ids: Optional[List[int]] = None,
-                          expected_target_content: Any = None) -> Dict[str, Any]:
+                          expected_target_content: Any = None,
+                          expected_tail_row_ids: Optional[List[int]] = None) -> Dict[str, Any]:
         """Soft-delete (``active=0``) every message with id >= *target_message_id*, target included (the caller
         pre-fills it as the next prompt). Returns ``{"rewound_count", "target_message", "new_head_id"}``, plus
         ``replacement_message_id`` with ``preserve_compaction_handoff`` (archives a composite summary carrier,
         inserts its hidden handoff scaffold as the new head). ``ValueError``: target missing or not ``user``.
         ``expected_active_ids`` / ``expected_target_content`` pin the active set and canonical live payload
-        in-txn before any mutation (presentation-only metadata changes don't invalidate a rewind). A live turn
-        lease refuses; expired/dead holders are reclaimed. ``rewind_count`` always increments."""
+        in-txn before any mutation (presentation-only metadata changes don't invalidate a rewind).
+        ``expected_tail_row_ids`` pins the ordered ids this call deactivates; the deactivated list IS the one
+        compared (one read), and it is checked before the active set so a drift there is reported as such. A
+        failed pin raises ``RewindExpectationMismatch`` (a RuntimeError) naming it. A live turn lease refuses;
+        expired/dead holders are reclaimed. ``rewind_count`` always increments."""
         def _do(conn):
             self._check_transcript_write_guards(
                 conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
+            from hermes_state_errors import RewindExpectationMismatch
+            ids = [int(r[0]) for r in conn.execute(_ACTIVE_TAIL_IDS_SQL, (session_id, target_message_id)).fetchall()]
+            if expected_tail_row_ids is not None and ids != list(expected_tail_row_ids):
+                raise RewindExpectationMismatch("expected_tail_row_ids", list(expected_tail_row_ids), ids)
             if expected_active_ids is not None:
-                active_rows = conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()
-                if [int(r[0]) for r in active_rows] != expected_active_ids:
-                    raise RuntimeError("active transcript changed before the rewind could be persisted")
+                active_ids = [int(r[0]) for r in conn.execute(_ACTIVE_IDS_SQL, (session_id,)).fetchall()]
+                if active_ids != expected_active_ids:
+                    raise RewindExpectationMismatch(
+                        "expected_active_ids", expected_active_ids, active_ids,
+                        "active transcript changed before the rewind could be persisted")
             row = conn.execute(
                 "SELECT * FROM messages WHERE id = ? AND session_id = ?", (target_message_id, session_id)).fetchone()
             if row is None:
@@ -1235,7 +1248,6 @@ class SessionMessagesMixin:
             replacement_message_id = replacement = None
             if preserve_compaction_handoff or expected_target_content is not None:
                 replacement = self._split_rewind_target(target_row, expected_target_content, preserve_compaction_handoff)
-            ids = [r[0] for r in conn.execute(_ACTIVE_TAIL_IDS_SQL, (session_id, target_message_id)).fetchall()]
             if ids:
                 conn.execute(f"UPDATE messages SET active = 0 WHERE id IN ({_placeholders(ids)})", ids)
             if replacement is not None:

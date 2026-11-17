@@ -1815,10 +1815,46 @@ def _(rid, params: dict, session: dict) -> dict:
 
 @_session_method("session.undo", live=True)
 def _(rid, params: dict, session: dict) -> dict:
+    """Rewind the last real user turn: every active row with id >= that turn's row gets ``active=0``.
+
+    Conditional undo: send BOTH ``expect_row_id`` and ``expect_tail_row_ids`` or neither (presence decides;
+    ``null`` or one without the other -> 4004). ``gateway.capabilities.session_undo_expectations`` lists them
+    when this build enforces them — an older core ignores them and undoes unconditionally.
+
+    - ``expect_row_id`` (int): the messages-table ``id`` the rewind must start from. The core's target is the
+      LAST row of the session's own active model transcript (``session_id`` = the session key — no compression
+      ancestors; ``active = 1``; ``display_only = 0``; background-review harness turns excluded; by id) for
+      which ``user_originated_turn_view`` is not None:
+        * plain user row (``role = 'user'``, ``display_kind`` NULL): that row.
+        * typed ``/steer`` row (``display_kind = 'steer'``): that row — it is a real user turn.
+        * composite compaction carrier (summary + live ask in one row): the carrier's own id; on success its
+          hidden handoff is re-inserted as a NEW row (``display_kind = 'hidden'``).
+        * never: timeline markers / notices (any other ``display_kind``), a summary with no live ask,
+          synthetic compression/recovery user rows, blank user rows, ``display_only`` rows.
+    - ``expect_tail_row_ids`` (list[int], 1..4096, strictly increasing, first == ``expect_row_id``): the ids of
+      ALL active rows with id >= the target (any role, ``display_only`` included) — exactly what is deactivated.
+
+    For a conditional call, 4004 / 4009 / 4033 / 4034 mean nothing was changed:
+      4033 ``{expected, actual}``: the target is another row (``actual`` its id) or the core could not confirm
+           one (``actual`` null: no user turn, no durable transcript, its loaded copy disagrees with the table,
+           or the transcript changed between its read and the rewind transaction).
+      4034 ``{expected, actual, actual_truncated}``: the active rows from the target on, read inside the rewind
+           transaction, differ (``actual`` capped at 4096 ids).
+      5008: outcome unknown — re-read the table before retrying.
+    Success adds ``target_row_id`` and ``checked`` (== the capability list) to ``removed``; without the params
+    the result is exactly ``{"removed": n}``."""
+    from hermes_state_errors import RewindExpectationMismatch
+    from tui_gateway.undo_expectation import (
+        INVALID_PARAMS_CODE, SESSION_UNDO_EXPECTATIONS, UndoExpectationParamError, parse_undo_expectation,
+        undo_expectation_error)
     # Under a running turn the post-run write would clobber the undo — /interrupt first.
     busy = _err(rid, 4009, "session busy — /interrupt the current turn before /undo")
     if session.get("running"):
         return busy
+    try:
+        expectation = parse_undo_expectation(params)
+    except UndoExpectationParamError as exc:
+        return _err(rid, INVALID_PARAMS_CODE, f"undo: {exc}")
     removed = 0
     with session["history_lock"]:
         if session.get("running"):
@@ -1826,12 +1862,21 @@ def _(rid, params: dict, session: dict) -> dict:
         history = _history_without_ephemeral_scaffolding(session.get("history", []))
         # Truncate from the last *real* user turn (not a timeline marker / compaction handoff).
         from agent.context_compressor import user_originated_turn_view
-        if user_turns := sum(1 for message in history if user_originated_turn_view(message) is not None):
-            try:
-                removed = _rewind_active_session_history(session, user_turns - 1)[2]
-            except Exception as exc:
-                return _err(rid, 5008, f"undo: {exc}")
-    return _ok(rid, {"removed": removed})
+        user_turns = sum(1 for message in history if user_originated_turn_view(message) is not None)
+        try:
+            if user_turns:
+                removed = _rewind_active_session_history(session, user_turns - 1, expectation=expectation)[2]
+            elif expectation is not None:
+                expectation.check_target(None)
+        except Exception as exc:
+            # A RewindExpectationMismatch is raised before any write; only a conditional caller gets it typed.
+            if expectation is not None and isinstance(exc, RewindExpectationMismatch):
+                return _err(rid, *undo_expectation_error(expectation, exc))
+            return _err(rid, 5008, f"undo: {exc}")
+    if expectation is None:
+        return _ok(rid, {"removed": removed})
+    return _ok(rid, {"removed": removed, "target_row_id": expectation.expect_row_id,
+                     "checked": list(SESSION_UNDO_EXPECTATIONS)})
 
 
 def _compute_host_ack_error(rid, ack: dict, code: int, default: str):
