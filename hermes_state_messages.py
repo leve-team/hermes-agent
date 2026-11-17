@@ -38,6 +38,8 @@ _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id =
 _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
 _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?"
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
+# The rows a rewind deactivates: the target and every active row after it.
+_ACTIVE_TAIL_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND id >= ? AND active = 1 ORDER BY id"
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
@@ -1233,8 +1235,7 @@ class SessionMessagesMixin:
             replacement_message_id = replacement = None
             if preserve_compaction_handoff or expected_target_content is not None:
                 replacement = self._split_rewind_target(target_row, expected_target_content, preserve_compaction_handoff)
-            ids = [r[0] for r in conn.execute("SELECT id FROM messages WHERE session_id = ? AND id >= ? AND active = 1",
-                                             (session_id, target_message_id)).fetchall()]
+            ids = [r[0] for r in conn.execute(_ACTIVE_TAIL_IDS_SQL, (session_id, target_message_id)).fetchall()]
             if ids:
                 conn.execute(f"UPDATE messages SET active = 0 WHERE id IN ({_placeholders(ids)})", ids)
             if replacement is not None:
