@@ -40,6 +40,9 @@ _replay_buffer_bytes: dict[str, int] = {}
 _replay_evicted_through: dict[str, int] = {}
 _replay_total_bytes = 0
 _replay_next_seq: dict[str, int] = {}
+# Live-only snapshots superseded within a second: stamped (seq stays monotonic) but never retained, so a
+# long silent model call cannot evict the turn's control events; a reconnecting client waits for the next one.
+_LIVE_ONLY_EVENT_TYPES = frozenset({"generation.progress"})
 
 
 def replay_epoch() -> str:
@@ -67,6 +70,8 @@ def _stamp_event(obj: dict) -> None:
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
         params["seq"] = seq
+        if params.get("type") in _LIVE_ONLY_EVENT_TYPES:
+            return
         buf = _replay_buffers.get(sid)
         if buf is None:
             buf = _replay_buffers[sid] = deque()

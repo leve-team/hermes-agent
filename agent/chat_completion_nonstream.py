@@ -1,6 +1,7 @@
 """Request-local worker lifecycle, watchdog polling, and wait status."""
 
 from agent import chat_completion_helpers as h
+from agent.generation_progress import open_generation_progress
 
 
 class _NonStreamRequest:
@@ -9,6 +10,9 @@ class _NonStreamRequest:
     State shared between the worker (``_call``) and the poll loop lives on the
     instance; ``_abort_request`` may run from the poll (stranger) thread.
     """
+
+    # Only the Codex Responses stream feeds one (other non-streaming wires have no deltas).
+    generation_progress = None
 
     def __init__(self, agent, api_kwargs: dict):
         self.agent = agent
@@ -26,6 +30,8 @@ class _NonStreamRequest:
         self.codex_token = object() if agent.api_mode == "codex_responses" else None
         self.codex_retired = False
         self.wd = h._resolve_nonstream_watchdogs(agent, api_kwargs)
+        if self.codex_token is not None:
+            self.generation_progress = open_generation_progress(agent)
         self.codex_watchdog_state = (
             h.SimpleNamespace(
                 token=self.codex_token,
@@ -34,6 +40,7 @@ class _NonStreamRequest:
                 last_progress_ts=None,
                 retry_started_ts=None,
                 phase_aware=self.wd.idle_requires_progress,
+                generation_progress=self.generation_progress,
             )
             if self.codex_token is not None
             else None
@@ -252,6 +259,8 @@ class _NonStreamRequest:
         while t.is_alive():
             t.join(timeout=0.3)
             poll_count += 1
+            if self.generation_progress is not None and t.is_alive() and not agent._interrupt_requested:
+                self.generation_progress.poll()
             # Keep the quiet gateway heartbeat; only silence warrants a notice.
             # Resumed events clear our notice on the next poll, not 30s later.
             now = h.time.time()

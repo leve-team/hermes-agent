@@ -302,6 +302,7 @@ Primary event types the client handles today:
 | `notification.clear`       | `{ key }`                                                                   |
 | `tool.start`               | `{ tool_id, name, context?, args_text? }`                                   |
 | `tool.generating`          | `{ name }`                                                                  |
+| `generation.progress`      | `{ api_call, attempt, phase, name?, tool_index?, output_chars, phase_chars, elapsed_ms }` ≤1/s while a model call runs (chars, not tokens). `api_call`: which model call of the turn; `attempt`: stream attempt of that call (retry/fallback), counts restart with it; `tool_index`: ordinal of the tool call in the attempt. Live-only (not replayed) |
 | `tool.progress`            | `{ name, preview }`                                                         |
 | `tool.complete`            | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }`    |
 | `clarify.request`          | `{ question, choices?, request_id }`                                        |

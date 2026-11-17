@@ -7,6 +7,9 @@ from agent.model_metadata import is_local_endpoint
 
 
 class StreamingWaitMonitor:
+    # Set per request by the owner (None: nobody listens for generation.progress).
+    generation_progress = None
+
     def _poll_local_load_notice(self, now: float) -> bool:
         """Managed local server: surface a cold model's weight-load progress
         instead of the 60s "provider may be slow" copy. Polled ~1s only while no
@@ -58,6 +61,10 @@ class StreamingWaitMonitor:
         _is_local_base = bool(self.agent.base_url) and is_local_endpoint(self.agent.base_url)
         while not self._call_done.is_set():
             self._call_done.wait(timeout=0.3)
+            # Only while the call is live: never a snapshot after completion or a pending /stop.
+            if (self.generation_progress is not None and not self._call_done.is_set()
+                    and not self.agent._interrupt_requested):
+                self.generation_progress.poll()
             _hb_now = time.time()
             if _is_local_base and self._poll_local_load_notice(_hb_now):
                 continue
