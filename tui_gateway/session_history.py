@@ -34,13 +34,25 @@ def _build_image_ref_message(user_text: str, image_paths: list[str]) -> str:
     return text or "What do you see in this image?"
 
 
+_IMAGE_REF_PREFIX = "@image:"
+
+
+def _persisted_image_paths(image_paths: list[str]) -> list[str]:
+    """The attached images a persisted row references: those that exist, in order."""
+    return [p for p in image_paths if Path(p).exists()]
+
+
+def _image_ref_line(path: str) -> str:
+    from agent.context_references import format_reference_value
+    return f"{_IMAGE_REF_PREFIX}{format_reference_value(path)}"
+
+
 def _build_persist_message_with_image_refs(user_text: str, image_paths: list[str]) -> str:
     """Persisted form of the user's message: ``@image:<path>`` directives (the desktop renders them as
     images); ``_build_image_ref_message``'s ``image_url:`` hint is model-only, never persisted. Caption
     first, directives last: session previews are the first 60 chars of the first user message."""
-    from agent.context_references import format_reference_value
     text = user_text or ""
-    refs = "\n".join(f"@image:{format_reference_value(p)}" for p in image_paths if Path(p).exists())
+    refs = "\n".join(_image_ref_line(p) for p in _persisted_image_paths(image_paths))
     if not refs:
         return text
     return f"{text}\n{refs}" if text else refs
