@@ -129,7 +129,8 @@ def pg_dsn():
     The container is torn down at module teardown. RYUK is disabled (see above)
     so no reaper sidecar is started.
     """
-    with PostgresContainer("postgres:16") as pg:
+    # PG_PARITY_IMAGE: run against an image already present locally instead of pulling postgres:16.
+    with PostgresContainer(os.environ.get("PG_PARITY_IMAGE", "postgres:16")) as pg:
         yield _normalize_dsn(pg.get_connection_url())
 
 
@@ -986,3 +987,23 @@ def test_search_observes_unindexed_rows_from_another_writer(pg_clean):
         }
     finally:
         db.close()
+
+
+def test_rewind_to_composite_carrier_on_both_backends(pg_clean, tmp_path):
+    """Rewinding to a composite compaction carrier archives it and its tail and re-inserts the hidden
+    handoff as the new head, returning that row's id — on PostgreSQL exactly as on SQLite."""
+    from agent.context_compressor import HISTORICAL_TASK_HEADING, SUMMARY_PREFIX, _SUMMARY_END_MARKER
+    carrier = f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\nold task\n\n{_SUMMARY_END_MARKER}\n\nREAL ASK"
+
+    def rewind(db):
+        db.create_session("carrier", "cli")
+        ids = [db.append_message("carrier", "user", carrier), db.append_message("carrier", "assistant", "answer")]
+        result = db.rewind_to_message("carrier", ids[0], preserve_compaction_handoff=True)
+        return ids, result["replacement_message_id"], db.get_active_message_ids("carrier")
+
+    for db in (_sqlite_session_db(tmp_path), SessionDB(postgres_dsn=pg_clean)):
+        try:
+            ids, replacement_id, active = rewind(db)
+        finally:
+            db.close()
+        assert active == [replacement_id] and replacement_id > ids[-1]

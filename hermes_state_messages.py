@@ -1239,8 +1239,10 @@ class SessionMessagesMixin:
             if ids:
                 conn.execute(f"UPDATE messages SET active = 0 WHERE id IN ({_placeholders(ids)})", ids)
             if replacement is not None:
+                # The insert's own row id (RETURNING id on PostgreSQL): last_insert_rowid() is SQLite-only.
                 self._insert_message_rows(conn, session_id, [replacement])
-                replacement_message_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                if not isinstance(replacement_message_id := replacement.get("_row_id"), int):
+                    raise RuntimeError("compaction handoff insert returned no row id")
             conn.execute(
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 WHERE id = ?", (session_id,))
             message_count, tool_call_count = self._active_transcript_counts(conn, session_id)
