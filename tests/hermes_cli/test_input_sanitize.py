@@ -1,9 +1,31 @@
 """Tests for shared user prompt input sanitization."""
 
+import pytest
+
 from hermes_cli.input_sanitize import (
     collapse_repeated_input_artifacts,
     sanitize_user_prompt_text,
     strip_leaked_bracketed_paste_wrappers,
+)
+
+# Number and time ranges users type every day; the degraded 00~ / 01~ / [200~ / [201~ forms once ate them (#143444).
+ORDINARY_RANGE_TEXTS = (
+    "회의는 09:00~18:00 입니다",
+    "오전 10:00~11:00, 오후 2:00~3:00",
+    "13:00~ 시작",
+    "08:01~ 출발",
+    "2001~ 2005",
+    "10~20개",
+    "(100~200)",
+    "1.00~1.01",
+    "tcp:8000~8010",
+    ":00~:30 매시\n:00~ 정각",
+    "v1.01~beta",
+    "00~06시 심야, 1월 01~ 05일",
+    "기간: 2024-01~",
+    "값은 [200~300] 사이, [201~ 300]",
+    "営業時間は9:00~18:00です",
+    "Open 9:00~17:00, pages 100~200",
 )
 
 
@@ -34,3 +56,8 @@ class TestSanitizeUserPromptText:
         prefix = "hello["
         corrupted = prefix + "~[[e" * 8
         assert sanitize_user_prompt_text(corrupted) == "hello"
+
+    @pytest.mark.parametrize("text", ORDINARY_RANGE_TEXTS)
+    def test_number_ranges_survive_alone_and_inside_a_leaked_paste(self, text):
+        assert sanitize_user_prompt_text(text) == text
+        assert sanitize_user_prompt_text(f"\x1b[200~{text}\x1b[201~") == text
