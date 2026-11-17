@@ -124,7 +124,8 @@ def test_replay_reproduces_stored_turn_and_leaves_staged_images(replay_env, monk
     other = _rpc("image.attach", path=str(uploads / "other.png"))["result"]["path"]
     db.rewind_to_message("replay-session", original["id"])
     capabilities = server._methods["gateway.capabilities"]("rid", {})["result"]
-    assert {"image_paths", "verbatim_text", "prompt.replay_source"} <= set(capabilities["prompt_submit_replay"])
+    assert {"image_paths", "verbatim_text", "prompt.replay_source", "image_paths_empty",
+            "replay_supported"} <= set(capabilities["prompt_submit_replay"])
 
     source = _rpc("prompt.replay_source", row_id=original["id"])["result"]
     assert (source["exact"], source["missing"]) == (True, [])
@@ -214,7 +215,8 @@ _PHOTO = "{up}/photo.png"
     (lambda env, mp: _symlink(env, "alias", "photo.png"), {"image_paths": ["{up}/alias"]}, ("result", "streaming")),
     (None, {"image_paths": [_PHOTO, _PHOTO]}, ("result", "streaming")),
     (None, {"image_paths": None}, _INVALID),
-    (None, {"image_paths": []}, _INVALID),
+    (None, {"image_paths": []}, ("result", "streaming")),
+    (None, {"image_paths": [], "verbatim_text": True}, ("result", "streaming")),
     (None, {"image_paths": _PHOTO}, _INVALID),
     (None, {"image_paths": ["photo.png"]}, _INVALID),
     (None, {"image_paths": [_PHOTO] * 1001}, ("error", 4004, "too_many_images")),
@@ -246,6 +248,10 @@ def test_replay_submit_decides_before_touching_staged_images(replay_env, monkeyp
             assert "error" in _rpc("image.attach", path=reply["error"]["data"]["path"])
     else:
         assert reply["result"]["status"] == expected[1]
+        if resolved.get("image_paths") == []:  # a turn without images: none sent, none recorded
+            stored = _last_user_row(replay_env["db"])
+            assert replay_env["agent"].model_inputs[-1] == "again"
+            assert (stored["content"], stored.get("display_metadata")) == ("again", None)
         if expected[1] == "streaming":  # image.attach accepts every path the replay accepted
             assert all(_rpc("image.attach", path=p).get("result") for p in resolved["image_paths"])
 
@@ -271,7 +277,11 @@ def _inexact(reason: str) -> dict:
 
 # (row factory, expected): ``text`` / ``image_paths`` / ``missing`` hold "{up}" for the uploads dir.
 @pytest.mark.parametrize(("make_row", "expected"), [
-    (lambda env: _row(env, "hi"), {"exact": True, "text": "hi", "image_paths": [], "missing": []}),
+    (lambda env: _row(env, "hi"),
+     {"exact": True, "text": "hi", "image_paths": [], "missing": [], "replay_supported": True,
+      "unsupported_reason": None}),
+    (lambda env: env["monkeypatch"].setattr(server, "_session_uses_compute_host", lambda *_a, **_k: True)
+     or _row(env, "hi"), {"exact": True, "replay_supported": False, "unsupported_reason": "compute_isolation"}),
     (lambda env: _row(env, "see @image:/typed.png here"),
      {"exact": True, "text": "see @image:/typed.png here", "image_paths": []}),
     (lambda env: _row(env, f"a\n@image:{_png(env)}\n@image:{_png(env)}", metadata={"image_paths": [_png(env)] * 2}),
@@ -291,10 +301,11 @@ def _inexact(reason: str) -> dict:
     (lambda env: 0, {"error": 4004}),
     (lambda env: True, {"error": 4004}),
 ])
-def test_replay_source_derives_the_submit_from_the_stored_row(replay_env, make_row, expected):
+def test_replay_source_derives_the_submit_from_the_stored_row(replay_env, monkeypatch, make_row, expected):
     """``prompt.replay_source`` is the inverse of the row writer, read-only, for this session's user
     rows only (a just-rewound row included): exact only when the row itself says which ``@image:``
     lines the core appended; ``missing`` lists what a submit would refuse right now."""
+    replay_env["monkeypatch"] = monkeypatch
     row_id = make_row(replay_env)
     if type(row_id) is int and row_id > 0 and "error" not in expected:
         replay_env["db"].rewind_to_message("replay-session", row_id)  # the caller rewinds before reading

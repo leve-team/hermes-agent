@@ -567,13 +567,18 @@ def _parse_submit_replay(rid, params):
     return replay, None
 
 
+def _replay_unsupported_reason(session):
+    """Why a replay submit on this session would get 4145 now (``"compute_isolation"``: its turns run
+    on a compute host, which rebuilds the input from the staged images in another process), else None.
+    Per-session state: ``prompt.replay_source`` reports it ahead, the submit asks again."""
+    return "compute_isolation" if _session_uses_compute_host(
+        session, _load_dashboard_process_isolation_config()) else None
+
+
 def _compute_isolation_refusal(rid, session):
-    """4145 when this session's turns run on a compute host: that turn rebuilds its input from the
-    staged images in another process. Asked right after the session lookup AND again where the
-    submit decides inline vs compute host, so a replay never reaches the compute host."""
-    if _session_uses_compute_host(session, _load_dashboard_process_isolation_config()):
-        return _compute_isolation_error(rid)
-    return None
+    """4145 right after the session lookup; asked again where the submit decides inline vs compute
+    host, so a replay never reaches the compute host."""
+    return None if _replay_unsupported_reason(session) is None else _compute_isolation_error(rid)
 
 
 def _compute_isolation_error(rid):
@@ -982,8 +987,10 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Read-only: what to send to ``prompt.submit`` (with ``verbatim_text: true``) to replay the stored
     user row ``row_id`` of this session as the same turn — ``{row_id, text, image_paths, exact, reason?,
-    missing, display_kind}``. The row may be inactive (just rewound). ``missing``: the ``image_paths``
-    a submit would refuse now (4144), so a caller can refuse before rewinding anything."""
+    missing, display_kind, replay_supported, unsupported_reason?}``. The row may be inactive (just
+    rewound). ``missing``: the ``image_paths`` a submit would refuse now (4144); ``replay_supported``:
+    false when a replay submit would get 4145 now — both so a caller refuses before rewinding anything.
+    Both reflect current state and can still change before the submit."""
     from tui_gateway import submit_replay as sr
     session, err = _sess_nowait(params, rid)
     if err:
@@ -1002,9 +1009,11 @@ def _(rid, params: dict) -> dict:
         return _err(rid, sr.SOURCE_NOT_FOUND_CODE, f"no user row {row_id} in this session",
                     {"reason": sr.SOURCE_NOT_FOUND_REASON})
     source = _replay_source(row.get("content"), row.get("display_metadata"))
+    unsupported = _replay_unsupported_reason(session)
     return _ok(rid, {"row_id": row_id, **source, "missing": sr.missing_images(source["image_paths"],
                                                                             _allowed_image_extensions),
-                     "display_kind": row.get("display_kind")})
+                     "display_kind": row.get("display_kind"), "replay_supported": unsupported is None,
+                     **({} if unsupported is None else {"unsupported_reason": unsupported})})
 
 
 # ── attachments ─────────────────────────────────────────────────────────────

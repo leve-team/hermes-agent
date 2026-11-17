@@ -5,13 +5,18 @@ row, rebuilt from the stored row alone. Two things in the ordinary submit stand 
 come only from the session's staged ``attached_images`` (consumed whole by the next submit, whoever
 sends it), and the text is re-prepared (input sanitizing, ``@`` reference expansion) although the
 stored text is already the prepared text. ``image_paths`` names this turn's images without touching
-the staged list; ``verbatim_text`` takes the text as the turn's prepared text. Parsing is pure; the
+the staged list (``[]``: the turn has none — send it for a replay of a turn without images, else the
+staged images of another message are taken); ``verbatim_text`` takes the text as the turn's prepared
+text. Parsing is pure; the
 file check (``check_image_files``) is the only I/O and runs before the submit changes anything.
 
 From a stored row: ``prompt.replay_source {session_id, row_id}`` returns the ``text`` and
 ``image_paths`` to send (``session_history._replay_source``, the inverse of the row writer). A row
 written with images records their exact paths in ``display_metadata.image_paths``; an older row is
 parsed and reported ``exact: false`` whenever its own text cannot be told from appended lines.
+A turn without images writes no ``display_metadata.image_paths`` key (not an empty list).
+``replay_supported`` / ``unsupported_reason`` there say whether a replay submit on this session would
+get 4145 now, by the decision the submit makes (``methods_prompt._replay_unsupported_reason``).
 
 What a replay does NOT promise:
 - Only 4004/4144 come before anything else. Later refusals follow what every submit does first:
@@ -19,7 +24,8 @@ What a replay does NOT promise:
   decision also follows the active-session slot claim and the ``client_surface`` /
   ``voice_live_context`` overwrite; 4143 (busy) also follows the transport rebind and orphan-reap
   cancel. No turn runs, and the staged images and the queue are untouched.
-- 4145 depends on per-session state (compute isolation), so it is decided per call.
+- 4145 depends on per-session state (compute isolation), so it is decided per call:
+  ``replay_supported`` is a forecast, and the state can still change before the submit (rare).
 - The in-flight bubble and the crash marker carry the verbatim (expanded) text, ``--- Attached
   Context ---`` block included.
 - Image routing (text references vs native parts) is decided again for the current model, so after a
@@ -38,7 +44,11 @@ from typing import Any, Callable, Collection, Mapping, Optional
 # them unless this build lists them.
 REPLAY_PARAMS = ("image_paths", "verbatim_text")
 REPLAY_SOURCE_METHOD = "prompt.replay_source"
-PROMPT_SUBMIT_REPLAY = (*REPLAY_PARAMS, REPLAY_SOURCE_METHOD)
+# Later additions, named so a caller can tell this build has them: ``image_paths: []`` (a turn with no
+# images that leaves the staged list alone) and ``prompt.replay_source``'s ``replay_supported``.
+IMAGE_PATHS_EMPTY = "image_paths_empty"
+REPLAY_SUPPORTED = "replay_supported"
+PROMPT_SUBMIT_REPLAY = (*REPLAY_PARAMS, REPLAY_SOURCE_METHOD, IMAGE_PATHS_EMPTY, REPLAY_SUPPORTED)
 
 INVALID_PARAMS_CODE = 4004
 INVALID_PARAMS_REASON = "invalid_replay_params"
@@ -74,8 +84,9 @@ class AttachmentRefused(Exception):
 
 @dataclass(frozen=True)
 class SubmitReplay:
-    """``image_paths``: this turn's images in order (a path may repeat, as with ``image.attach``),
-    None = the staged ``attached_images`` (ordinary submit). ``verbatim_text``: the text is the
+    """``image_paths``: this turn's images in order (a path may repeat, as with ``image.attach``);
+    ``()`` = this turn has none; None = the staged ``attached_images`` (ordinary submit). Any list,
+    the empty one included, leaves the staged list unread and uncleared. ``verbatim_text``: the text is the
     turn's prepared text (no sanitizing, stop phrase, skill or ``@`` expansion)."""
 
     image_paths: Optional[tuple[str, ...]]
@@ -117,8 +128,8 @@ def parse_submit_replay(params: Mapping[str, Any]) -> Optional[SubmitReplay]:
     image_paths = None
     if "image_paths" in params:
         raw = params["image_paths"]
-        if not isinstance(raw, list) or not raw:
-            raise ReplayParamError("image_paths must be a non-empty list of paths")
+        if not isinstance(raw, list):
+            raise ReplayParamError("image_paths must be a list of paths")
         if len(raw) > MAX_IMAGE_PATHS:
             raise ReplayParamError(f"image_paths holds more than {MAX_IMAGE_PATHS} paths", TOO_MANY_IMAGES_REASON)
         image_paths = tuple(_image_path(value) for value in raw)
