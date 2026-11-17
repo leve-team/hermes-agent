@@ -8,10 +8,10 @@ stored text is already the prepared text. ``image_paths`` names this turn's imag
 the staged list; ``verbatim_text`` takes the text as the turn's prepared text. Parsing is pure; the
 file check (``check_image_files``) is the only I/O and runs before the submit changes anything.
 
-From a stored row: the text part (the row itself, or the first part of a content-part list) is the
-prepared text followed by one ``\\n@image:<format_reference_value(path)>`` line per image
-(``session_history._build_persist_message_with_image_refs``). ``text`` = the part without those
-trailing lines, ``image_paths`` = their unquoted paths in order; the turn writes the same row back.
+From a stored row: ``prompt.replay_source {session_id, row_id}`` returns the ``text`` and
+``image_paths`` to send (``session_history._replay_source``, the inverse of the row writer). A row
+written with images records their exact paths in ``display_metadata.image_paths``; an older row is
+parsed and reported ``exact: false`` whenever its own text cannot be told from appended lines.
 
 What a replay does NOT promise:
 - Only 4004/4144 come before anything else. Later refusals follow what every submit does first:
@@ -32,11 +32,13 @@ import stat
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Mapping, Optional
 
-# Advertised by ``gateway.capabilities`` (``prompt_submit_replay``). A module constant, not config: an
-# older core ignores unknown params (re-expands references, takes the staged images), so a caller must
-# not send them unless this build lists them.
+# Advertised by ``gateway.capabilities`` (``prompt_submit_replay``): the two ``prompt.submit`` params and
+# the read-only RPC that derives them from a stored row. A module constant, not config: an older core
+# ignores unknown params (re-expands references, takes the staged images), so a caller must not send
+# them unless this build lists them.
 REPLAY_PARAMS = ("image_paths", "verbatim_text")
-PROMPT_SUBMIT_REPLAY = REPLAY_PARAMS
+REPLAY_SOURCE_METHOD = "prompt.replay_source"
+PROMPT_SUBMIT_REPLAY = (*REPLAY_PARAMS, REPLAY_SOURCE_METHOD)
 
 INVALID_PARAMS_CODE = 4004
 INVALID_PARAMS_REASON = "invalid_replay_params"
@@ -46,6 +48,8 @@ ATTACHMENT_MISSING_REASON = "attachment_missing"
 ATTACHMENT_NOT_IMAGE_REASON = "attachment_not_image"
 UNSUPPORTED_CODE = 4145
 UNSUPPORTED_REASON = "prompt_submit_replay_unsupported"
+SOURCE_NOT_FOUND_CODE = 4146
+SOURCE_NOT_FOUND_REASON = "replay_source_not_found"
 # ``image.attach`` / ``pdf.attach`` put no limit on how many images one message stages (a PDF call
 # stages up to 25 pages, calls repeat), so this only bounds the request: far above any real row.
 MAX_IMAGE_PATHS = 1000
@@ -137,6 +141,14 @@ def image_file_refusal(path: str, image_extensions: Collection[str]) -> Optional
     if os.path.splitext(real)[1].lower() not in image_extensions:
         return ATTACHMENT_NOT_IMAGE_REASON
     return None
+
+
+def missing_images(image_paths: list[str], image_extensions: Callable[[], Collection[str]]) -> list[str]:
+    """The paths a replay would refuse (4144), in order, each once."""
+    if not image_paths:
+        return []
+    extensions = image_extensions()
+    return list(dict.fromkeys(p for p in image_paths if image_file_refusal(p, extensions) is not None))
 
 
 def check_image_files(replay: SubmitReplay, image_extensions: Callable[[], Collection[str]]) -> None:

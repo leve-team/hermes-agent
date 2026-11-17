@@ -978,6 +978,35 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": status, **survivor_fields, **(claim.record.payload() if claim else {})})
 
 
+@method("prompt.replay_source")
+def _(rid, params: dict) -> dict:
+    """Read-only: what to send to ``prompt.submit`` (with ``verbatim_text: true``) to replay the stored
+    user row ``row_id`` of this session as the same turn — ``{row_id, text, image_paths, exact, reason?,
+    missing, display_kind}``. The row may be inactive (just rewound). ``missing``: the ``image_paths``
+    a submit would refuse now (4144), so a caller can refuse before rewinding anything."""
+    from tui_gateway import submit_replay as sr
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    row_id = params.get("row_id")
+    if type(row_id) is not int or row_id < 1:
+        return _err(rid, sr.INVALID_PARAMS_CODE, "row_id must be a positive integer",
+                    {"reason": sr.INVALID_PARAMS_REASON})
+    session_key = str(session.get("session_key") or "")
+    with _session_db(session) as db:
+        if db is None:
+            return _err(rid, 5072, "session storage unavailable")
+        rows = db.get_messages(session_key, include_inactive=True, after_id=row_id - 1, limit=1) if session_key else []
+    row = rows[0] if rows and rows[0].get("id") == row_id and rows[0].get("role") == "user" else None
+    if row is None:
+        return _err(rid, sr.SOURCE_NOT_FOUND_CODE, f"no user row {row_id} in this session",
+                    {"reason": sr.SOURCE_NOT_FOUND_REASON})
+    source = _replay_source(row.get("content"), row.get("display_metadata"))
+    return _ok(rid, {"row_id": row_id, **source, "missing": sr.missing_images(source["image_paths"],
+                                                                            _allowed_image_extensions),
+                     "display_kind": row.get("display_kind")})
+
+
 # ── attachments ─────────────────────────────────────────────────────────────
 
 def _attached_image_result(session, image_path, **extra) -> dict:

@@ -48,9 +48,11 @@ class _RecordingAgent:
         return None
 
     def run_conversation(self, user_message, conversation_history=None, stream_callback=None,
-                         persist_user_message=None, **_kwargs):
+                         persist_user_message=None, persist_user_display_kind=None,
+                         persist_user_display_metadata=None, **_kwargs):
         self.model_inputs.append(user_message)
-        self.db.append_message(self.session_id, "user", persist_user_message)
+        self.db.append_message(self.session_id, "user", persist_user_message, display_kind=persist_user_display_kind,
+                               display_metadata=persist_user_display_metadata)
         self.db.append_message(self.session_id, "assistant", "ok")
         return {"final_response": "ok", "messages": [
             *(conversation_history or []),
@@ -96,19 +98,13 @@ def _rpc(method: str, **params) -> dict:
     return server._methods[method]("rid", {"session_id": "replay-sid", **params})
 
 
-def _last_user_row(db: SessionDB):
-    return [m for m in db.get_messages_as_conversation("replay-session") if m["role"] == "user"][-1]["content"]
+def _last_user_row(db: SessionDB) -> dict:
+    rows = db.get_messages("replay-session", include_inactive=True)
+    return [r for r in rows if r["role"] == "user"][-1]
 
 
-def _replay_request(stored) -> tuple[str, list[str]]:
-    """What the broker does with a stored row: take the text part, split off the trailing
-    ``@image:`` lines (unquoting ``format_reference_value``) as ``image_paths``."""
-    text = stored if isinstance(stored, str) else stored[0]["text"]
-    lines, paths = text.split("\n"), []
-    while lines and lines[-1].startswith("@image:"):
-        value = lines.pop()[len("@image:"):]
-        paths.insert(0, value[1:-1] if value[:1] in "`\"'" and value[-1:] == value[:1] else value)
-    return "\n".join(lines), paths
+def _stored(row: dict) -> tuple:
+    return row["content"], row.get("display_kind"), row.get("display_metadata")
 
 
 @pytest.mark.parametrize("image_mode", ["text", "native"])
@@ -116,26 +112,30 @@ def test_replay_reproduces_stored_turn_and_leaves_staged_images(replay_env, monk
     monkeypatch.setattr(agent.image_routing, "decide_image_input_mode", lambda *_a, **_k: image_mode)
     db, recorder, session, uploads = (replay_env[k] for k in ("db", "agent", "session", "uploads"))
 
-    assert _rpc("image.attach", path=str(uploads / "photo.png"))["result"]["attached"]
+    for _ in range(2):  # the same file attached twice is two images
+        assert _rpc("image.attach", path=str(uploads / "photo.png"))["result"]["attached"]
     assert _rpc("prompt.submit", text="compare @file:notes.txt")["result"]["status"] == "streaming"
     original = _last_user_row(db)
     assert session["attached_images"] == []  # an ordinary submit consumes the staged list
 
-    # The reply edited the referenced file, and another message staged its own image meanwhile.
+    # The reply edited the referenced file, another message staged its own image, and the caller
+    # rewound the turn (its row is now inactive).
     (replay_env["workspace"] / "notes.txt").write_text("rewritten\n", encoding="utf-8")
     other = _rpc("image.attach", path=str(uploads / "other.png"))["result"]["path"]
+    db.rewind_to_message("replay-session", original["id"])
     capabilities = server._methods["gateway.capabilities"]("rid", {})["result"]
-    assert {"image_paths", "verbatim_text"} <= set(capabilities["prompt_submit_replay"])
+    assert {"image_paths", "verbatim_text", "prompt.replay_source"} <= set(capabilities["prompt_submit_replay"])
 
-    text, image_paths = _replay_request(original)
+    source = _rpc("prompt.replay_source", row_id=original["id"])["result"]
+    assert (source["exact"], source["missing"]) == (True, [])
     # The stored row holds the expanded file snapshot (with a sequence the input sanitizer would
-    # rewrite) and the image; the replay is built from that row alone.
-    assert "--- Attached Context ---" in text and "09:00~18:00" in text
-    assert image_paths == [str((uploads / "photo.png").resolve())]
-    replayed = _rpc("prompt.submit", text=text, image_paths=image_paths, verbatim_text=True)
+    # rewrite) and the images; the replay is built from that row alone.
+    assert "--- Attached Context ---" in source["text"] and "09:00~18:00" in source["text"]
+    assert source["image_paths"] == [str((uploads / "photo.png").resolve())] * 2
+    replayed = _rpc("prompt.submit", text=source["text"], image_paths=source["image_paths"], verbatim_text=True)
 
     assert replayed["result"]["status"] == "streaming"
-    assert _last_user_row(db) == original
+    assert _stored(_last_user_row(db)) == _stored(original)
     assert recorder.model_inputs[1] == recorder.model_inputs[0]
     assert session["attached_images"] == [other]
 
@@ -248,3 +248,64 @@ def test_replay_submit_decides_before_touching_staged_images(replay_env, monkeyp
         assert reply["result"]["status"] == expected[1]
         if expected[1] == "streaming":  # image.attach accepts every path the replay accepted
             assert all(_rpc("image.attach", path=p).get("result") for p in resolved["image_paths"])
+
+
+
+def _row(env, content, *, role="user", metadata=None, session="replay-session") -> int:
+    if env["db"].get_session(session) is None:
+        env["db"].create_session(session, source="tui")
+    return env["db"].append_message(session, role, content, display_metadata=metadata)
+
+
+def _png(env, name: str = "photo.png") -> str:
+    return str(env["uploads"] / name)
+
+
+def _parts(text: str) -> list:
+    return [{"type": "text", "text": text}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]
+
+
+def _inexact(reason: str) -> dict:
+    return {"exact": False, "reason": reason}
+
+
+# (row factory, expected): ``text`` / ``image_paths`` / ``missing`` hold "{up}" for the uploads dir.
+@pytest.mark.parametrize(("make_row", "expected"), [
+    (lambda env: _row(env, "hi"), {"exact": True, "text": "hi", "image_paths": [], "missing": []}),
+    (lambda env: _row(env, "see @image:/typed.png here"),
+     {"exact": True, "text": "see @image:/typed.png here", "image_paths": []}),
+    (lambda env: _row(env, f"a\n@image:{_png(env)}\n@image:{_png(env)}", metadata={"image_paths": [_png(env)] * 2}),
+     {"exact": True, "text": "a", "image_paths": ["{up}/photo.png"] * 2, "missing": []}),
+    (lambda env: _row(env, f"@image:`{_png(env, 'my photo.png')}`", metadata={"image_paths": [_png(env, "my photo.png")]}),
+     {"exact": True, "text": "", "image_paths": ["{up}/my photo.png"], "missing": ["{up}/my photo.png"]}),
+    (lambda env: _row(env, _parts(f"a\n@image:{_png(env)}"), metadata={"image_paths": [_png(env)]}),
+     {"exact": True, "text": "a", "image_paths": ["{up}/photo.png"]}),
+    (lambda env: _row(env, _parts(f"a\n@image:{_png(env)}")), {"exact": True, "text": "a", "image_paths": ["{up}/photo.png"]}),
+    (lambda env: _row(env, f"a\n@image:{_png(env)}"), _inexact("unrecorded_image_refs")),
+    (lambda env: _row(env, _parts(f"a\n@image:{_png(env)}\n@image:/typed.png")), _inexact("unmapped_content_parts")),
+    (lambda env: _row(env, "a\n@image:/x.png", metadata={"image_paths": ["/y.png"]}), _inexact("recorded_images_mismatch")),
+    (lambda env: _row(env, "[The user attached an image: p.png]\nwhat is it"), _inexact("legacy_image_note")),
+    (lambda env: _row(env, "a\n@image:my photo.png"), _inexact("image_ref_does_not_round_trip")),
+    (lambda env: _row(env, "ok", role="assistant"), {"error": 4146}),
+    (lambda env: _row(env, "theirs", session="someone-else"), {"error": 4146}),
+    (lambda env: 0, {"error": 4004}),
+    (lambda env: True, {"error": 4004}),
+])
+def test_replay_source_derives_the_submit_from_the_stored_row(replay_env, make_row, expected):
+    """``prompt.replay_source`` is the inverse of the row writer, read-only, for this session's user
+    rows only (a just-rewound row included): exact only when the row itself says which ``@image:``
+    lines the core appended; ``missing`` lists what a submit would refuse right now."""
+    row_id = make_row(replay_env)
+    if type(row_id) is int and row_id > 0 and "error" not in expected:
+        replay_env["db"].rewind_to_message("replay-session", row_id)  # the caller rewinds before reading
+    before = replay_env["db"].get_messages("replay-session", include_inactive=True)
+
+    reply = _rpc("prompt.replay_source", row_id=row_id)
+
+    assert replay_env["db"].get_messages("replay-session", include_inactive=True) == before
+    if "error" in expected:
+        assert reply["error"]["code"] == expected["error"]
+        return
+    up = str(replay_env["uploads"])
+    want = {k: [p.format(up=up) for p in v] if isinstance(v, list) else v for k, v in expected.items()}
+    assert {k: reply["result"].get(k) for k in want} == want

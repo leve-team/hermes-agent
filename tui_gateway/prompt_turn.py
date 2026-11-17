@@ -602,9 +602,11 @@ def _invoke_agent(
         run_params = {}
     if "task_id" in run_params:
         run_kwargs["task_id"] = session["session_key"]
-    if display_kind and "persist_user_display_kind" in run_params:
+    # A row written with images also records their exact paths (session_history._replay_source).
+    row_metadata = _image_paths_display_metadata(display_metadata, images) if images else display_metadata
+    if (display_kind or row_metadata is not display_metadata) and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
-        run_kwargs["persist_user_display_metadata"] = display_metadata
+        run_kwargs["persist_user_display_metadata"] = row_metadata
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
     # Live-rename hook: auto-titling fires inside the turn prologue.
