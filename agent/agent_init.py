@@ -2168,7 +2168,7 @@ _CALLBACK_PARAMS = (
     "read_window_below_callback", "setup_mcp_callback", "tour_callback",
     "step_callback", "stream_delta_callback", "interim_assistant_callback",
     "status_callback", "notice_callback", "notice_clear_callback",
-    "event_callback", "reaction_callback", "tool_gen_callback",
+    "event_callback", "reaction_callback", "tool_gen_callback", "generation_progress_callback",
 )
 
 
@@ -2191,8 +2191,8 @@ def init_agent(
     read_window_below_callback: callable = None, setup_mcp_callback: callable = None,
     tour_callback: callable = None, step_callback: callable = None,
     stream_delta_callback: callable = None, interim_assistant_callback: callable = None,
-    tool_gen_callback: callable = None, status_callback: callable = None,
-    notice_callback: callable = None, notice_clear_callback: callable = None,
+    tool_gen_callback: callable = None, generation_progress_callback: callable = None,
+    status_callback: callable = None, notice_callback: callable = None, notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None, max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None, service_tier: str = None,
