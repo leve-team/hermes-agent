@@ -616,11 +616,12 @@ def _client_request_id(rid, params, name):
         return None, _idempotency_store_error(rid, exc)
 
 
-def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id, hosted_task):
+def _claim_submit_turn(rid, sid, session, fingerprint, text, params, client_msg_id, hosted_task):
     """Claim ``client_msg_id`` and, inside the same advisory-locked PostgreSQL
     transaction, lock in the turn: ``(claim, None)`` when this request owns a turn,
     else ``(None, reply)`` — the recorded state of a duplicate, a conflict (4141),
-    the busy refusal (4143) or an unavailable store (5140)."""
+    the busy refusal (4143) or an unavailable store (5140). ``fingerprint``: what a
+    retry of the same id must match (``submit_idempotency.fingerprint``)."""
     from tui_gateway import submit_idempotency as idem
     busy = _err(
         rid, 4143, "session busy: resubmit the same client_msg_id after the current turn",
@@ -636,7 +637,7 @@ def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id,
 
     try:
         claim = idem.claim_submit(
-            str(session.get("session_key") or sid), client_msg_id, idem.fingerprint(raw_text),
+            str(session.get("session_key") or sid), client_msg_id, fingerprint,
             ui_session_id=sid, admit=admit)
     except Exception as exc:
         if admitted:  # the turn was locked in but the record never committed
@@ -861,8 +862,9 @@ def _(rid, params: dict) -> dict:
         if err is not None:
             return err
     else:
+        from tui_gateway.submit_idempotency import fingerprint
         claim, reply = _claim_submit_turn(
-            rid, sid, session, raw_text, text, params, client_msg_id, hosted_task)
+            rid, sid, session, fingerprint(raw_text), text, params, client_msg_id, hosted_task)
         if claim is None:
             return reply
         survivor_fields = {}
