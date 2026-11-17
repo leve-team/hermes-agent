@@ -31,6 +31,9 @@ from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.generation_feeds import (feed_anthropic_event, feed_bedrock_event, feed_chat_chunk,
+    is_provider_progress_chunk, metered_events)
+from agent.generation_progress import open_generation_progress
 # Remote endpoints must never be fingerprinted: the probe waterfall is only valid for local/LM-Studio/Ollama
 # boxes. Non-Ollama remotes (sglang, vLLM, OpenAI-compat) expose Ollama-compat endpoints that can
 # misidentify and, without an api_key, return 401 on every leg (issue #89863).
@@ -2363,6 +2366,7 @@ class _BedrockStream:
         self.region = api_kwargs.get("__bedrock_region__", "us-east-1")
         # Same patience budget as the OpenAI/Anthropic stale detector.
         self.stale_timeout = _derive_stream_stale_timeout(agent, api_kwargs)
+        self.generation_progress = open_generation_progress(agent)
 
     def _model(self) -> str:
         return self.api_kwargs.get("modelId", "unknown")
@@ -2430,7 +2434,11 @@ class _BedrockStream:
                 completed_response_predicate=lambda response: bool(getattr(response, "choices", None)),
                 metadata=_relay_stream_metadata(agent, "custom"), defer_logical_completion=True)
             wants_reasoning = agent.reasoning_callback or agent.stream_delta_callback or plugin_reasoning_observer
-            streamed_response = stream_converse_with_callbacks({"stream": stream},
+            progress = self.generation_progress
+            if progress is not None:
+                progress.start_attempt()
+            events = stream if progress is None else metered_events(stream, progress, feed_bedrock_event)
+            streamed_response = stream_converse_with_callbacks({"stream": events},
                 on_text_delta=self._after_first(agent._fire_stream_delta) if agent._has_stream_consumers() else None,
                 on_tool_start=self._after_first(agent._fire_tool_gen_started),
                 on_reasoning_delta=self._after_first(agent._fire_reasoning_delta) if wants_reasoning else None,
@@ -2483,6 +2491,8 @@ class _BedrockStream:
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
+            if self.generation_progress is not None and t.is_alive() and not self.agent._interrupt_requested:
+                self.generation_progress.poll()
             self._raise_if_interrupted("Agent interrupted during Bedrock API call", worker=t)
             stale_elapsed = time.time() - self.last_event
             if stale_elapsed > self.stale_timeout:
@@ -2597,6 +2607,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
+        self.generation_progress = open_generation_progress(agent)
 
     # ── shared small helpers ────────────────────────────────────────────
 
@@ -2685,6 +2696,14 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent.stream_delta_callback:
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
+    def _metered(self, events, feed):
+        """``events`` fed to this call's progress reporter as a new attempt; unchanged when nobody listens."""
+        progress = self.generation_progress
+        if progress is None:
+            return events
+        progress.start_attempt()
+        return metered_events(events, progress, feed)
+
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
         self.clients.diag = diag
@@ -2696,7 +2715,8 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._touch_activity("receiving stream response")
         with contextlib.suppress(Exception):
             diag["chunks"] = int(diag.get("chunks", 0)) + 1
-            if diag.get("first_chunk_at") is None:
+            # TTFB stays "first output": a provider's progress-only chunk is liveness, not content.
+            if diag.get("first_chunk_at") is None and not is_provider_progress_chunk(chunk):
                 diag["first_chunk_at"] = self.last_chunk_time["t"]
             # Delta-length estimate: ~3x cheaper than repr() per chunk.
             diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
@@ -2841,7 +2861,8 @@ class _StreamingCall(StreamingWaitMonitor):
             # Hermes interrupts the managed stream; Relay alone closes the provider stream.
             self.clients.set_stream_handle(stream)
 
-        for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
+        chunks = _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response)
+        for chunk in self._metered(chunks, feed_chat_chunk):
             self._count_chunk(_diag, chunk)
             if self.agent._interrupt_requested:
                 # A half-read SSE response stays checked out of the httpx pool and the finally
@@ -3067,7 +3088,7 @@ class _StreamingCall(StreamingWaitMonitor):
             accept_chunk=lambda _event: self._writer_still_current("Anthropic streaming"),
             metadata=_relay_stream_metadata(self.agent, "anthropic_messages"), defer_logical_completion=True))
         try:
-            for event in stream:
+            for event in self._metered(stream, feed_anthropic_event):
                 saw_stream_event = True
                 self._count_chunk(_diag, event)
                 if self.agent._interrupt_requested:
