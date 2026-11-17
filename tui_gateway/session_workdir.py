@@ -367,15 +367,29 @@ def _session_db(session: dict):
 
 
 def _rewind_active_session_history(
-    session: dict, user_ordinal: int, *, require_retryable: bool = False) -> tuple[list[dict], dict, int]:
+    session: dict, user_ordinal: int, *, require_retryable: bool = False,
+    expectation=None) -> tuple[list[dict], dict, int]:
     """Rewind one canonical user turn while retaining carrier scaffolding. Caller holds ``history_lock``. Persistent
     sessions archive the target and tail, inserting a composite carrier's hidden handoff in the same transaction; memory
-    is installed only after the durable commit, from the validated prefix + returned scaffold row id (no reload)."""
+    is installed only after the durable commit, from the validated prefix + returned scaffold row id (no reload).
+
+    ``expectation`` (``tui_gateway.undo_expectation.UndoExpectation``; only for the last user turn) refuses with
+    ``RewindExpectationMismatch`` before any write unless the durable transcript's last user-originated row is
+    ``expect_row_id``. That row is computed from a durable read made right AFTER the active-id read whose set the
+    rewind transaction re-checks, so any change in between (or later) refuses in-transaction; the transaction also
+    compares the ids it deactivates with ``expect_tail_row_ids``. A session without a durable transcript has no row
+    identity and always refuses. Loaded-history divergence raises the same type (``loaded_history``) so a conditional
+    caller can tell it from an unknown outcome."""
     from agent.context_compressor import (
         history_before_user_originated_turn, retryable_user_text, split_user_originated_turn,
         user_originated_turn_view)
     from agent.memory_manager import sanitize_context
     from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
+    from hermes_state_errors import RewindExpectationMismatch
+
+    def _history_changed():
+        return RewindExpectationMismatch(
+            "loaded_history", None, None, "session history changed before the rewind could be persisted")
 
     def _comparison_content(message: dict) -> Any:
         content = message.get("content")
@@ -398,11 +412,15 @@ def _rewind_active_session_history(
     user_indices = _user_indices(history)
     if user_ordinal < 0 or user_ordinal >= len(user_indices):
         raise ValueError("target user message is no longer in session history")
+    if expectation is not None and user_ordinal != len(user_indices) - 1:
+        raise ValueError("an undo expectation only applies to the last user turn")
     target_index = user_indices[user_ordinal]
     installed, live_view = history_before_user_originated_turn(history, target_index)
     rewound_count = len(history) - target_index
 
     session_key = str(session.get("session_key") or "").strip()
+    if expectation is not None and not session_key:
+        expectation.check_target(None)
     persisted = False
     if session_key:
         with _session_db(session) as db:
@@ -411,13 +429,16 @@ def _rewind_active_session_history(
             expected_active_ids = db.get_active_message_ids(session_key)
             durable = db.get_messages_as_conversation(session_key, include_row_ids=True)
             durable_user_indices = _user_indices(durable)
+            if expectation is not None:
+                # Before the count check: a turn another process added is a stale target, not loaded-history drift.
+                expectation.check_target(durable[durable_user_indices[-1]].get("_row_id") if durable_user_indices else None)
             if len(durable_user_indices) != len(user_indices):
-                raise RuntimeError("session history changed before the rewind could be persisted")
+                raise _history_changed()
             durable_target_index = durable_user_indices[user_ordinal]
             durable_target = durable[durable_target_index]
             durable_prefix, durable_live_view = history_before_user_originated_turn(durable, durable_target_index)
             if _comparison_content(durable_live_view) != _comparison_content(live_view):
-                raise RuntimeError("session history changed before the rewind could be persisted")
+                raise _history_changed()
             if not isinstance(target_row_id := durable_target.get("_row_id"), int):
                 raise RuntimeError("rewind target has no durable row identity")
             if require_retryable:
@@ -425,7 +446,8 @@ def _rewind_active_session_history(
             scaffold, _ = split_user_originated_turn(durable_target)
             result = db.rewind_to_message(
                 session_key, target_row_id, preserve_compaction_handoff=scaffold is not None,
-                expected_active_ids=expected_active_ids, expected_target_content=durable_live_view.get("content"))
+                expected_active_ids=expected_active_ids, expected_target_content=durable_live_view.get("content"),
+                expected_tail_row_ids=None if expectation is None else expectation.expect_tail_row_ids)
             if scaffold is not None:
                 if not isinstance(replacement_id := result.get("replacement_message_id"), int):
                     raise RuntimeError("rewind commit did not return the replacement scaffold id")

@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import re
 
+# A degraded form that touches a number is a range the user wrote, not a leaked marker (#143444):
+# "09:00~18:00", "13:00~ 시작", "2001~ 2005", "2024-01~", "[200~300]", "00~06시".
+_NO_NUMBER_AFTER = r"(?![ \t]*\d)"
+_NO_NUMBER_BEFORE = r"(?<!\d)(?<!\d[-./:,])"
+# A colon opens a paste after a label ("note:"), never after a digit, a space or a line start (":00~" minutes).
+_DIGIT_OPENER_BOUNDARY = r"(^|[\s>\]\)]|(?<=[^\s\d]):)"
+
 # Degraded visible bracketed-paste forms, matched only at boundaries so embedded literals stay intact.
 _BOUNDARY_SUBS = (
-    (re.compile(r"(^|[\s\n>:\]\)])\[200~"), r"\1"),
-    (re.compile(r"\[201~(?=$|[\s\n<\[\(\):;.,!?])"), ""),
-    (re.compile(r"(^|[\s\n>:\]\)])00~"), r"\1"),
-    (re.compile(r"01~(?=$|[\s\n<\[\(\):;.,!?])"), ""),
+    (re.compile(r"(^|[\s\n>:\]\)])\[200~" + _NO_NUMBER_AFTER), r"\1"),
+    (re.compile(r"\[201~(?=$|[\s\n<\[\(\):;.,!?])" + _NO_NUMBER_AFTER), ""),
+    (re.compile(_DIGIT_OPENER_BOUNDARY + r"00~" + _NO_NUMBER_AFTER), r"\1"),
+    (re.compile(_NO_NUMBER_BEFORE + r"01~(?=$|[\s\n<\[\(\):;.,!?])" + _NO_NUMBER_AFTER), ""),
 )
 
 # Corruption signature from desktop bracketed-paste leaks (#62557).
@@ -18,7 +25,8 @@ _DESKTOP_PASTE_ARTIFACT = "~[[e"
 
 def strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     """Strip leaked bracketed-paste wrapper markers: canonical wrappers unconditionally, degraded visible forms
-    (``[200~`` / ``[201~`` and ``00~`` / ``01~``) only at boundaries so ``literal[200~tag`` stays intact."""
+    (``[200~`` / ``[201~`` and ``00~`` / ``01~``) only at boundaries and never beside a number, so
+    ``literal[200~tag`` and ``09:00~18:00`` stay intact."""
     if not text:
         return text
     for wrapper in ("\x1b[200~", "\x1b[201~", "^[[200~", "^[[201~"):
