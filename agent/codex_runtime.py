@@ -13,6 +13,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.generation_feeds import chars_of, tool_name_of
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.usage_anchor import set_usage_anchor
 
@@ -597,9 +598,11 @@ class _CodexResponseAssembler:
     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
     saw_response_completed = False
 
-    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta):
+    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta,
+                 on_tool_start=None):
         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
         self.on_commentary_message, self.on_first_delta = on_commentary_message, on_first_delta
+        self.on_tool_start = on_tool_start
         self.output_items: List[Any] = []
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
         # back in stream order.
@@ -627,6 +630,9 @@ class _CodexResponseAssembler:
             self.next_output_sequence += 1
         if "function_call" in str(item_type):
             self.has_tool_calls = True
+            if tool_name := _event_field(item, "name"):
+                # The model starts writing this call's arguments (same signal as the other wires).
+                self._safe(self.on_tool_start, "on_tool_start", tool_name)
             if item_id:
                 announced_sequence, announced_index = self.announced_output_order[item_id]
                 self.pending_function_calls[item_id] = {
@@ -775,9 +781,44 @@ class _CodexResponseAssembler:
             error=self.terminal_error)
 
 
+def _feed_codex_function_call(progress, event: Any) -> None:
+    item = _event_field(event, "item")
+    if "function_call" in str(_event_field(item, "type", "")):
+        progress.add("tool_call", chars_of(_event_field(item, "arguments")), name=tool_name_of(_event_field(item, "name")),
+                     tool_key=_event_field(event, "output_index"))
+
+
+def _feed_codex_arguments(progress, event: Any) -> None:
+    progress.add("tool_call", chars_of(_event_field(event, "delta")), tool_key=_event_field(event, "output_index"))
+
+
+def _feed_codex_text(progress, event: Any) -> None:
+    progress.add("text", chars_of(_event_field(event, "delta")))
+
+
+def _feed_codex_reasoning(progress, event: Any) -> None:
+    progress.add("reasoning", chars_of(_event_field(event, "delta")))
+
+
+_CODEX_PROGRESS_FEEDS = {
+    "response.output_item.added": _feed_codex_function_call,
+    "response.function_call_arguments.delta": _feed_codex_arguments,
+    "response.output_text.delta": _feed_codex_text, "response.text.delta": _feed_codex_text,
+    "response.reasoning_summary_text.delta": _feed_codex_reasoning, "response.reasoning_text.delta": _feed_codex_reasoning,
+}
+
+
+def feed_codex_event(progress, event: Any) -> None:
+    """Responses SSE event -> ``generation.progress`` counts (``output_index`` is the tool key)."""
+    event_type = _event_field(event, "type", "")
+    feed = _CODEX_PROGRESS_FEEDS.get(event_type) if isinstance(event_type, str) else None
+    if feed is not None:
+        feed(progress, event)
+
+
 def _consume_codex_event_stream(
     event_iter: Any, *, model: str, on_text_delta=None, on_reasoning_delta=None, on_commentary_message=None,
-    on_first_delta=None, on_event=None, interrupt_check=None,
+    on_first_delta=None, on_event=None, interrupt_check=None, on_tool_start=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -786,11 +827,12 @@ def _consume_codex_event_stream(
     Callbacks: ``on_text_delta`` per output_text delta, suppressed once a function_call is seen;
     ``on_reasoning_delta`` for reasoning and ``phase=analysis`` deltas (also commentary without a commentary
     callback); ``on_commentary_message`` once per completed ``phase=commentary`` message, before any following
-    tool item; ``on_first_delta`` one-shot; ``on_event`` every event before any processing; ``interrupt_check()``
-    True breaks the loop and may raise ``TimeoutError`` / ``InterruptedError`` for request retirement that
-    must not become a partial final response."""
+    tool item; ``on_tool_start`` once per announced function call; ``on_first_delta`` one-shot; ``on_event``
+    every event before any processing; ``interrupt_check()`` True breaks the loop and may raise
+    ``TimeoutError`` / ``InterruptedError`` for request retirement that must not become a partial final response."""
     assembler = _CodexResponseAssembler(model=model, on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
-                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta)
+                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
+                                        on_tool_start=on_tool_start)
     for event in event_iter:
         if on_event is not None:
             try:
@@ -885,6 +927,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     )
     # Delta-sink claim for the CURRENT physical attempt (None until the stream opens).
     writer_token = {"value": None}
+    # generation.progress reporter for this model call (the request's poll thread emits it), or None.
+    progress = getattr(watchdog_state, "generation_progress", None)
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -909,6 +953,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 if has_progress:
                     watchdog_state.last_progress_ts = now
         agent._touch_activity("receiving stream response")
+        if progress is not None:
+            feed_codex_event(progress, event)
 
     def _interrupt_or_superseded() -> bool:
         # A retired request must NOT break out of the consume loop (that returns a partial ``final`` with
@@ -976,6 +1022,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     show_commentary = getattr(agent, "show_commentary", True)
     wants_commentary = getattr(agent, "interim_assistant_callback", None) is not None and show_commentary
     on_commentary_message = _fenced(lambda text: agent._fire_streamed_codex_commentary(text)) if wants_commentary else None
+    # getattr: stand-in agents drive this path with only the attrs it needs (see _sanitize_consumer_codex_request).
+    fire_tool_started = getattr(agent, "_fire_tool_gen_started", None)
+    on_tool_start = _fenced(fire_tool_started) if fire_tool_started is not None else None
     call_role = ("delegated" if getattr(agent, "is_subagent", False)
                  else "fallback" if int(getattr(agent, "_fallback_index", 0) or 0) > 0 else "primary")
     for attempt in range(max_stream_retries + 1):
@@ -990,6 +1039,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 watchdog_state.retry_started_ts = time.time()
         intercepted_events: list = []
         writer_token["value"] = event_stream = None
+        if progress is not None:
+            progress.start_attempt()  # a reconnect regenerates the output from scratch
         try:
             try:
                 event_stream = relay_llm.stream(
@@ -1008,7 +1059,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     event_stream, model=model, on_text_delta=_fenced(_on_text_delta),
                     on_reasoning_delta=_fenced(lambda text: agent._fire_reasoning_delta(text)),
                     on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
-                    on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
+                    on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded, on_tool_start=on_tool_start,
                 )
             except transport_errors as exc:
                 if attempt >= max_stream_retries:

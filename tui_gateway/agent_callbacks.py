@@ -78,6 +78,10 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+# Every session agent gets a generation_progress_callback (gateway.capabilities advertises it).
+GENERATION_PROGRESS_EVENT = "generation.progress"
+
+
 def _agent_cbs(sid: str) -> dict:
     def _read_block(event: str, timeout: int):
         # read_terminal / read_preview (desktop GUI): blocking bridge like clarify; the preview
@@ -92,6 +96,9 @@ def _agent_cbs(sid: str) -> dict:
         "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
             sid, event_type, name, preview, args, **kwargs),
         "tool_gen_callback": lambda name: _tool_progress_enabled(sid) and _emit("tool.generating", sid, {"name": name}),
+        # Output size of the running model call (≤1/s, poll-thread driven); gated like tool.generating.
+        "generation_progress_callback": lambda payload: _tool_progress_enabled(sid) and _emit(
+            GENERATION_PROGRESS_EVENT, sid, payload),
         "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
         # Affection reaction (ily / <3 / good bot) → hearts; core-detected so TUI/desktop share it.
         "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
