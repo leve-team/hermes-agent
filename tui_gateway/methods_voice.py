@@ -437,9 +437,11 @@ def _(rid, params: dict) -> dict:
     module, never config: a believed-but-absent capability is worse."""
     from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
     from tui_gateway.agent_callbacks import GENERATION_PROGRESS_EVENT
+    from tui_gateway.submit_replay import PROMPT_SUBMIT_REPLAY
     from tui_gateway.undo_expectation import SESSION_UNDO_EXPECTATIONS
     return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT),
                      "generation_progress": bool(GENERATION_PROGRESS_EVENT),
+                     "prompt_submit_replay": list(PROMPT_SUBMIT_REPLAY),
                      "session_undo_expectations": list(SESSION_UNDO_EXPECTATIONS)})
 
 

@@ -484,12 +484,13 @@ def _early_turn_result(session, result_callback, error):
 
 
 def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None,
-                           stored_user_row=None, result_callback=None, trusted_context=None):
+                           stored_user_row=None, result_callback=None, trusted_context=None, replay=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run. ``stored_user_row``: a resumed ``client_msg_id``
     turn answers that stored user row instead of writing one. ``result_callback``: receives
     the turn's result receipt once, before its terminal frame (``_run_prompt_submit``).
-    ``trusted_context``: the submit's turn ticket, for this turn's tool handlers only."""
+    ``trusted_context``: the submit's turn ticket, for this turn's tool handlers only.
+    ``replay``: the submit's ``SubmitReplay`` (its own images, verbatim text), else None."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
@@ -524,7 +525,7 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
         rid, sid, session, text, display_kind=display_kind,
         terminal_callback=hosted_terminal_callback, turn_author=turn_author,
         stored_user_row=stored_user_row, result_callback=result_callback,
-        **_trusted_context_kwargs(trusted_context))
+        **_trusted_context_kwargs(trusted_context), **({} if replay is None else replay.turn_kwargs()))
 
 
 def _take_trusted_context(params):
@@ -542,6 +543,55 @@ def _trusted_context_kwargs(trusted_context) -> dict:
     """Only a ticketed turn passes ``trusted_context=``: an unticketed submit calls the turn
     functions exactly as before."""
     return {} if trusted_context is None else {"trusted_context": trusted_context}
+
+
+def _replay_kwargs(replay) -> dict:
+    """Only a replay submit passes ``replay=``: an ordinary submit calls the turn functions
+    exactly as before."""
+    return {} if replay is None else {"replay": replay}
+
+
+def _parse_submit_replay(rid, params):
+    """``(replay, err)`` for ``image_paths`` / ``verbatim_text`` (tui_gateway/submit_replay.py).
+    Runs before the submit reads its session or changes anything: a malformed key (4004) or an
+    image ``image.attach`` would refuse (4144) refuses the whole submit."""
+    from tui_gateway import submit_replay as sr
+    try:
+        replay = sr.parse_submit_replay(params)
+        if replay is not None:
+            sr.check_image_files(replay, _allowed_image_extensions)
+    except sr.ReplayParamError as exc:
+        return None, _err(rid, sr.INVALID_PARAMS_CODE, str(exc), {"reason": exc.reason})
+    except sr.AttachmentRefused as exc:
+        return None, _err(rid, sr.ATTACHMENT_CODE, str(exc), {"reason": exc.reason, "path": exc.path})
+    return replay, None
+
+
+def _replay_unsupported_reason(session):
+    """Why a replay submit on this session would get 4145 now (``"compute_isolation"``: its turns run
+    on a compute host, which rebuilds the input from the staged images in another process), else None.
+    Per-session state: ``prompt.replay_source`` reports it ahead, the submit asks again."""
+    return "compute_isolation" if _session_uses_compute_host(
+        session, _load_dashboard_process_isolation_config()) else None
+
+
+def _compute_isolation_refusal(rid, session):
+    """4145 right after the session lookup; asked again where the submit decides inline vs compute
+    host, so a replay never reaches the compute host."""
+    return None if _replay_unsupported_reason(session) is None else _compute_isolation_error(rid)
+
+
+def _compute_isolation_error(rid):
+    from tui_gateway import submit_replay as sr
+    return _err(rid, sr.UNSUPPORTED_CODE, "image_paths/verbatim_text are not supported with compute isolation",
+                {"reason": sr.UNSUPPORTED_REASON, "with": "compute_isolation"})
+
+
+def _replay_busy_error(rid):
+    """A replay is never steered, redirected or queued (those carry neither its images nor its
+    text mode): a busy session refuses it with the id-carrying submit's busy reply."""
+    return _err(rid, 4143, "session busy: resubmit the replayed turn after the current turn",
+                {"reason": "session_busy", "retryable": True})
 
 
 _TRUNCATION_PARAMS = (
@@ -616,11 +666,12 @@ def _client_request_id(rid, params, name):
         return None, _idempotency_store_error(rid, exc)
 
 
-def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id, hosted_task):
+def _claim_submit_turn(rid, sid, session, fingerprint, text, params, client_msg_id, hosted_task):
     """Claim ``client_msg_id`` and, inside the same advisory-locked PostgreSQL
     transaction, lock in the turn: ``(claim, None)`` when this request owns a turn,
     else ``(None, reply)`` — the recorded state of a duplicate, a conflict (4141),
-    the busy refusal (4143) or an unavailable store (5140)."""
+    the busy refusal (4143) or an unavailable store (5140). ``fingerprint``: what a
+    retry of the same id must match (``submit_idempotency.fingerprint``)."""
     from tui_gateway import submit_idempotency as idem
     busy = _err(
         rid, 4143, "session busy: resubmit the same client_msg_id after the current turn",
@@ -636,7 +687,7 @@ def _claim_submit_turn(rid, sid, session, raw_text, text, params, client_msg_id,
 
     try:
         claim = idem.claim_submit(
-            str(session.get("session_key") or sid), client_msg_id, idem.fingerprint(raw_text),
+            str(session.get("session_key") or sid), client_msg_id, fingerprint,
             ui_session_id=sid, admit=admit)
     except Exception as exc:
         if admitted:  # the turn was locked in but the record never committed
@@ -672,7 +723,7 @@ def _release_submit_claim(claim):
 
 
 def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
-                        trusted_context=None):
+                        trusted_context=None, replay=None):
     """Turn thread body for a claimed ``client_msg_id``: run the turn (a resumed claim on
     its stored user row), wait for the agent thread it hands off to, then settle the
     record (``completed`` once the user row exists, else ownerless ``accepted`` so a retry
@@ -688,7 +739,7 @@ def _run_claimed_submit(claim, rid, sid, session, text, display_kind, hosted_ter
     try:
         _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
                                stored_user_row=claim.stored_user_row, result_callback=result_callback,
-                               **_trusted_context_kwargs(trusted_context))
+                               **_trusted_context_kwargs(trusted_context), **_replay_kwargs(replay))
         turn_thread = session.get("_run_thread")
         if turn_thread is not None and turn_thread is not threading.current_thread():
             turn_thread.join()
@@ -763,14 +814,20 @@ def _(rid, params: dict) -> dict:
     # The broker's user-authority ticket (``_levos_turn``): off ``params`` before anything
     # else reads them; only this turn's tool handlers see it (tools.trusted_context).
     trusted_context = _take_trusted_context(params)
+    replay, err = _parse_submit_replay(rid, params)
+    if err is not None:
+        return err
+    # A verbatim text is a stored turn's prepared text, not typed input: no sanitizing, no
+    # stop phrase, no skill or @-reference expansion.
+    verbatim = replay is not None and replay.verbatim_text
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
-    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) and not verbatim else raw_text
     # Off-screen sends (widget intents) type the row so no client renders a bubble;
     # whitelisted to "hidden" — this RPC must not mint kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
-    if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
+    if not verbatim and (stopped := _typed_stop_phrase_response(rid, text)) is not None:
         return stopped
     if params.get("interrupted"):
         # Client-side barge-in: latch so this turn's model message carries the note.
@@ -778,6 +835,8 @@ def _(rid, params: dict) -> dict:
         mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
+        return err
+    if replay is not None and (err := _compute_isolation_refusal(rid, session)) is not None:
         return err
     client_msg_id, err = _client_request_id(rid, params, "client_msg_id")
     if err is not None:
@@ -810,13 +869,16 @@ def _(rid, params: dict) -> dict:
     session["voice_live_context"] = (
         voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
     has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
-    if has_truncation and isinstance(text, str):
+    if has_truncation and isinstance(text, str) and not verbatim:
         # A rewind replays what the transcript shows: re-expand a skill invocation or
         # `/work fix it` sends nine literal chars.
         text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
         return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
+    if replay is not None and turn_isolation:
+        # The answer can change after the early check (config reload, session state).
+        return _compute_isolation_error(rid)
     if client_msg_id is not None and (has_truncation or turn_isolation):
         # A rewind re-inserts survivor rows above the record's watermark, and a compute-host
         # turn settles out of this process: neither can be told apart from a stored message.
@@ -839,7 +901,7 @@ def _(rid, params: dict) -> dict:
     # steer/redirect/queue it would get are in-memory, so its claim refuses a busy session.
     # A busy/queued submit drops its ticket: the steer joins a turn that has its own, and a
     # queued prompt runs later as a turn of no submit.
-    while client_msg_id is None:
+    while client_msg_id is None and replay is None:
         with session["history_lock"]:
             if not session.get("running"):
                 break
@@ -857,12 +919,15 @@ def _(rid, params: dict) -> dict:
     claim = None
     if client_msg_id is None:
         err, survivor_fields = _lock_in_submit_turn(
-            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
+            rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task,
+            busy_error=None if replay is None else _replay_busy_error(rid))
         if err is not None:
             return err
     else:
+        from tui_gateway.submit_idempotency import fingerprint
         claim, reply = _claim_submit_turn(
-            rid, sid, session, raw_text, text, params, client_msg_id, hosted_task)
+            rid, sid, session, fingerprint(raw_text if replay is None else replay.fingerprint_payload(raw_text)),
+            text, params, client_msg_id, hosted_task)
         if claim is None:
             return reply
         survivor_fields = {}
@@ -901,13 +966,13 @@ def _(rid, params: dict) -> dict:
         run_thread = threading.Thread(
             target=lambda: _run_after_agent_ready(
                 rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
-                **_trusted_context_kwargs(trusted_context)),
+                **_trusted_context_kwargs(trusted_context), **_replay_kwargs(replay)),
             daemon=True)
     else:
         run_thread = threading.Thread(
             target=lambda: _run_claimed_submit(
                 claim, rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
-                **_trusted_context_kwargs(trusted_context)),
+                **_trusted_context_kwargs(trusted_context), **_replay_kwargs(replay)),
             daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -916,6 +981,39 @@ def _(rid, params: dict) -> dict:
     from tui_gateway.submit_idempotency import RESUME
     status = RESUME if claim is not None and claim.outcome == RESUME else "streaming"
     return _ok(rid, {"status": status, **survivor_fields, **(claim.record.payload() if claim else {})})
+
+
+@method("prompt.replay_source")
+def _(rid, params: dict) -> dict:
+    """Read-only: what to send to ``prompt.submit`` (with ``verbatim_text: true``) to replay the stored
+    user row ``row_id`` of this session as the same turn — ``{row_id, text, image_paths, exact, reason?,
+    missing, display_kind, replay_supported, unsupported_reason?}``. The row may be inactive (just
+    rewound). ``missing``: the ``image_paths`` a submit would refuse now (4144); ``replay_supported``:
+    false when a replay submit would get 4145 now — both so a caller refuses before rewinding anything.
+    Both reflect current state and can still change before the submit."""
+    from tui_gateway import submit_replay as sr
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    row_id = params.get("row_id")
+    if type(row_id) is not int or row_id < 1:
+        return _err(rid, sr.INVALID_PARAMS_CODE, "row_id must be a positive integer",
+                    {"reason": sr.INVALID_PARAMS_REASON})
+    session_key = str(session.get("session_key") or "")
+    with _session_db(session) as db:
+        if db is None:
+            return _err(rid, 5072, "session storage unavailable")
+        rows = db.get_messages(session_key, include_inactive=True, after_id=row_id - 1, limit=1) if session_key else []
+    row = rows[0] if rows and rows[0].get("id") == row_id and rows[0].get("role") == "user" else None
+    if row is None:
+        return _err(rid, sr.SOURCE_NOT_FOUND_CODE, f"no user row {row_id} in this session",
+                    {"reason": sr.SOURCE_NOT_FOUND_REASON})
+    source = _replay_source(row.get("content"), row.get("display_metadata"))
+    unsupported = _replay_unsupported_reason(session)
+    return _ok(rid, {"row_id": row_id, **source, "missing": sr.missing_images(source["image_paths"],
+                                                                            _allowed_image_extensions),
+                     "display_kind": row.get("display_kind"), "replay_supported": unsupported is None,
+                     **({} if unsupported is None else {"unsupported_reason": unsupported})})
 
 
 # ── attachments ─────────────────────────────────────────────────────────────

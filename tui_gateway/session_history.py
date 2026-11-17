@@ -34,16 +34,92 @@ def _build_image_ref_message(user_text: str, image_paths: list[str]) -> str:
     return text or "What do you see in this image?"
 
 
+_IMAGE_REF_PREFIX = "@image:"
+# display_metadata key of a user row written with images: the exact ordered paths of its ``@image:``
+# lines, so a replay never guesses which trailing lines the core appended (``_replay_source``).
+_IMAGE_PATHS_METADATA_KEY = "image_paths"
+_LEGACY_IMAGE_NOTE = "[The user attached an image:"
+
+
+def _persisted_image_paths(image_paths: list[str]) -> list[str]:
+    """The attached images a persisted row references: those that exist, in order."""
+    return [p for p in image_paths if Path(p).exists()]
+
+
+def _image_ref_line(path: str) -> str:
+    from agent.context_references import format_reference_value
+    return f"{_IMAGE_REF_PREFIX}{format_reference_value(path)}"
+
+
 def _build_persist_message_with_image_refs(user_text: str, image_paths: list[str]) -> str:
     """Persisted form of the user's message: ``@image:<path>`` directives (the desktop renders them as
     images); ``_build_image_ref_message``'s ``image_url:`` hint is model-only, never persisted. Caption
     first, directives last: session previews are the first 60 chars of the first user message."""
-    from agent.context_references import format_reference_value
     text = user_text or ""
-    refs = "\n".join(f"@image:{format_reference_value(p)}" for p in image_paths if Path(p).exists())
+    refs = "\n".join(_image_ref_line(p) for p in _persisted_image_paths(image_paths))
     if not refs:
         return text
     return f"{text}\n{refs}" if text else refs
+
+
+def _image_paths_display_metadata(display_metadata: dict | None, image_paths: list[str]) -> dict | None:
+    """The user row's display_metadata plus the paths its ``@image:`` lines carry (unchanged when none)."""
+    persisted = _persisted_image_paths(image_paths)
+    if not persisted:
+        return display_metadata
+    return {**(display_metadata or {}), _IMAGE_PATHS_METADATA_KEY: persisted}
+
+
+def _unformat_image_ref(value: str) -> str | None:
+    """The path ``_image_ref_line`` wrote as *value*, or None when no path formats back to it."""
+    from agent.context_references import format_reference_value
+    quoted = len(value) >= 2 and value[0] in "`\"'" and value[-1] == value[0]
+    path = value[1:-1] if quoted else value
+    return path if path and format_reference_value(path) == value else None
+
+
+def _replay_source(content: Any, display_metadata: Any) -> dict:
+    """Inverse of the persisted user row (``_build_persist_user_message`` + display_metadata):
+    ``{text, image_paths, exact, reason?}`` to send to ``prompt.submit`` with ``verbatim_text: true``
+    so the replayed turn writes the same row. ``exact`` is False (with ``reason``) when the row cannot
+    tell its own text from appended ``@image:`` lines or lost what the model saw; ``text`` /
+    ``image_paths`` are then a best guess the caller should not send."""
+    def result(text: str, paths: list, reason: str | None = None) -> dict:
+        return {"text": text, "image_paths": paths, "exact": reason is None, **({"reason": reason} if reason else {})}
+
+    image_parts = None
+    if isinstance(content, list):
+        head = content[0] if content else None
+        if not (isinstance(head, dict) and head.get("type") == "text" and isinstance(head.get("text"), str)):
+            return result("", [], "unmapped_content_parts")
+        content, image_parts = head["text"], content[1:]
+    if not isinstance(content, str):
+        return result("", [], "no_text")
+    recorded = display_metadata.get(_IMAGE_PATHS_METADATA_KEY) if isinstance(display_metadata, dict) else None
+    if isinstance(recorded, list) and recorded and all(isinstance(p, str) for p in recorded):
+        refs = "\n".join(_image_ref_line(p) for p in recorded)
+        if content == refs:
+            return result("", list(recorded))
+        if content.endswith("\n" + refs):
+            return result(content[:-len(refs) - 1], list(recorded))
+        return result(content, list(recorded), "recorded_images_mismatch")
+    lines, paths = content.split("\n"), []
+    while lines and lines[-1].startswith(_IMAGE_REF_PREFIX):
+        path = _unformat_image_ref(lines[-1][len(_IMAGE_REF_PREFIX):])
+        if path is None:
+            return result(content, [], "image_ref_does_not_round_trip")
+        paths.insert(0, path)
+        lines.pop()
+    text = "\n".join(lines)
+    if _LEGACY_IMAGE_NOTE in content:
+        return result(text, paths, "legacy_image_note")
+    if image_parts is not None:
+        # Native rows hold one image part per readable image: equal counts tie every line to a part.
+        if not paths or len(paths) != len(image_parts):
+            return result(text, paths, "unmapped_content_parts")
+        return result(text, paths)
+    # A text row without the recorded list: a trailing line may be the user's own typing.
+    return result(text, paths, "unrecorded_image_refs") if paths else result(content, [])
 
 
 def _build_persist_user_message(user_text: str, image_paths: list[str], run_message: Any) -> Any:

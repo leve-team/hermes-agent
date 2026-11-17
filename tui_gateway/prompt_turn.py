@@ -435,6 +435,7 @@ class _TurnRun:
     receipt_attempted: bool = False
     result_callback: Any = None  # client_msg_id result receipt (methods_prompt._run_claimed_submit)
     result_reported: bool = False
+    verbatim_text: bool = False  # the text is a stored turn's prepared text (tui_gateway/submit_replay.py)
 
 
 def _final_assistant_row_id(result: Any) -> int | None:
@@ -516,7 +517,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     cols = session.get("cols", 80)
     streamer = make_stream_renderer(cols)
     prompt = text
-    if isinstance(prompt, str) and "@" in prompt:
+    if isinstance(prompt, str) and "@" in prompt and not st.verbatim_text:
         from agent.context_references import preprocess_context_references
         from agent.model_metadata import get_model_context_length
         ctx_len = get_model_context_length(
@@ -601,9 +602,11 @@ def _invoke_agent(
         run_params = {}
     if "task_id" in run_params:
         run_kwargs["task_id"] = session["session_key"]
-    if display_kind and "persist_user_display_kind" in run_params:
+    # A row written with images also records their exact paths (session_history._replay_source).
+    row_metadata = _image_paths_display_metadata(display_metadata, images) if images else display_metadata
+    if (display_kind or row_metadata is not display_metadata) and "persist_user_display_kind" in run_params:
         run_kwargs["persist_user_display_kind"] = display_kind
-        run_kwargs["persist_user_display_metadata"] = display_metadata
+        run_kwargs["persist_user_display_metadata"] = row_metadata
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
     # Live-rename hook: auto-titling fires inside the turn prologue.
@@ -866,11 +869,14 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None, stored_user_row: int | None = None,
-    result_callback: Callable[..., None] | None = None, trusted_context=None) -> bool:
+    result_callback: Callable[..., None] | None = None, trusted_context=None,
+    verbatim_text: bool = False) -> bool:
     """``result_callback``: the turn's result receipt (outcome, the ``message.complete``
     text, error, session, assistant row id), once, before that frame is emitted.
     ``trusted_context``: the submit's turn ticket (``prompt.submit`` only; synthesized
-    turns pass none); readable by this turn's tool handlers, released in ``finally``."""
+    turns pass none); readable by this turn's tool handlers, released in ``finally``.
+    ``image_paths``: this turn's images; None takes (and clears) the staged ones.
+    ``verbatim_text``: ``text`` is already the prepared turn text — no ``@`` expansion."""
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -900,6 +906,7 @@ def _run_prompt_submit(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
         st.result_callback = result_callback
+        st.verbatim_text = verbatim_text
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
         goal_followup = None
         try:
