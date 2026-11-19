@@ -263,6 +263,241 @@ def test_binary_reference_block_keeps_host_path_on_local_backend(tmp_path: Path,
     assert "/root/.hermes/attachments/" not in result.message
 
 
+# ── Staged attachments outside the workspace (upstream #110174) ─────────────
+# Production layout: the gateway stages uploads in ``<profile home>/attachments``
+# while the session works in ``<profile home>/work`` — the staging dir is NOT
+# under the workspace, so allowed_root alone used to refuse every staged file.
+
+
+def _staged_attachment_layout(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
+    """``(hermes_home, workspace)`` with the workspace NOT containing the staging dirs."""
+    root = tmp_path.resolve()
+    hermes_home = root / "profile"
+    workspace = hermes_home / "work"
+    workspace.mkdir(parents=True)
+    (hermes_home / "attachments").mkdir()
+    monkeypatch.setenv("HOME", str(root / "home"))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    return hermes_home, workspace
+
+
+def _attached_context(message: str) -> str:
+    """Everything the expansion appended (warnings + blocks), minus the user's own text."""
+    return message.split("\n\n--- ", 1)[1] if "\n\n--- " in message else ""
+
+
+def test_staged_binary_attachment_outside_workspace_expands_without_warning(tmp_path: Path, monkeypatch):
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    payload = hermes_home / "attachments" / "clip.mp4"
+    payload.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64)
+
+    result = preprocess_context_references(
+        f"What is in this clip? @file:{payload}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert result.warnings == []
+    assert "--- Context Warnings ---" not in result.message
+    assert "outside the allowed workspace" not in result.message
+    attached = _attached_context(result.message)
+    assert "binary file, not inlined" in attached
+    assert f"available on disk at `{payload}`" in attached
+
+
+def test_staged_text_attachment_outside_workspace_is_inlined(tmp_path: Path, monkeypatch):
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    payload = hermes_home / "attachments" / "report.html"
+    payload.write_text("<h1>STAGED-HTML-BODY</h1>\n", encoding="utf-8")
+
+    result = preprocess_context_references(
+        f"Summarise @file:{payload}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert result.warnings == []
+    assert "--- Context Warnings ---" not in result.message
+    attached = _attached_context(result.message)
+    assert f"📄 @file:{payload}" in attached
+    assert "```\n<h1>STAGED-HTML-BODY</h1>" in attached
+    assert "not inlined" not in attached
+
+
+def test_path_outside_workspace_and_staging_dirs_is_still_refused(tmp_path: Path, monkeypatch):
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    elsewhere = hermes_home.parent / "elsewhere"
+    elsewhere.mkdir()
+    outside = elsewhere / "notes.txt"
+    outside.write_text("OUTSIDE-WORKSPACE-BODY\n", encoding="utf-8")
+    # A non-staging sibling inside HERMES_HOME is not widened either.
+    inside_home = hermes_home / "notes.txt"
+    inside_home.write_text("HERMES-HOME-BODY\n", encoding="utf-8")
+
+    result = preprocess_context_references(
+        f"Read @file:{outside} and @file:{inside_home}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert sum("path is outside the allowed workspace" in warning for warning in result.warnings) == 2
+    assert "OUTSIDE-WORKSPACE-BODY" not in result.message
+    assert "HERMES-HOME-BODY" not in result.message
+    assert "--- Attached Context ---" not in result.message
+
+
+def test_credential_file_in_hermes_home_outside_workspace_is_still_refused(tmp_path: Path, monkeypatch):
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    auth_json = hermes_home / "auth.json"
+    auth_json.write_text('{"openai": "sk-AUTHJSON-SECRET"}\n', encoding="utf-8")
+    # ``..`` out of the staging dir must not smuggle the credential store through either.
+    traversal = hermes_home / "attachments" / ".." / "auth.json"
+
+    result = preprocess_context_references(
+        f"inspect @file:{auth_json} and @file:{traversal}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert len(result.warnings) == 2
+    assert "sk-AUTHJSON-SECRET" not in result.message
+    assert "--- Attached Context ---" not in result.message
+
+
+def test_read_denied_name_under_staging_dir_is_still_refused(tmp_path: Path, monkeypatch):
+    """Staging only lifts the workspace-root check; the credential deny-list still applies."""
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    staged_env = hermes_home / "attachments" / ".env"
+    staged_env.write_text("DB_PASSWORD=STAGED-ENV-SECRET\n", encoding="utf-8")
+
+    result = preprocess_context_references(
+        f"inspect @file:{staged_env}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert sum("sensitive credential" in warning for warning in result.warnings) == 1
+    assert "STAGED-ENV-SECRET" not in result.message
+    assert "--- Attached Context ---" not in result.message
+
+
+def test_symlink_under_staging_dir_cannot_escape_to_outside_file(tmp_path: Path, monkeypatch):
+    """The staging check runs on the RESOLVED path, so a staged symlink grants nothing."""
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    elsewhere = hermes_home.parent / "elsewhere"
+    elsewhere.mkdir()
+    target = elsewhere / "private.txt"
+    target.write_text("SYMLINK-TARGET-BODY\n", encoding="utf-8")
+    link = hermes_home / "attachments" / "link.txt"
+    link.symlink_to(target)
+
+    result = preprocess_context_references(
+        f"Read @file:{link}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert sum("path is outside the allowed workspace" in warning for warning in result.warnings) == 1
+    assert "SYMLINK-TARGET-BODY" not in result.message
+
+
+def test_staging_lookup_failure_keeps_workspace_refusal(tmp_path: Path, monkeypatch):
+    """If the staging-dir lookup raises, the path is treated as NOT staged (fails closed)."""
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    payload = hermes_home / "attachments" / "report.html"
+    payload.write_text("<h1>STAGED-HTML-BODY</h1>\n", encoding="utf-8")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("mount resolution failed")
+
+    monkeypatch.setattr("tools.credential_files.get_cache_directory_mounts", _boom)
+
+    result = preprocess_context_references(
+        f"Summarise @file:{payload}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert sum("path is outside the allowed workspace" in warning for warning in result.warnings) == 1
+    assert "<h1>STAGED-HTML-BODY</h1>" not in result.message
+
+
+def test_staged_attachment_follows_session_profile_home_override(tmp_path: Path, monkeypatch):
+    """Multiplexed gateway: the staging dirs are the SESSION profile's (context-local
+    HERMES_HOME override installed for the turn), not the launch profile's."""
+    from agent.context_references import preprocess_context_references
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    launch_home, _ = _staged_attachment_layout(tmp_path, monkeypatch)
+    other_profile_upload = launch_home / "attachments" / "other-profile.html"
+    other_profile_upload.write_text("<p>OTHER-PROFILE-BODY</p>\n", encoding="utf-8")
+    profile_home = launch_home.parent / "profiles" / "dave"
+    workspace = profile_home / "work"
+    workspace.mkdir(parents=True)
+    (profile_home / "attachments").mkdir()
+    payload = profile_home / "attachments" / "clip.mp4"
+    payload.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64)
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        result = preprocess_context_references(
+            f"Compare @file:{payload} with @file:{other_profile_upload}",
+            cwd=workspace,
+            allowed_root=workspace,
+            context_length=100_000,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    attached = _attached_context(result.message)
+    assert f"available on disk at `{payload}`" in attached
+    assert len(result.warnings) == 1
+    assert str(other_profile_upload) in result.warnings[0]
+    assert "path is outside the allowed workspace" in result.warnings[0]
+    assert "OTHER-PROFILE-BODY" not in result.message
+
+
+def test_folder_reference_to_staging_dir_still_exposes_no_listing(tmp_path: Path, monkeypatch):
+    """``@folder:`` is untouched: a staging dir outside the workspace yields no listing."""
+    from agent.context_references import preprocess_context_references
+
+    hermes_home, workspace = _staged_attachment_layout(tmp_path, monkeypatch)
+    (hermes_home / "attachments" / "other-session-upload.pdf").write_bytes(b"%PDF-1.7\n\x00")
+
+    result = preprocess_context_references(
+        f"List @folder:{hermes_home / 'attachments'}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert len(result.warnings) == 1
+    assert "other-session-upload.pdf" not in result.message
+    assert "--- Attached Context ---" not in result.message
+
+
 
 
 

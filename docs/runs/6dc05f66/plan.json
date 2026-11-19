@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "base_branch": "levos/pg3",
+  "base_sha": "c156b2257ad86e29181927e24e9a75164dff0b90",
+  "upstream_reference": "NousResearch/hermes-agent a164569429 (#110174) — _agent_staged_path, quoted verbatim in the brief",
+  "goal": "Expand @file references to gateway-staged Hermes dirs (attachments, images, cache/*) that sit outside the session workspace, without a workspace warning, while every other outside path and every credential/read-deny rule stays refused.",
+  "chunks": [
+    {
+      "name": "staged-path-exemption",
+      "files": ["agent/context_references.py", "tests/agent/test_context_references.py"],
+      "status": "complete"
+    }
+  ],
+  "steps": [
+    {"name": "Trace _resolve_path / _ensure_reference_path_allowed, staging dirs (tools/credential_files._CACHE_DIRS) and both call sites", "status": "complete"},
+    {"name": "Add red tests (brief 1-5 plus symlink escape, lookup failure, profile-home override, @folder)", "status": "complete"},
+    {"name": "Port upstream _agent_staged_path verbatim and add it to the _resolve_path refusal condition", "status": "complete"},
+    {"name": "Run related suites through the canonical file-isolated runner and the loopback file.attach probe", "status": "complete"},
+    {"name": "Commit candidate, declare gates, request managed verification and levos/pg3 merge", "status": "in_progress"}
+  ],
+  "scope": [
+    "agent/context_references.py",
+    "tests/agent/test_context_references.py",
+    "docs/runs/6dc05f66/"
+  ],
+  "constraints": [
+    "No product-code change under tui_gateway/, gateway/, tools/",
+    "No relaxation of sensitive-path or read-deny rules; _ensure_reference_path_allowed still runs on staged paths and fails closed",
+    "No dependency, .github/ or Dockerfile change; no existing test modified or removed",
+    "Call-site arguments and signatures unchanged",
+    "Merge to levos/pg3 only; runtime image rebuild and production swap happen outside this run after human approval"
+  ],
+  "validation_rationale": "The change is one predicate in agent/context_references.py, so the build gate compiles that module, its test file and the probe script. The behavior gate runs the canonical file-isolated runner over the 3 files named in the brief (tests/agent/test_context_references.py, tests/tools/test_credential_files.py, tests/tui_gateway/test_attach_does_not_wait_for_agent.py) plus the 5 other suites that drive the same expansion path (concurrent refs, plugin refs, gateway inbound expansion, CLI codex refs, git-spawn hardening), then runs the loopback probe once. The runtime image has no pytest, so the script bootstraps pinned test-only packages into a disposable venv exactly as run 0ed7b26b did; no repo dependency changes. The HTTP live probe is not a production probe: it calls the real file.attach RPC handler in an isolated temp profile (staging into <profile home>/attachments with cwd <profile home>/work), expands the returned @file ref with the arguments tui_gateway/prompt_turn.py passes, and answers 200 only if the binary block and the text inline appear without warnings AND an outside file, auth.json and a staged .env are still refused with no content exposed. The same probe returns 500 on the base commit, reproducing the production warning.",
+  "observations": [
+    "get_cache_directory_mounts() creates missing staging dirs under HERMES_HOME as a side effect (create_missing=True). The staging check only runs for paths outside the workspace; this is upstream behavior and was kept verbatim.",
+    "Staging dirs are resolved from get_hermes_home(), i.e. the context-local profile override the turn installs before expansion (tui_gateway/prompt_turn.py:486 then :529, same thread, no running loop). Another profile's attachments dir is therefore still refused; a test pins this.",
+    "@folder:<staging dir> outside the workspace still yields a warning and no listing (the listing builder is workspace-relative); the warning text for that case changes from the workspace message to the relative-path error. Pinned by a test as no-listing, not by message text."
+  ],
+  "remaining": [
+    "Immutable candidate verification by the managed runner",
+    "Merge to levos/pg3; image rebuild and production swap are post-merge and need human approval"
+  ]
+}
