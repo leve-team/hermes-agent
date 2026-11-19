@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "gates": [
+    {
+      "name": "context-references-build",
+      "kind": "build",
+      "required": true,
+      "timeout_s": 60,
+      "cwd": ".",
+      "cmd": "bash -n docs/runs/6dc05f66/verify-behavior.sh && python -m compileall -q agent/context_references.py tests/agent/test_context_references.py docs/runs/6dc05f66/live_probe.py",
+      "applies_to": ["agent/**", "tests/**", "docs/runs/6dc05f66/**"],
+      "inputs": ["agent/**", "tests/**", "docs/runs/6dc05f66/**", "pyproject.toml"]
+    },
+    {
+      "name": "staged-attachment-reference-behavior",
+      "kind": "behavior",
+      "required": true,
+      "timeout_s": 600,
+      "cwd": ".",
+      "cmd": "bash docs/runs/6dc05f66/verify-behavior.sh",
+      "applies_to": ["agent/**", "tests/**", "docs/runs/6dc05f66/**"],
+      "inputs": ["agent/**", "tests/**", "tools/**", "tui_gateway/**", "gateway/**", "hermes_cli/**", "plugins/**", "providers/**", "*.py", "pyproject.toml", "uv.lock", "scripts/run_tests.sh", "scripts/run_tests_parallel.py", "docs/runs/6dc05f66/**"]
+    }
+  ],
+  "live_probe": {"kind": "http", "url": "http://127.0.0.1:18762/probe", "status": 200}
+}

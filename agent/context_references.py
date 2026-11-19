@@ -339,9 +339,23 @@ def _is_under(path: Path, root: Path) -> bool:
     return True
 
 
+def _agent_staged_path(path: Path) -> bool:
+    """True when *path* sits in a Hermes dir the gateway stages for the agent."""
+    try:
+        from tools.credential_files import get_cache_directory_mounts
+        return any(_is_under(path, Path(entry["host_path"]).expanduser().resolve())
+                   for entry in get_cache_directory_mounts())
+    except Exception:
+        return False
+
+
 def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -> Path:
     resolved = (cwd / Path(os.path.expanduser(target))).resolve()  # `/` keeps an absolute target as-is
-    if allowed_root is not None and not _is_under(resolved, allowed_root):
+    # Gateway-staged uploads (attachments/, images/, cache/*) live under HERMES_HOME, which is
+    # usually NOT under the session workspace; refusing them made every staged `@file:` a
+    # dead-end warning. Only the workspace-root check is lifted — the caller still runs
+    # _ensure_reference_path_allowed on the result, and *resolved* is symlink-free.
+    if allowed_root is not None and not _is_under(resolved, allowed_root) and not _agent_staged_path(resolved):
         raise ValueError("path is outside the allowed workspace")
     return resolved
 
